@@ -244,16 +244,23 @@ _WEBHOOK_PATTERN = re.compile(
     r"https?://[^\s\"']+/open-apis/bot/v2/hook/[^\s\"']+",
     re.IGNORECASE,
 )
-_API_KEY_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(\b(?:api[_-]?key|llm[_-]?secret)\b\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,]+)"
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(\b(?:requirement_monitor_(?:llm_api_key|webhook_url)|"
+    r"api[_-]?key|llm[_-]?secret|webhook[_-]?url)\b\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s]+)"
+)
+_BEARER_TOKEN_PATTERN = re.compile(
+    r"(?i)(\bBearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
 )
 _OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 
 
 def _sanitize_error(message: str) -> str:
     sanitized = _WEBHOOK_PATTERN.sub("[REDACTED]", message)
-    sanitized = _API_KEY_ASSIGNMENT_PATTERN.sub(
+    sanitized = _SECRET_ASSIGNMENT_PATTERN.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", sanitized
+    )
+    sanitized = _BEARER_TOKEN_PATTERN.sub(
         lambda match: f"{match.group(1)}[REDACTED]", sanitized
     )
     return _OPENAI_KEY_PATTERN.sub("[REDACTED]", sanitized)

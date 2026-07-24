@@ -65,6 +65,39 @@ def test_run_json_redacts_webhook_and_llm_secrets(monkeypatch):
     assert "[REDACTED]" in message
 
 
+def test_run_json_redacts_monitor_env_secrets_and_bearer_tokens(monkeypatch):
+    llm_api_key = "opaque.llm/key+with=arbitrary-value,llm-tail"
+    webhook_url = "https://hooks.example.com/custom/path?secret=arbitrary-value"
+    bearer_token = "opaque.bearer/token+with=arbitrary-value,bearer-tail"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            (
+                f"REQUIREMENT_MONITOR_LLM_API_KEY={llm_api_key} "
+                f'REQUIREMENT_MONITOR_WEBHOOK_URL="{webhook_url}" '
+                f"Authorization: Bearer {bearer_token}"
+            ),
+        ),
+    )
+
+    with pytest.raises(FeishuCLIError) as exc_info:
+        FeishuCLI().run_json(["bitable", "meta", "app"])
+
+    message = str(exc_info.value)
+    assert llm_api_key not in message
+    assert webhook_url not in message
+    assert bearer_token not in message
+    assert "llm-tail" not in message
+    assert "bearer-tail" not in message
+    assert "REQUIREMENT_MONITOR_LLM_API_KEY=[REDACTED]" in message
+    assert "REQUIREMENT_MONITOR_WEBHOOK_URL=[REDACTED]" in message
+    assert "Bearer [REDACTED]" in message
+
+
 def test_run_json_raises_clear_error_for_invalid_json(monkeypatch):
     monkeypatch.setattr(
         subprocess,
