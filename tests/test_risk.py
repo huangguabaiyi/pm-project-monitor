@@ -12,6 +12,7 @@ from requirement_monitor.models import (
     Requirement,
     RiskLevel,
 )
+import requirement_monitor.risk as risk_module
 from requirement_monitor.risk import evaluate_requirement, resolve_effective_rules
 
 
@@ -540,7 +541,7 @@ def test_completed_downstream_stages_do_not_consume_remaining_duration(rules):
         make_node(
             "PV 测试第一轮",
             work_type="测试",
-            planned_start=at(20),
+            planned_start=at(17),
             planned_end=at(21),
             actual_end=at(21),
             status=NodeStatus.COMPLETED,
@@ -556,7 +557,7 @@ def test_completed_downstream_stages_do_not_consume_remaining_duration(rules):
         make_node(
             "线上回归",
             work_type="测试",
-            planned_start=at(22),
+            planned_start=at(20),
             planned_end=completed_at,
             actual_end=completed_at,
             status=NodeStatus.COMPLETED,
@@ -623,6 +624,188 @@ def test_missing_next_test_round_remains_in_budget_and_warns_near_start(rules):
     assert result.level == RiskLevel.WARNING
     assert result.predicted_completion == at(27, 12)
     assert "测试排期缺少计划开始时间" in result.reasons
+
+
+def test_in_progress_test_budget_deducts_elapsed_project_days(rules):
+    config = make_config(at_days=4, pv_days=0, bugfix_days=0, regression_days=0)
+    completed_upstream = make_node(
+        "提测",
+        planned_start=at(21),
+        planned_end=at(22),
+        actual_end=at(22),
+        status=NodeStatus.COMPLETED,
+    )
+    in_progress_test = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=at(22),
+        planned_end=NOW,
+        status=NodeStatus.IN_PROGRESS,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(),
+        [completed_upstream, in_progress_test],
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert result.predicted_completion == at(28)
+    assert node_result(result, "提测").safe_deadline == in_aug(12, 18)
+
+
+def test_in_progress_test_without_planned_start_keeps_full_budget(rules):
+    config = make_config(at_days=4, pv_days=0, bugfix_days=0, regression_days=0)
+    node = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=None,
+        planned_end=NOW,
+        status=NodeStatus.IN_PROGRESS,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(), [node], [], rules, NOW, project_config=config
+    )
+
+    assert result.predicted_completion == at(30)
+
+
+def test_parallel_nodes_in_same_phase_use_max_budget_and_completion(rules):
+    config = make_config(at_days=0, pv_days=4, bugfix_days=0, regression_days=0)
+    nodes = [
+        make_node(
+            "PV1 客户端主链路",
+            work_type="测试",
+            record_id="rec-pv1-main",
+            planned_start=NOW,
+            planned_end=at(28),
+        ),
+        make_node(
+            "PV1 客户端兼容性",
+            work_type="测试",
+            record_id="rec-pv1-compat",
+            planned_start=NOW,
+            planned_end=at(29),
+        ),
+        make_node(
+            "PV2 客户端主链路",
+            work_type="测试",
+            record_id="rec-pv2-main",
+            planned_start=at(29),
+            planned_end=at(31),
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(), nodes, [], rules, NOW, project_config=config
+    )
+
+    assert result.predicted_completion == at(31)
+    assert node_result(result, "PV1 客户端主链路").safe_deadline == in_aug(12, 18)
+    assert node_result(result, "PV1 客户端兼容性").safe_deadline == in_aug(12, 18)
+
+
+def test_extra_at_and_pv_rounds_keep_family_order_and_downstream_reserves(rules):
+    config = make_config(at_days=2, pv_days=4, bugfix_days=2, regression_days=3)
+    nodes = [
+        make_node(
+            "AT3 补充轮次",
+            work_type="测试",
+            planned_start=NOW,
+            planned_end=at(29),
+        ),
+        make_node(
+            "PV3 补充轮次",
+            work_type="测试",
+            planned_start=None,
+            planned_end=at(31),
+            status=NodeStatus.NOT_STARTED,
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(), nodes, [], rules, NOW, project_config=config
+    )
+
+    assert result.predicted_completion == in_aug(12)
+    assert node_result(result, "AT3 补充轮次").safe_deadline == at(31, 18)
+    assert node_result(result, "PV3 补充轮次").safe_deadline == in_aug(7, 18)
+
+
+@pytest.mark.parametrize(
+    "actual_end, planned_end",
+    [
+        (at(21), at(22)),
+        (None, at(21)),
+    ],
+)
+def test_completed_test_window_below_minimum_is_severe(
+    rules, actual_end, planned_end
+):
+    config = make_config(at_days=4, pv_days=0, bugfix_days=0, regression_days=0)
+    node = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=at(20),
+        planned_end=planned_end,
+        actual_end=actual_end,
+        status=NodeStatus.COMPLETED,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(), [node], [], rules, NOW, project_config=config
+    )
+
+    assert node_result(result, "AT 测试第一轮").level == RiskLevel.SEVERE
+    assert "AT1计划测试周期低于最低要求" in result.reasons
+
+
+def test_downstream_precomputation_keeps_node_status_checks_linear(rules, monkeypatch):
+    process_names = [
+        "需求撰写",
+        "内部评审",
+        "产品需求评审",
+        "设计稿输出",
+        "设计宣讲",
+        "需求宣讲",
+        "工作量评估排期",
+        "各端开发",
+        "联调",
+        "提测",
+    ]
+    nodes = [
+        make_node(
+            name,
+            record_id=f"rec-{rank}-{parallel_index}",
+            planned_start=NOW,
+            planned_end=at(27),
+            status=NodeStatus.NOT_STARTED,
+        )
+        for rank, name in enumerate(process_names)
+        for parallel_index in range(8)
+    ]
+    original_node_done = risk_module._node_done
+    calls = 0
+
+    def counting_node_done(node):
+        nonlocal calls
+        calls += 1
+        return original_node_done(node)
+
+    monkeypatch.setattr(risk_module, "_node_done", counting_node_done)
+
+    evaluate_requirement(
+        make_requirement(merge_at=datetime(2026, 12, 31, 18, tzinfo=TZ)),
+        nodes,
+        [],
+        rules,
+        NOW,
+    )
+
+    assert calls < len(nodes) * 12
 
 
 @pytest.mark.parametrize(

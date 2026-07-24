@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from datetime import datetime, time
 from math import ceil
@@ -26,12 +27,11 @@ _COMPLETED_NODE_STATUSES = {
 _COMPLETED_BLOCKER_STATUSES = {"已解决", "已完成", "关闭", "已关闭", "已取消"}
 _PROCESS_ORDER = {name: index for index, name in enumerate(DEFAULT_PROCESS_NODES)}
 _AT1_ORDER = _PROCESS_ORDER["AT 测试第一轮"]
-_AT2_ORDER = _PROCESS_ORDER["AT 测试第二轮"]
 _PV1_ORDER = _PROCESS_ORDER["PV 测试第一轮"]
-_PV2_ORDER = _PROCESS_ORDER["PV 测试第二轮"]
 _REGRESSION_ORDER = _PROCESS_ORDER["线上回归"]
-_BUGFIX_ORDER = _PV2_ORDER + 0.25
-_SPECIAL_ORDER = _PV2_ORDER + 0.5
+_PhaseRank = Tuple[int, int]
+_BUGFIX_ORDER = (_REGRESSION_ORDER, -2)
+_SPECIAL_ORDER = (_REGRESSION_ORDER, -1)
 
 
 @dataclass(frozen=True)
@@ -49,10 +49,19 @@ class EffectiveRules:
 
 @dataclass(frozen=True)
 class _Event:
-    order: float
+    order: _PhaseRank
     duration: int
     label: str
     node: Optional[DeliveryNode] = None
+
+
+@dataclass(frozen=True)
+class _PhaseEvent:
+    order: _PhaseRank
+    remaining_duration: int
+    label: str
+    events: Tuple[_Event, ...]
+    unfinished: bool
 
 
 @dataclass(frozen=True)
@@ -198,48 +207,56 @@ def _evaluate_domain(
         [node for node in nodes if not _is_checklist(node)],
         rules,
     )
+    phases = _build_phase_events(events, rules, now)
+    downstream_durations = _downstream_durations(phases)
     node_risks: List[NodeRisk] = []
     reasons: List[str] = []
     level = RiskLevel.NORMAL
     first_unfinished = next(
-        (event.node for event in events if event.node is not None and not _node_done(event.node)),
+        (
+            event.node
+            for phase in phases
+            if phase.unfinished
+            for event in phase.events
+            if event.node is not None and not _node_done(event.node)
+        ),
         None,
     )
 
-    for event in events:
-        if event.node is None:
-            continue
+    for phase in phases:
         safe_deadline = subtract_days(
             requirement.merge_at,
-            _downstream_duration(events, event.order),
+            downstream_durations[phase.order],
             rules.duration_mode,
         )
-        node_level, node_reasons, node_buffer = _evaluate_node(
-            event,
-            safe_deadline,
-            first_unfinished,
-            events,
-            rules,
-            now,
-        )
-        level = max(level, node_level)
-        reasons.extend(node_reasons)
-        node_risks.append(
-            NodeRisk(
-                node_record_id=event.node.record_id,
-                requirement_id=event.node.requirement_id,
-                node_name=event.node.name,
-                domain=event.node.domain,
-                owner_id=event.node.owner_id,
-                owner_name=event.node.owner_name,
-                level=node_level,
-                predicted_completion=_predict_node_completion(event, rules, now),
-                safe_deadline=safe_deadline,
-                buffer_days=node_buffer,
-                reasons=_deduplicate(node_reasons),
-                actions=[],
+        for event in phase.events:
+            if event.node is None:
+                continue
+            node_level, node_reasons, node_buffer = _evaluate_node(
+                event,
+                safe_deadline,
+                first_unfinished,
+                rules,
+                now,
             )
-        )
+            level = max(level, node_level)
+            reasons.extend(node_reasons)
+            node_risks.append(
+                NodeRisk(
+                    node_record_id=event.node.record_id,
+                    requirement_id=event.node.requirement_id,
+                    node_name=event.node.name,
+                    domain=event.node.domain,
+                    owner_id=event.node.owner_id,
+                    owner_name=event.node.owner_name,
+                    level=node_level,
+                    predicted_completion=_predict_node_completion(event, rules, now),
+                    safe_deadline=safe_deadline,
+                    buffer_days=node_buffer,
+                    reasons=_deduplicate(node_reasons),
+                    actions=[],
+                )
+            )
 
     for checklist_node in checklist_nodes:
         checklist_risk = _evaluate_checklist_node(
@@ -249,27 +266,27 @@ def _evaluate_domain(
         reasons.extend(checklist_risk.reasons)
         node_risks.append(checklist_risk)
 
-    for event in events:
+    for phase in phases:
         if (
-            event.node is not None
-            or event.duration <= 0
-            or event.label not in {"AT1", "AT2", "PV1", "PV2", "线上回归"}
-            or not _event_is_unfinished(event, events)
+            any(event.node is not None for event in phase.events)
+            or phase.remaining_duration <= 0
+            or phase.label not in {"AT1", "AT2", "PV1", "PV2", "线上回归"}
+            or not phase.unfinished
         ):
             continue
         safe_deadline = subtract_days(
             requirement.merge_at,
-            _downstream_duration(events, event.order),
+            downstream_durations[phase.order],
             rules.duration_mode,
         )
         latest_start = subtract_days(
-            safe_deadline, event.duration, rules.duration_mode
+            safe_deadline, phase.remaining_duration, rules.duration_mode
         )
         if days_available(now, latest_start, rules.duration_mode) <= 2:
             level = max(level, RiskLevel.WARNING)
             reasons.append("测试排期缺少计划开始时间")
 
-    if not events:
+    if not phases:
         return _DomainEvaluation(
             domain=domain,
             predicted_completion=None,
@@ -279,10 +296,8 @@ def _evaluate_domain(
             node_risks=node_risks,
         )
 
-    predicted_completion = _predict_domain_completion(events, rules, now)
-    remaining_duration = sum(
-        event.duration for event in events if _event_is_unfinished(event, events)
-    )
+    predicted_completion = _predict_domain_completion(phases, rules, now)
+    remaining_duration = sum(phase.remaining_duration for phase in phases)
     available = days_available(now, requirement.merge_at, rules.duration_mode)
     minimum_buffer = available - remaining_duration
     minimum_completion = add_days(now, remaining_duration, rules.duration_mode)
@@ -298,7 +313,7 @@ def _evaluate_domain(
 
     if minimum_buffer < 0:
         level = RiskLevel.SEVERE
-        reasons.append(_minimum_window_reason(domain, events))
+        reasons.append(_minimum_window_reason(domain, phases))
         reasons.append("剩余缓冲为负")
     elif buffer_days < 0:
         level = RiskLevel.SEVERE
@@ -329,34 +344,41 @@ def _evaluate_node(
     event: _Event,
     safe_deadline: datetime,
     first_unfinished: Optional[DeliveryNode],
-    events: Sequence[_Event],
     rules: EffectiveRules,
     now: datetime,
 ) -> Tuple[RiskLevel, List[str], int]:
     node = event.node
     if node is None:
         raise ValueError("node event is required")
-    comparison_time = max(now, node.planned_end) if not _node_done(node) else node.planned_end
+    node_done = _node_done(node)
+    comparison_time = (
+        max(now, node.planned_end)
+        if not node_done
+        else node.actual_end or node.planned_end
+    )
     buffer_days = days_available(comparison_time, safe_deadline, rules.duration_mode)
-    if _node_done(node):
-        return RiskLevel.NORMAL, [], buffer_days
-
     level = RiskLevel.NORMAL
     reasons: List[str] = []
+    if node.planned_start is not None and event.duration > 0:
+        window_end = (
+            node.actual_end or node.planned_end if node_done else node.planned_end
+        )
+        planned_duration = days_available(
+            node.planned_start, window_end, rules.duration_mode
+        )
+        if planned_duration < event.duration:
+            level = RiskLevel.SEVERE
+            reasons.append(f"{event.label}计划测试周期低于最低要求")
+
+    if node_done:
+        return level, _deduplicate(reasons), buffer_days
+
     if buffer_days < 0:
         level = RiskLevel.SEVERE
         reasons.append("节点延期已经耗尽全部缓冲")
     elif now > node.planned_end:
         level = RiskLevel.WARNING
         reasons.append("节点延期但仍有缓冲")
-
-    if node.planned_start is not None and event.duration > 0:
-        planned_duration = days_available(
-            node.planned_start, node.planned_end, rules.duration_mode
-        )
-        if planned_duration < event.duration:
-            level = RiskLevel.SEVERE
-            reasons.append(f"{event.label}计划测试周期低于最低要求")
 
     staleness_enabled = node.status == NodeStatus.IN_PROGRESS or (
         node.planned_start is not None and node.planned_start <= now
@@ -464,30 +486,38 @@ def _build_events(
 
     for node in nodes:
         order, label, duration = _node_stage(
-            node, at_first, at_second, pv_first, pv_second, rules.regression_days
+            node,
+            at_first,
+            at_second,
+            pv_first,
+            pv_second,
+            rules.regression_days,
+            rules.duration_mode,
         )
         events.append(_Event(order=order, duration=duration, label=label, node=node))
 
     stages = {event.label for event in events}
-    has_at = "AT1" in stages or "AT2" in stages
-    has_pv = "PV1" in stages or "PV2" in stages
+    has_at = any(_is_round_label(stage, "AT") for stage in stages)
+    has_pv = any(_is_round_label(stage, "PV") for stage in stages)
     has_test_flow = has_at or has_pv or "线上回归" in stages
 
     if has_at and "AT1" not in stages and at_first:
-        events.append(_Event(_AT1_ORDER, at_first, "AT1"))
+        events.append(_Event((_AT1_ORDER, 1), at_first, "AT1"))
     if has_at and "AT2" not in stages and at_second:
-        events.append(_Event(_AT2_ORDER, at_second, "AT2"))
+        events.append(_Event((_AT1_ORDER, 2), at_second, "AT2"))
     if has_pv and "PV1" not in stages and pv_first:
-        events.append(_Event(_PV1_ORDER, pv_first, "PV1"))
+        events.append(_Event((_PV1_ORDER, 1), pv_first, "PV1"))
     if has_pv and "PV2" not in stages and pv_second:
-        events.append(_Event(_PV2_ORDER, pv_second, "PV2"))
+        events.append(_Event((_PV1_ORDER, 2), pv_second, "PV2"))
     if has_pv and rules.bugfix_days:
         events.append(_Event(_BUGFIX_ORDER, rules.bugfix_days, "Bug修复预留"))
     special_days = rules.special_days.get(domain, 0)
     if special_days:
         events.append(_Event(_SPECIAL_ORDER, special_days, f"{domain}专项测试"))
     if has_test_flow and "线上回归" not in stages and rules.regression_days:
-        events.append(_Event(_REGRESSION_ORDER, rules.regression_days, "线上回归"))
+        events.append(
+            _Event((_REGRESSION_ORDER, 0), rules.regression_days, "线上回归")
+        )
 
     return sorted(events, key=_event_sort_key)
 
@@ -499,21 +529,90 @@ def _node_stage(
     pv_first: int,
     pv_second: int,
     regression_days: int,
-) -> Tuple[float, str, int]:
+    duration_mode: DayMode,
+) -> Tuple[_PhaseRank, str, int]:
     normalized = "".join(node.name.upper().split())
-    if "AT1" in normalized or ("AT" in normalized and "第一轮" in node.name):
-        return _AT1_ORDER, "AT1", at_first
-    if "AT2" in normalized or ("AT" in normalized and "第二轮" in node.name):
-        return _AT2_ORDER, "AT2", at_second
-    if "PV1" in normalized or ("PV" in normalized and "第一轮" in node.name):
-        return _PV1_ORDER, "PV1", pv_first
-    if "PV2" in normalized or ("PV" in normalized and "第二轮" in node.name):
-        return _PV2_ORDER, "PV2", pv_second
+    round_stage = _test_round_stage(node, normalized)
+    if round_stage is not None:
+        family, round_number = round_stage
+        if family == "AT":
+            duration = (
+                at_first
+                if round_number == 1
+                else at_second
+                if round_number == 2
+                else _extra_round_duration(node, duration_mode)
+            )
+            return (_AT1_ORDER, round_number), f"AT{round_number}", duration
+        duration = (
+            pv_first
+            if round_number == 1
+            else pv_second
+            if round_number == 2
+            else _extra_round_duration(node, duration_mode)
+        )
+        return (_PV1_ORDER, round_number), f"PV{round_number}", duration
     if "线上回归" in node.name:
-        return _REGRESSION_ORDER, "线上回归", regression_days
+        return (_REGRESSION_ORDER, 0), "线上回归", regression_days
 
     process_name = _matching_process_name(node)
-    return float(_PROCESS_ORDER.get(process_name, len(DEFAULT_PROCESS_NODES))), process_name, 0
+    return (
+        (_PROCESS_ORDER.get(process_name, len(DEFAULT_PROCESS_NODES)), 0),
+        process_name,
+        0,
+    )
+
+
+def _test_round_stage(
+    node: DeliveryNode, normalized_name: str
+) -> Optional[Tuple[str, int]]:
+    numeric_match = re.search(r"(AT|PV)(\d+)", normalized_name)
+    if numeric_match is not None:
+        return numeric_match.group(1), int(numeric_match.group(2))
+
+    for family in ("AT", "PV"):
+        if family not in normalized_name:
+            continue
+        chinese_match = re.search(r"第([一二三四五六七八九十]+)轮", node.name)
+        if chinese_match is not None:
+            round_number = _chinese_round_number(chinese_match.group(1))
+            if round_number is not None:
+                return family, round_number
+    return None
+
+
+def _chinese_round_number(value: str) -> Optional[int]:
+    digits = {
+        "一": 1,
+        "二": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if value in digits:
+        return digits[value]
+    if value == "十":
+        return 10
+    if "十" in value:
+        tens, ones = value.split("十", 1)
+        tens_value = digits.get(tens, 1) if tens else 1
+        ones_value = digits.get(ones, 0) if ones else 0
+        return tens_value * 10 + ones_value
+    return None
+
+
+def _extra_round_duration(node: DeliveryNode, duration_mode: DayMode) -> int:
+    if node.planned_start is None:
+        return 1
+    return max(1, days_available(node.planned_start, node.planned_end, duration_mode))
+
+
+def _is_round_label(label: str, family: str) -> bool:
+    return label.startswith(family) and label[len(family) :].isdigit()
 
 
 def _matching_process_name(node: DeliveryNode) -> str:
@@ -528,29 +627,147 @@ def _matching_process_name(node: DeliveryNode) -> str:
     return node.name
 
 
-def _predict_domain_completion(
+def _build_phase_events(
     events: Sequence[_Event], rules: EffectiveRules, now: datetime
+) -> List[_PhaseEvent]:
+    grouped: Dict[_PhaseRank, List[_Event]] = {}
+    for event in events:
+        grouped.setdefault(event.order, []).append(event)
+
+    grouped_events = [
+        (order, tuple(phase_events))
+        for order, phase_events in sorted(grouped.items())
+    ]
+    node_done = {
+        id(event.node): _node_done(event.node)
+        for event in events
+        if event.node is not None
+    }
+    node_started_or_done = {
+        id(event.node): event.node.status != NodeStatus.NOT_STARTED
+        or node_done[id(event.node)]
+        for event in events
+        if event.node is not None
+    }
+    real_unfinished = [
+        any(
+            event.node is not None and not node_done[id(event.node)]
+            for event in phase_events
+        )
+        for _, phase_events in grouped_events
+    ]
+    real_started_or_done = [
+        any(
+            event.node is not None and node_started_or_done[id(event.node)]
+            for event in phase_events
+        )
+        for _, phase_events in grouped_events
+    ]
+    prefix_unfinished: List[bool] = []
+    has_unfinished = False
+    for unfinished in real_unfinished:
+        has_unfinished = has_unfinished or unfinished
+        prefix_unfinished.append(has_unfinished)
+    suffix_started = [False] * (len(grouped_events) + 1)
+    for index in range(len(grouped_events) - 1, -1, -1):
+        suffix_started[index] = suffix_started[index + 1] or real_started_or_done[index]
+    has_real_node = bool(node_done)
+
+    phases: List[_PhaseEvent] = []
+    for index, (order, phase_events) in enumerate(grouped_events):
+        real_events = [event for event in phase_events if event.node is not None]
+        if real_events:
+            unfinished = real_unfinished[index]
+            remaining_duration = max(
+                (
+                    _remaining_event_duration(event, rules, now)
+                    for event in real_events
+                    if not node_done[id(event.node)]
+                ),
+                default=0,
+            )
+        else:
+            unfinished = prefix_unfinished[index] or (
+                not suffix_started[index + 1] and has_real_node
+            )
+            remaining_duration = (
+                max(event.duration for event in phase_events) if unfinished else 0
+            )
+        phases.append(
+            _PhaseEvent(
+                order=order,
+                remaining_duration=remaining_duration,
+                label=phase_events[0].label,
+                events=phase_events,
+                unfinished=unfinished,
+            )
+        )
+    return phases
+
+
+def _remaining_event_duration(
+    event: _Event, rules: EffectiveRules, now: datetime
+) -> int:
+    node = event.node
+    if node is None:
+        return event.duration
+    if _node_done(node):
+        return 0
+    if node.status != NodeStatus.IN_PROGRESS or node.planned_start is None:
+        return event.duration
+    consumed = max(
+        0, days_available(node.planned_start, now, rules.duration_mode)
+    )
+    return max(0, event.duration - consumed)
+
+
+def _downstream_durations(phases: Sequence[_PhaseEvent]) -> Dict[_PhaseRank, int]:
+    downstream: Dict[_PhaseRank, int] = {}
+    suffix_duration = 0
+    for phase in reversed(phases):
+        downstream[phase.order] = suffix_duration
+        suffix_duration += phase.remaining_duration
+    return downstream
+
+
+def _predict_domain_completion(
+    phases: Sequence[_PhaseEvent], rules: EffectiveRules, now: datetime
 ) -> Optional[datetime]:
-    if not events:
+    if not phases:
         return None
     cursor = now
-    has_unfinished = False
-    for event in events:
-        if not _event_is_unfinished(event, events):
+    has_unfinished = any(phase.unfinished for phase in phases)
+    for phase in phases:
+        if not phase.unfinished:
             continue
-        has_unfinished = True
-        if event.node is None:
-            cursor = add_days(cursor, event.duration, rules.duration_mode)
+        real_events = [event for event in phase.events if event.node is not None]
+        if not real_events:
+            cursor = add_days(cursor, phase.remaining_duration, rules.duration_mode)
             continue
-        planned_start = event.node.planned_start or cursor
-        start = max(cursor, planned_start)
-        minimum_end = add_days(start, event.duration, rules.duration_mode)
-        cursor = max(minimum_end, event.node.planned_end)
+        phase_completions = []
+        for event in real_events:
+            node = event.node
+            if node is None:
+                continue
+            if _node_done(node):
+                phase_completions.append(node.actual_end or node.planned_end)
+                continue
+            planned_start = node.planned_start or cursor
+            start = max(cursor, planned_start)
+            minimum_end = add_days(
+                start,
+                _remaining_event_duration(event, rules, now),
+                rules.duration_mode,
+            )
+            phase_completions.append(max(minimum_end, node.planned_end))
+        if phase_completions:
+            cursor = max(cursor, max(phase_completions))
     if has_unfinished:
         return cursor
     completed = [
         event.node.actual_end or event.node.planned_end
-        for event in events
+        for phase in phases
+        for event in phase.events
         if event.node is not None
     ]
     return max(completed) if completed else None
@@ -565,43 +782,18 @@ def _predict_node_completion(
     if _node_done(node):
         return node.actual_end or node.planned_end
     start = max(now, node.planned_start or now)
-    return max(add_days(start, event.duration, rules.duration_mode), node.planned_end)
-
-
-def _downstream_duration(events: Sequence[_Event], order: float) -> int:
-    return sum(
-        event.duration
-        for event in events
-        if event.order > order and _event_is_unfinished(event, events)
+    return max(
+        add_days(
+            start,
+            _remaining_event_duration(event, rules, now),
+            rules.duration_mode,
+        ),
+        node.planned_end,
     )
-
-
-def _event_is_unfinished(event: _Event, events: Sequence[_Event]) -> bool:
-    if event.node is not None:
-        return not _node_done(event.node)
-    if any(
-        candidate.node is not None
-        and candidate.order <= event.order
-        and not _node_done(candidate.node)
-        for candidate in events
-    ):
-        return True
-    if any(
-        candidate.node is not None
-        and candidate.order > event.order
-        and _node_started_or_done(candidate.node)
-        for candidate in events
-    ):
-        return False
-    return any(candidate.node is not None for candidate in events)
 
 
 def _node_done(node: DeliveryNode) -> bool:
     return node.actual_end is not None or node.status in _COMPLETED_NODE_STATUSES
-
-
-def _node_started_or_done(node: DeliveryNode) -> bool:
-    return node.status != NodeStatus.NOT_STARTED or _node_done(node)
 
 
 def _blocker_done(blocker: Blocker) -> bool:
@@ -665,13 +857,11 @@ def _checklist_is_due(
     return now.date() >= deadline.date()
 
 
-def _minimum_window_reason(domain: str, events: Sequence[_Event]) -> str:
-    labels = {
-        event.label for event in events if _event_is_unfinished(event, events)
-    }
-    if "AT1" in labels or "AT2" in labels:
+def _minimum_window_reason(domain: str, phases: Sequence[_PhaseEvent]) -> str:
+    labels = {phase.label for phase in phases if phase.unfinished}
+    if any(_is_round_label(label, "AT") for label in labels):
         return f"{domain} AT 最低测试周期无法容纳合板窗口"
-    if "PV1" in labels or "PV2" in labels:
+    if any(_is_round_label(label, "PV") for label in labels):
         return f"{domain} PV 最低测试周期无法容纳合板窗口"
     if "线上回归" in labels:
         return f"{domain}线上回归最低周期无法容纳合板窗口"
@@ -687,7 +877,7 @@ def _group_nodes_by_domain(
     return grouped.items()
 
 
-def _event_sort_key(event: _Event) -> Tuple[float, datetime, str]:
+def _event_sort_key(event: _Event) -> Tuple[_PhaseRank, datetime, str]:
     planned_end = event.node.planned_end if event.node is not None else datetime.max
     if planned_end.tzinfo is not None:
         planned_end = planned_end.replace(tzinfo=None)
