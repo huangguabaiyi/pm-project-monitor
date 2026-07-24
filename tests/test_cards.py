@@ -479,6 +479,35 @@ def test_daily_card_reserves_llm_footer_before_owner_truncation_notice():
     assert text.index(llm_notice) < text.index(match.group(0))
 
 
+def test_daily_card_reserves_llm_footer_before_secondary_node_truncation():
+    nodes = [
+        make_node_risk(
+            "node-{:03d}".format(index),
+            "节点{:03d}".format(index),
+            at(25),
+        )
+        for index in range(100)
+    ]
+    payload = build_daily_card(
+        make_report(
+            [make_risk(nodes=nodes)],
+            llm_attempted=True,
+            llm_degraded=True,
+        )
+    )
+    text = card_text(payload)
+    llm_notice = "AI 补充分析不可用，基础规则正常运行"
+
+    assert payload_bytes(payload) <= 18 * 1024
+    assert len(payload["card"]["elements"]) <= 40
+    assert '<at id="ou-zhang">张三</at>' in text
+    assert "节点000" in text
+    assert "节点001" in text
+    assert llm_notice in text
+    assert text.index(llm_notice) < text.index("节点001")
+    assert "内容过长，请查看多维表格" in text
+
+
 @pytest.mark.parametrize(
     ("level", "template"),
     [

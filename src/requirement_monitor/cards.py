@@ -202,15 +202,15 @@ def build_daily_card(report: RunReport) -> Dict[str, object]:
             "---",
             "AI 补充分析不可用，基础规则正常运行",
         ]
-    remaining_units = secondary + required_system_units + summaries
-    if not owner_groups and not remaining_units:
-        remaining_units = ["暂无符合提醒条件的未完成节点。"]
+    if not owner_groups and not secondary and not required_system_units and not summaries:
+        secondary = ["暂无符合提醒条件的未完成节点。"]
     return _daily_interactive_card(
         title,
         _LEVEL_TEMPLATES[highest_level],
         owner_groups,
-        remaining_units,
         required_system_units,
+        secondary,
+        summaries,
     )
 
 
@@ -218,20 +218,30 @@ def _daily_interactive_card(
     title: str,
     template: str,
     owner_groups: List[str],
-    remaining_units: List[str],
     required_system_units: List[str],
+    secondary_units: List[str],
+    summary_units: List[str],
 ) -> Dict[str, object]:
     if not owner_groups:
-        return interactive_card(title, template, remaining_units)
+        return interactive_card(
+            title,
+            template,
+            required_system_units + secondary_units + summary_units,
+        )
 
     safe_title = _truncate_utf8(_normalize_text(title), _MAX_TITLE_BYTES) or "通知"
     safe_template = template if template in {"blue", "yellow", "red"} else "blue"
     owner_blocks = _pack_owner_groups(owner_groups)
     owner_elements = [_markdown_element(block) for block in owner_blocks]
-    owner_payload = _interactive_payload(safe_title, safe_template, owner_elements)
+    required_elements, _ = _optional_markdown_elements(required_system_units)
+    required_payload = _interactive_payload(
+        safe_title,
+        safe_template,
+        owner_elements + required_elements,
+    )
     if (
-        len(owner_elements) > _MAX_ELEMENTS
-        or _payload_bytes(owner_payload) > _MAX_PAYLOAD_BYTES
+        len(owner_elements) + len(required_elements) > _MAX_ELEMENTS
+        or _payload_bytes(required_payload) > _MAX_PAYLOAD_BYTES
     ):
         return _truncated_owner_payload(
             safe_title,
@@ -240,8 +250,11 @@ def _daily_interactive_card(
             required_system_units,
         )
 
-    optional_elements, discarded = _optional_markdown_elements(remaining_units)
-    full_elements = owner_elements + optional_elements
+    optional_elements, discarded = _optional_markdown_elements(
+        secondary_units + summary_units
+    )
+    required_base = owner_elements + required_elements
+    full_elements = required_base + optional_elements
     full_payload = _interactive_payload(safe_title, safe_template, full_elements)
     if (
         not discarded
@@ -251,7 +264,7 @@ def _daily_interactive_card(
         return full_payload
 
     notice_element = _markdown_element(_TRUNCATION_NOTICE)
-    kept_elements = list(owner_elements)
+    kept_elements = list(required_base)
     for element in optional_elements:
         if len(kept_elements) >= _MAX_ELEMENTS - 1:
             break
