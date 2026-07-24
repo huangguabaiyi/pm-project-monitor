@@ -7,6 +7,9 @@ from requirement_monitor.models import FixedRules
 
 _SERVER_LAUNCH_CONTEXT_PATTERN = re.compile(r"服务端[^。\n]*上线[^。\n]*")
 _WEEKDAY_PATTERN = re.compile(r"周(?P<weekday>[一二三四五六日天])")
+_SERVER_WEEKDAY_NEGATION_PATTERN = re.compile(
+    r"(?:并非|不是|不(?:在|按))[^，。；;\n]{0,24}周[一二三四五六日天]"
+)
 _WEEKDAY_NUMBERS = {
     "一": 0,
     "二": 1,
@@ -25,6 +28,10 @@ _CUTOFF_PATTERN = re.compile(
     rf"|{_CUTOFF_TIME_REGEX}\s*(?:为|是)\s*上线截止(?:时间)?)"
 )
 _AT_DURATION_PATTERN = re.compile(r"AT[^。\n]*一\s*周\s*半", re.IGNORECASE)
+_AT_DURATION_NEGATION_PATTERN = re.compile(
+    r"AT[^。\n]*(?:不需要|无需|并非|不是)[^。\n]*一\s*周\s*半",
+    re.IGNORECASE,
+)
 _PV_DAYS_PATTERN = re.compile(
     r"PV\s*测试[^。\n]*?(?P<days>\d+)\s*天", re.IGNORECASE
 )
@@ -52,7 +59,13 @@ def parse_fixed_rules(text: str) -> FixedRules:
         for context in server_launch_contexts
         for match in _WEEKDAY_PATTERN.finditer(context)
     }
-    has_server_weekdays = server_launch_weekdays == {1, 3}
+    has_negated_server_weekdays = any(
+        _SERVER_WEEKDAY_NEGATION_PATTERN.search(context) is not None
+        for context in server_launch_contexts
+    )
+    has_server_weekdays = (
+        server_launch_weekdays == {1, 3} and not has_negated_server_weekdays
+    )
     if not has_server_weekdays:
         missing_rules.append("server_launch_weekdays")
 
@@ -63,11 +76,17 @@ def parse_fixed_rules(text: str) -> FixedRules:
     if not has_cutoff:
         missing_rules.append("server_launch_cutoff")
 
-    has_checklist = _CHECKLIST_PATTERN.search(text) is not None
+    has_checklist = any(
+        _CHECKLIST_PATTERN.search(context) is not None
+        for context in server_launch_contexts
+    )
     if not has_checklist:
         missing_rules.append("checklist_days_before")
 
-    has_at_duration = _AT_DURATION_PATTERN.search(text) is not None
+    has_at_duration = (
+        _AT_DURATION_PATTERN.search(text) is not None
+        and _AT_DURATION_NEGATION_PATTERN.search(text) is None
+    )
     if not has_at_duration:
         missing_rules.extend(("at_workdays", "at_natural_days"))
 

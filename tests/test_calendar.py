@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -78,6 +78,32 @@ def test_calendar_arithmetic_preserves_timezone_and_wall_time_across_dst():
     assert result == datetime(2026, 3, 9, 9, 45, tzinfo=new_york)
     assert result.tzinfo is new_york
     assert result.utcoffset() != before_dst.utcoffset()
+
+
+def test_calendar_arithmetic_normalizes_dst_gap_to_first_valid_local_time():
+    new_york = ZoneInfo("America/New_York")
+    before_gap = datetime(2026, 3, 7, 2, 30, tzinfo=new_york)
+    after_gap = datetime(2026, 3, 9, 2, 30, tzinfo=new_york)
+
+    added = add_days(before_gap, 1, mode="natural")
+    subtracted = subtract_days(after_gap, 1, mode="natural")
+
+    expected = datetime(2026, 3, 8, 3, 0, tzinfo=new_york)
+    assert added == expected
+    assert subtracted == expected
+    assert added.astimezone(timezone.utc).astimezone(new_york) == added
+    assert subtracted.astimezone(timezone.utc).astimezone(new_york) == subtracted
+
+
+def test_calendar_arithmetic_preserves_fold_for_ambiguous_local_time():
+    new_york = ZoneInfo("America/New_York")
+    before_fold = datetime(2026, 10, 31, 1, 30, tzinfo=new_york, fold=1)
+
+    result = add_days(before_fold, 1, mode="natural")
+
+    assert result == datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=1)
+    assert result.fold == 1
+    assert result.utcoffset() == timedelta(hours=-5)
 
 
 @pytest.mark.parametrize("function", (add_days, subtract_days))

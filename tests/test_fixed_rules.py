@@ -74,6 +74,42 @@ def test_unrelated_1730_does_not_satisfy_server_launch_cutoff():
     assert exc_info.value.missing_rules == ("server_launch_cutoff",)
 
 
+def test_client_checklist_does_not_satisfy_server_checklist_rule():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "需在前一天提交对应的 checklist 上线表格，", ""
+    )
+    rules_text += "客户端需在前一天提交 checklist 上线表格\n"
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("checklist_days_before",)
+
+
+def test_negated_server_launch_weekdays_are_rejected():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "服务端的上线时间固定为每周二和周四",
+        "服务端并非周二周四上线",
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("server_launch_weekdays",)
+
+
+def test_negated_at_duration_is_rejected():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "AT1轮加二轮的测试周期一般需要一周半以上",
+        "AT不需要一周半以上",
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("at_workdays", "at_natural_days")
+
+
 @pytest.mark.parametrize(
     "cutoff_text", ("17:30前禁止上线", "下午5点30分前禁止上线")
 )
@@ -102,3 +138,12 @@ def test_load_fixed_rules_reads_utf8_without_writing(tmp_path, monkeypatch):
 
     assert rules.server_launch_weekdays == {1, 3}
     assert rules_path.read_bytes() == original_bytes
+
+
+def test_load_repository_fixed_rules_file():
+    rules_path = Path(__file__).resolve().parents[1] / "固定业务规则"
+
+    rules = load_fixed_rules(rules_path)
+
+    assert rules.server_launch_weekdays == {1, 3}
+    assert rules.server_launch_cutoff == "17:30"
