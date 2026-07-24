@@ -37,6 +37,14 @@ class ValidationIssue(BaseModel):
     field_name: NonEmptyStr
     message: NonEmptyStr
 
+    @field_validator("requirement_id", mode="before")
+    @classmethod
+    def normalize_blank_requirement_id(cls, value):
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
 
 class Person(BaseModel):
     open_id: NonEmptyStr

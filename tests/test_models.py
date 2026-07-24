@@ -14,6 +14,7 @@ from requirement_monitor.models import (
     Requirement,
     RiskLevel,
     RunReport,
+    ValidationIssue,
 )
 
 
@@ -104,6 +105,17 @@ def test_eligible_requirements_filters_notification_criteria():
 def test_risk_levels_are_ordered_by_severity():
     assert RiskLevel.NORMAL < RiskLevel.WARNING < RiskLevel.SEVERE
     assert max(RiskLevel.WARNING, RiskLevel.SEVERE) == RiskLevel.SEVERE
+
+
+def test_validation_issue_normalizes_blank_requirement_id_to_none():
+    issue = ValidationIssue(
+        table_name="需求主表",
+        requirement_id="   ",
+        field_name="需求编号",
+        message="must not be empty",
+    )
+
+    assert issue.requirement_id is None
 
 
 @pytest.mark.parametrize(

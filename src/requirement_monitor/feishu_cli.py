@@ -222,35 +222,50 @@ class FeishuCLI:
         self,
         app_token: str,
         table_id: str,
-        records: Sequence[Mapping[str, Any]],
+        records: Optional[Sequence[Mapping[str, Any]]] = None,
+        *,
+        file_path: Optional[str] = None,
     ) -> JsonObject:
         return self.run_json(
-            [
-                "bitable",
-                "batch-create",
-                app_token,
-                table_id,
-                "--records",
-                _json_argument(records),
-            ]
+            _batch_arguments(
+                "batch-create", app_token, table_id, records, file_path
+            )
         )
 
     def batch_update(
         self,
         app_token: str,
         table_id: str,
-        records: Sequence[Mapping[str, Any]],
+        records: Optional[Sequence[Mapping[str, Any]]] = None,
+        *,
+        file_path: Optional[str] = None,
     ) -> JsonObject:
         return self.run_json(
-            [
-                "bitable",
-                "batch-update",
-                app_token,
-                table_id,
-                "--records",
-                _json_argument(records),
-            ]
+            _batch_arguments(
+                "batch-update", app_token, table_id, records, file_path
+            )
         )
+
+
+def _batch_arguments(
+    command: str,
+    app_token: str,
+    table_id: str,
+    records: Optional[Sequence[Mapping[str, Any]]],
+    file_path: Optional[str],
+) -> list:
+    has_records = records is not None
+    has_file = isinstance(file_path, str) and bool(file_path.strip())
+    if has_records == has_file:
+        raise FeishuCLIError(
+            "Bitable batch operation requires exactly one input source"
+        )
+    arguments = ["bitable", command, app_token, table_id]
+    if has_file:
+        arguments.extend(["-f", file_path])
+    else:
+        arguments.extend(["--records", _json_argument(records)])
+    return arguments
 
 
 def _append_option(

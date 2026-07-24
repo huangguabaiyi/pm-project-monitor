@@ -1,5 +1,7 @@
 from copy import deepcopy
 from datetime import datetime
+import json
+import os
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -150,6 +152,61 @@ def test_invalid_node_date_isolated_from_valid_sibling(raw_tables):
     assert issues[0].field_name == "计划完成时间"
 
 
+def test_blank_invalid_requirement_id_is_reported_as_none(raw_tables):
+    raw_tables["需求主表"][0]["fields"]["需求编号"] = "   "
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.requirements == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "需求编号"
+    assert issues[0].requirement_id is None
+
+
+def test_second_based_numeric_datetime_is_rejected_as_record_issue(raw_tables):
+    raw_tables["需求主表"][0]["fields"]["合板时间"] = 1785204000
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.requirements == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "合板时间"
+
+
+@pytest.mark.parametrize(
+    "people",
+    [
+        [],
+        [
+            {"open_id": "ou-one", "name": "一号负责人"},
+            {"open_id": "ou-two", "name": "二号负责人"},
+        ],
+    ],
+)
+def test_single_owner_field_requires_exactly_one_person(raw_tables, people):
+    raw_tables["需求主表"][0]["fields"]["项目负责人"] = people
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.requirements == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "项目负责人"
+
+
+def test_child_single_owner_field_rejects_multiple_people(raw_tables):
+    raw_tables["进展节点表"][0]["fields"]["负责人"] = [
+        {"open_id": "ou-one", "name": "一号负责人"},
+        {"open_id": "ou-two", "name": "二号负责人"},
+    ]
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
+    assert snapshot.nodes == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "负责人"
+
+
 def test_invalid_requirement_excludes_only_it_and_its_children(raw_tables):
     second_requirement = deepcopy(raw_tables["需求主表"][0])
     second_requirement["record_id"] = "rec-req-2"
@@ -225,6 +282,7 @@ class FakeCLI:
         self.record_calls = []
         self.batch_updates = []
         self.batch_creates = []
+        self.temp_files = []
 
     def meta(self, url_or_token):
         assert url_or_token == "base-token"
@@ -250,13 +308,28 @@ class FakeCLI:
         )
         return self.pages[(table_id, page_token)]
 
-    def batch_update(self, app_token, table_id, records):
-        self.batch_updates.append((app_token, table_id, list(records)))
-        return {"data": {"records": list(records)}}
+    def batch_update(self, app_token, table_id, records=None, *, file_path=None):
+        loaded_records = self._load_batch(records, file_path)
+        self.batch_updates.append((app_token, table_id, loaded_records))
+        return {"data": {"records": loaded_records}}
 
-    def batch_create(self, app_token, table_id, records):
-        self.batch_creates.append((app_token, table_id, list(records)))
-        return {"data": {"records": list(records)}}
+    def batch_create(self, app_token, table_id, records=None, *, file_path=None):
+        loaded_records = self._load_batch(records, file_path)
+        self.batch_creates.append((app_token, table_id, loaded_records))
+        return {"data": {"records": loaded_records}}
+
+    def _load_batch(self, records, file_path):
+        if file_path is None:
+            return list(records)
+        self.temp_files.append(
+            {
+                "path": file_path,
+                "mode": os.stat(file_path).st_mode & 0o777,
+                "exists_during_call": os.path.exists(file_path),
+            }
+        )
+        with open(file_path, "r", encoding="utf-8") as input_file:
+            return json.load(input_file)
 
 
 def repository_meta(*table_names):
@@ -329,6 +402,42 @@ def test_load_snapshot_raises_when_a_key_table_is_missing():
     client = FakeCLI(repository_meta("需求主表", "进展节点表", "项目配置表"))
 
     with pytest.raises(RepositorySchemaError, match="阻塞项表"):
+        BitableRepository("base-token", client=client).load_snapshot()
+
+
+class SequenceRecordsCLI(FakeCLI):
+    def __init__(self, meta, responses):
+        super().__init__(meta)
+        self.responses = iter(responses)
+
+    def records(self, *args, **kwargs):
+        self.record_calls.append({"args": args, **kwargs})
+        try:
+            return next(self.responses)
+        except StopIteration:
+            raise AssertionError("pagination loop was not detected") from None
+
+
+def test_load_snapshot_rejects_repeated_pagination_token():
+    client = SequenceRecordsCLI(
+        repository_meta("需求主表", "进展节点表", "阻塞项表", "项目配置表"),
+        [
+            {"data": {"records": [], "has_more": True, "page_token": "page-1"}},
+            {"data": {"records": [], "has_more": True, "page_token": "page-1"}},
+        ],
+    )
+
+    with pytest.raises(RepositorySchemaError, match="pagination"):
+        BitableRepository("base-token", client=client).load_snapshot()
+
+
+def test_load_snapshot_rejects_has_more_without_new_token():
+    client = SequenceRecordsCLI(
+        repository_meta("需求主表", "进展节点表", "阻塞项表", "项目配置表"),
+        [{"data": {"records": [], "has_more": True, "page_token": ""}}],
+    )
+
+    with pytest.raises(RepositorySchemaError, match="pagination"):
         BitableRepository("base-token", client=client).load_snapshot()
 
 
@@ -432,6 +541,10 @@ def test_batch_writers_chunk_at_500_and_use_schema_field_names():
         {"id": "ou-owner"},
         {"id": "ou-product"},
     ]
+    assert client.temp_files
+    assert all(item["mode"] == 0o600 for item in client.temp_files)
+    assert all(item["exists_during_call"] for item in client.temp_files)
+    assert all(not os.path.exists(item["path"]) for item in client.temp_files)
 
 
 def test_batch_writers_do_not_send_empty_batches():
@@ -445,3 +558,19 @@ def test_batch_writers_do_not_send_empty_batches():
     assert client.batch_updates == []
     assert client.batch_creates == []
     assert client.record_calls == []
+
+
+def test_batch_temp_file_is_deleted_when_cli_call_fails():
+    class FailingCLI(FakeCLI):
+        def batch_update(self, app_token, table_id, records=None, *, file_path=None):
+            self._load_batch(records, file_path)
+            raise RuntimeError("write failed")
+
+    client = FailingCLI(repository_meta("需求主表"))
+    repository = BitableRepository("base-token", client=client)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        repository.write_requirement_risks([make_requirement_risk(1)])
+
+    assert client.temp_files
+    assert all(not os.path.exists(item["path"]) for item in client.temp_files)

@@ -474,6 +474,48 @@ def test_batch_helpers_serialize_records_as_utf8_json(
 
 
 @pytest.mark.parametrize(
+    ("method_name", "expected_command"),
+    [("batch_create", "batch-create"), ("batch_update", "batch-update")],
+)
+def test_batch_helpers_support_file_input_without_payload_in_argv(
+    recorded_cli, tmp_path, method_name, expected_command
+):
+    cli, commands = recorded_cli
+    secret_payload = "敏感长内容" * 10000
+    batch_file = tmp_path / "batch.json"
+    batch_file.write_text(secret_payload, encoding="utf-8")
+
+    getattr(cli, method_name)("app", "table", file_path=str(batch_file))
+
+    assert commands == [
+        [
+            "feishu",
+            "bitable",
+            expected_command,
+            "app",
+            "table",
+            "-f",
+            str(batch_file),
+        ]
+    ]
+    assert secret_payload not in " ".join(commands[0])
+
+
+@pytest.mark.parametrize("method_name", ["batch_create", "batch_update"])
+def test_batch_helpers_require_exactly_one_input_source(recorded_cli, method_name):
+    cli, commands = recorded_cli
+
+    with pytest.raises(FeishuCLIError, match="exactly one"):
+        getattr(cli, method_name)("app", "table")
+    with pytest.raises(FeishuCLIError, match="exactly one"):
+        getattr(cli, method_name)(
+            "app", "table", [{"字段": "值"}], file_path="batch.json"
+        )
+
+    assert commands == []
+
+
+@pytest.mark.parametrize(
     "invalid_value",
     [float("nan"), object()],
 )

@@ -1,4 +1,7 @@
+import json
+import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -22,6 +25,8 @@ from requirement_monitor.models import (
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 KEY_TABLE_NAMES = ("需求主表", "进展节点表", "阻塞项表", "项目配置表")
 BATCH_SIZE = 500
+MIN_MILLISECONDS_TIMESTAMP = 1_000_000_000_000
+MAX_MILLISECONDS_TIMESTAMP = 99_999_999_999_999
 
 
 class RepositorySchemaError(RuntimeError):
@@ -217,18 +222,49 @@ class BitableRepository:
         normalized = [_notification_fields(record) for record in records]
         app_token = self._required_app_token()
         for chunk in _chunks(normalized):
-            self.client.batch_create(app_token, table_id, chunk)
+            self._write_batch_file(
+                self.client.batch_create, app_token, table_id, chunk
+            )
 
     def _batch_update(
         self, table_id: str, records: Sequence[Mapping[str, Any]]
     ) -> None:
         app_token = self._required_app_token()
         for chunk in _chunks(records):
-            self.client.batch_update(app_token, table_id, chunk)
+            self._write_batch_file(
+                self.client.batch_update, app_token, table_id, chunk
+            )
+
+    def _write_batch_file(
+        self,
+        operation: Callable[..., Mapping[str, Any]],
+        app_token: str,
+        table_id: str,
+        records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        file_descriptor, file_path = tempfile.mkstemp(
+            prefix="requirement-monitor-batch-", suffix=".json"
+        )
+        try:
+            os.chmod(file_path, 0o600)
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as output_file:
+                json.dump(
+                    records,
+                    output_file,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            operation(app_token, table_id, file_path=file_path)
+        finally:
+            try:
+                os.unlink(file_path)
+            except FileNotFoundError:
+                pass
 
     def _all_records(self, table_id: str) -> List[Mapping[str, Any]]:
         records: List[Mapping[str, Any]] = []
         page_token: Optional[str] = None
+        seen_page_tokens = set()
         while True:
             response = self.client.records(
                 self._required_app_token(),
@@ -255,6 +291,11 @@ class BitableRepository:
                 raise RepositorySchemaError(
                     "Record pagination omitted the next page token"
                 )
+            if next_page_token in seen_page_tokens:
+                raise RepositorySchemaError(
+                    "Record pagination repeated a previously seen page token"
+                )
+            seen_page_tokens.add(next_page_token)
             page_token = next_page_token
 
     def _require_tables(self, names: Iterable[str]) -> Dict[str, str]:
@@ -528,7 +569,7 @@ def _person(
     if isinstance(value, Mapping) and isinstance(value.get("users"), list):
         value = value["users"]
     people = value if isinstance(value, list) else [value]
-    if not people or not isinstance(people[0], Mapping):
+    if len(people) != 1 or not isinstance(people[0], Mapping):
         raise _FieldParseError(field_name, "must include a valid person")
     person = people[0]
     person_id = next(
@@ -590,15 +631,11 @@ def _optional_date_time(value: Any, field_name: str) -> Optional[datetime]:
         if isinstance(value, bool):
             raise ValueError
         if isinstance(value, (int, float)):
-            seconds = float(value) / 1000
-            return datetime.fromtimestamp(seconds, timezone.utc).astimezone(SHANGHAI)
+            return _milliseconds_datetime(value, field_name)
         if isinstance(value, str):
             stripped = value.strip()
             if re.fullmatch(r"-?\d+(?:\.\d+)?", stripped):
-                seconds = float(stripped) / 1000
-                return datetime.fromtimestamp(seconds, timezone.utc).astimezone(
-                    SHANGHAI
-                )
+                return _milliseconds_datetime(float(stripped), field_name)
             normalized = stripped[:-1] + "+00:00" if stripped.endswith("Z") else stripped
             parsed = datetime.fromisoformat(normalized)
             if parsed.tzinfo is None:
@@ -607,6 +644,17 @@ def _optional_date_time(value: Any, field_name: str) -> Optional[datetime]:
     except (OverflowError, OSError, ValueError):
         pass
     raise _FieldParseError(field_name, "must be milliseconds or an ISO datetime")
+
+
+def _milliseconds_datetime(value: Any, field_name: str) -> datetime:
+    milliseconds = float(value)
+    if not MIN_MILLISECONDS_TIMESTAMP <= milliseconds <= MAX_MILLISECONDS_TIMESTAMP:
+        raise _FieldParseError(
+            field_name, "numeric datetime must be a millisecond timestamp"
+        )
+    return datetime.fromtimestamp(
+        milliseconds / 1000, timezone.utc
+    ).astimezone(SHANGHAI)
 
 
 def _links(value: Any, field_name: str) -> List[str]:
