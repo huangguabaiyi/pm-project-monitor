@@ -1,3 +1,5 @@
+import json
+import re
 from datetime import datetime
 from typing import get_type_hints
 from zoneinfo import ZoneInfo
@@ -9,6 +11,7 @@ from requirement_monitor.cards import (
     build_data_error_card,
     build_plain_text_fallback,
     build_severe_card,
+    escape_value,
     interactive_card,
     mention,
 )
@@ -148,6 +151,10 @@ def card_text(payload):
     )
 
 
+def payload_bytes(payload):
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
 def assert_no_none(value):
     if isinstance(value, dict):
         for item in value.values():
@@ -171,21 +178,104 @@ def test_mention_escapes_identifier_and_visible_name():
     assert rendered == '<at id="ou-&quot;bad">张&lt;三&gt;&amp;</at>'
 
 
-def test_interactive_card_chunks_lines_without_splitting_mentions():
-    atomic_mention = mention("ou-owner", "负责人")
-    escaped_entity = "&lt;"
-    long_line = "x" * 2998 + escaped_entity + atomic_mention + "y" * 100
+def test_interactive_card_enforces_utf8_payload_and_element_budgets():
+    business_lines = [
+        "业务行 {}｜{}".format(index, "中文内容" * 80) for index in range(100)
+    ]
 
-    payload = interactive_card("长内容", "yellow", [long_line, None])
+    payload = interactive_card("中文预算卡片", "yellow", business_lines)
     contents = [element["text"]["content"] for element in payload["card"]["elements"]]
 
     assert payload["card"]["config"]["wide_screen_mode"] is True
-    assert "".join(contents) == long_line
-    assert all(len(content) <= 3000 for content in contents)
-    assert any(escaped_entity in content for content in contents)
-    assert any(atomic_mention in content for content in contents)
-    assert all(content.count("<at ") == content.count("</at>") for content in contents)
+    assert payload_bytes(payload) <= 18 * 1024
+    assert len(contents) <= 40
+    assert all(len(content.encode("utf-8")) <= 1800 for content in contents)
+    assert contents[-1] == "内容过长，请查看多维表格"
+    assert all(content in business_lines for content in contents[:-1])
     assert_no_none(payload)
+
+
+def test_long_bold_value_is_truncated_before_trusted_markdown_wrapper():
+    risk = make_risk(
+        name="超长需求" * 3000,
+        nodes=[make_node_risk("node", "开发", at(25))],
+    )
+
+    payload = build_daily_card(make_report([risk]))
+    contents = [element["text"]["content"] for element in payload["card"]["elements"]]
+    bold_lines = [content for content in contents if content.startswith("**需求概览｜")]
+
+    assert bold_lines
+    assert all(content.endswith("**") for content in bold_lines)
+    assert all(content.count("**") % 2 == 0 for content in bold_lines)
+    assert payload_bytes(payload) <= 18 * 1024
+
+
+def test_interactive_card_does_not_split_multiline_markdown_markers():
+    payload = interactive_card("模板完整性", "blue", ["**粗体\n续行**"])
+    contents = [element["text"]["content"] for element in payload["card"]["elements"]]
+
+    assert contents == ["**粗体 续行**"]
+    assert contents[0].count("**") == 2
+
+
+def test_interactive_card_replaces_empty_content_with_valid_placeholder():
+    payload = interactive_card("", "blue", [None])
+    contents = [element["text"]["content"] for element in payload["card"]["elements"]]
+
+    assert contents == ["暂无内容"]
+
+
+def test_long_mention_name_is_truncated_without_breaking_at_tag():
+    long_name = "节点负责人" * 2000
+    risk = make_risk(
+        nodes=[
+            make_node_risk(
+                "node",
+                "开发",
+                at(25),
+                owner_id="ou-long-owner",
+                owner_name=long_name,
+            )
+        ]
+    )
+
+    payload = build_daily_card(make_report([risk]))
+    text = card_text(payload)
+    matches = re.findall(r'<at id="ou-long-owner">.*?</at>', text)
+
+    assert matches
+    assert all(match.endswith("</at>") for match in matches)
+    assert all(len(match.encode("utf-8")) <= 256 for match in matches)
+    assert text.count('<at id="ou-long-owner">') == text.count("</at>")
+    assert payload_bytes(payload) <= 18 * 1024
+
+
+def test_escape_value_neutralizes_newlines_and_markdown_block_injection():
+    raw = (
+        "第一行\n# 标题\r> 引用\t- 列表\n--- 分隔 "
+        "*粗体* [链接](url) | 表格"
+    )
+
+    escaped = escape_value(raw)
+
+    assert "\n" not in escaped
+    assert "\r" not in escaped
+    assert "\t" not in escaped
+    assert ">" not in escaped
+    assert "&gt;" in escaped
+    for marker in (
+        r"\#",
+        r"\-",
+        r"\---",
+        r"\*",
+        r"\[",
+        r"\]",
+        r"\(",
+        r"\)",
+        r"\|",
+    ):
+        assert marker in escaped
 
 
 def test_daily_card_groups_projects_and_owners_with_required_ordering():

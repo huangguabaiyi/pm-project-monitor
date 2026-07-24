@@ -1,4 +1,5 @@
 import html
+import json
 import math
 import re
 from collections import OrderedDict
@@ -19,11 +20,19 @@ from .models import (
 )
 
 
-_MAX_MARKDOWN_BLOCK_LENGTH = 3000
-_ATOMIC_MARKUP_PATTERN = re.compile(
-    r'(?:<at id="[^"]*">.*?</at>'
-    r"|&(?:#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);"
-    r"|\\.)"
+_MAX_PAYLOAD_BYTES = 18 * 1024
+_MAX_ELEMENTS = 40
+_MAX_ELEMENT_BYTES = 1800
+_MAX_TITLE_BYTES = 240
+_MAX_VALUE_BYTES = 480
+_MAX_MENTION_BYTES = 256
+_MAX_MENTION_ID_BYTES = 96
+_TRUNCATION_NOTICE = "内容过长，请查看多维表格"
+_ATOMIC_ESCAPED_PATTERN = re.compile(
+    r"(?:&(?:#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);|\\.)"
+)
+_BLOCK_MARKER_PATTERN = re.compile(
+    r"(^|\s)(#{1,6}|-{3,}|={3,}|[#>+\-=])(?=\s|$)"
 )
 _LEVEL_TEMPLATES = {
     RiskLevel.NORMAL: "blue",
@@ -49,32 +58,115 @@ class _DailyRow:
 
 
 def mention(open_id: str, name: str) -> str:
-    return '<at id="{}">{}</at>'.format(
-        html.escape(_plain(open_id), quote=True),
-        html.escape(_plain(name), quote=False),
+    escaped_id = html.escape(_normalize_text(open_id), quote=True)
+    escaped_id = _truncate_escaped_text(escaped_id, _MAX_MENTION_ID_BYTES)
+    prefix = '<at id="{}">'.format(escaped_id)
+    suffix = "</at>"
+    name_budget = max(
+        1,
+        _MAX_MENTION_BYTES
+        - len(prefix.encode("utf-8"))
+        - len(suffix.encode("utf-8")),
     )
+    escaped_name = escape_value(name, max_bytes=name_budget)
+    return "{}{}{}".format(prefix, escaped_name, suffix)
+
+
+def escape_value(value: object, max_bytes: int = _MAX_VALUE_BYTES) -> str:
+    normalized = _normalize_text(value)
+    escaped = html.escape(normalized, quote=False)
+    escaped = escaped.replace("\\", "\\\\")
+    for character in ("`", "*", "_", "~", "[", "]", "(", ")", "|", "{", "}", "!"):
+        escaped = escaped.replace(character, "\\{}".format(character))
+    escaped = _BLOCK_MARKER_PATTERN.sub(
+        lambda match: "{}\\{}".format(match.group(1), match.group(2)),
+        escaped,
+    )
+    return _truncate_escaped_text(escaped, max_bytes)
 
 
 def interactive_card(
     title: str, template: str, markdown_blocks: List[str]
 ) -> Dict[str, object]:
-    elements = []
+    safe_title = _truncate_utf8(_normalize_text(title), _MAX_TITLE_BYTES) or "通知"
+    safe_template = template if template in {"blue", "yellow", "red"} else "blue"
+    source_lines: List[str] = []
+    discarded = False
     for block in markdown_blocks or []:
-        for chunk in _chunk_markdown_unit(_plain(block)):
-            elements.append(
-                {"tag": "div", "text": {"tag": "lark_md", "content": chunk}}
-            )
+        lines = _trusted_business_lines(_plain(block))
+        for line in lines:
+            if not line.strip():
+                continue
+            if len(line.encode("utf-8")) > _MAX_ELEMENT_BYTES:
+                discarded = True
+                continue
+            source_lines.append(line)
+
+    if not source_lines:
+        source_lines.append("暂无内容")
+
+    full_elements = [_markdown_element(line) for line in source_lines]
+    full_payload = _interactive_payload(safe_title, safe_template, full_elements)
+    if (
+        not discarded
+        and len(full_elements) <= _MAX_ELEMENTS
+        and _payload_bytes(full_payload) <= _MAX_PAYLOAD_BYTES
+    ):
+        return full_payload
+
+    notice_element = _markdown_element(_TRUNCATION_NOTICE)
+    kept_elements: List[Dict[str, object]] = []
+    for element in full_elements:
+        if len(kept_elements) >= _MAX_ELEMENTS - 1:
+            break
+        candidate = _interactive_payload(
+            safe_title,
+            safe_template,
+            kept_elements + [element, notice_element],
+        )
+        if _payload_bytes(candidate) > _MAX_PAYLOAD_BYTES:
+            break
+        kept_elements.append(element)
+
+    payload = _interactive_payload(
+        safe_title,
+        safe_template,
+        kept_elements + [notice_element],
+    )
+    if _payload_bytes(payload) > _MAX_PAYLOAD_BYTES:
+        payload = _interactive_payload("内容已截断", safe_template, [notice_element])
+    return payload
+
+
+def _interactive_payload(
+    title: str,
+    template: str,
+    elements: List[Dict[str, object]],
+) -> Dict[str, object]:
     return {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "template": _plain(template) or "blue",
-                "title": {"tag": "plain_text", "content": _plain(title)},
+                "template": template,
+                "title": {"tag": "plain_text", "content": title},
             },
             "elements": elements,
         },
     }
+
+
+def _markdown_element(content: str) -> Dict[str, object]:
+    return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+
+
+def _payload_bytes(payload: Dict[str, object]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def _trusted_business_lines(block: str) -> List[str]:
+    normalized = re.sub(r"[\r\n\t]+", " ", block)
+    return [re.sub(r" {2,}", " ", normalized)]
 
 
 def build_daily_card(report: RunReport) -> Dict[str, object]:
@@ -123,17 +215,18 @@ def build_severe_card(risk: RequirementRisk) -> Dict[str, object]:
             mention(risk.project_owner_id, risk.project_owner_name)
         ),
         "**需求：{}（{}）**".format(
-            _md(risk.requirement_name), _md(risk.requirement_id)
+            escape_value(risk.requirement_name, 600),
+            escape_value(risk.requirement_id, 160),
         ),
-        "项目：{}".format(_md(risk.project)),
-        "版本：{}".format(_md(risk.target_version)),
+        "项目：{}".format(escape_value(risk.project, 240)),
+        "版本：{}".format(escape_value(risk.target_version, 160)),
         "统一合板：{}".format(_format_datetime(risk.merge_at)),
         "当前预计完成：{}".format(_format_datetime(risk.predicted_completion)),
         "预计延期：{} 天".format(delayed_days),
-        "受影响交付域：{}".format(_join_md(risk.affected_domains)),
-        "判定原因：{}".format(_join_md(risk.reasons)),
+        "受影响交付域：{}".format(_join_values(risk.affected_domains)),
+        "判定原因：{}".format(_join_values(risk.reasons)),
         "阻塞：{}".format(_format_blockers(blockers, mention_owners=True)),
-        "行动：{}".format(_join_md(actions)),
+        "行动：{}".format(_join_values(actions)),
         "最晚处理时间：{}".format(_format_datetime(_latest_action_time(risk))),
         "节点负责人：{}".format(_node_owners(risk.node_risks)),
         "项目负责人：{}".format(
@@ -158,16 +251,26 @@ def build_data_error_card(
         units.extend(
             [
                 "**异常 {}**".format(index),
-                "表名：{}".format(_md(issue.table_name)),
-                "需求：{}".format(_md(issue.requirement_id or "未关联需求")),
-                "记录标识：{}".format(_md(issue.record_id or "未提供")),
-                "错误字段：{}".format(_md(issue.field_name)),
-                "当前错误值：{}".format(_md(_issue_value(issue.current_value))),
-                "预期格式：{}".format(_md(issue.expected_format or "未提供")),
-                "修复建议：{}".format(_md(issue.fix_suggestion or "未提供")),
+                "表名：{}".format(escape_value(issue.table_name, 240)),
+                "需求：{}".format(
+                    escape_value(issue.requirement_id or "未关联需求", 240)
+                ),
+                "记录标识：{}".format(
+                    escape_value(issue.record_id or "未提供", 240)
+                ),
+                "错误字段：{}".format(escape_value(issue.field_name, 240)),
+                "当前错误值：{}".format(
+                    escape_value(_issue_value(issue.current_value), 1000)
+                ),
+                "预期格式：{}".format(
+                    escape_value(issue.expected_format or "未提供", 600)
+                ),
+                "修复建议：{}".format(
+                    escape_value(issue.fix_suggestion or "未提供", 1000)
+                ),
                 "隔离范围：{}".format(scope_text),
                 "是否跳过该需求：{}".format(skip_text),
-                "错误说明：{}".format(_md(issue.message)),
+                "错误说明：{}".format(escape_value(issue.message, 1000)),
             ]
         )
     if not units:
@@ -193,7 +296,7 @@ def build_plain_text_fallback(
 def _daily_project_units(
     project: str, risks: List[RequirementRisk], report_day: date
 ) -> List[str]:
-    units = ["## {}".format(_md(project))]
+    units = ["## {}".format(escape_value(project, 240))]
     for risk in risks:
         units.extend(_requirement_summary_units(risk))
 
@@ -213,7 +316,7 @@ def _daily_project_units(
 
     for owner, rows in owners.items():
         owner_id, owner_name = owner
-        units.append("### {}".format(_md(owner_name)))
+        units.append("### {}".format(escape_value(owner_name, 180)))
         units.append(
             "@负责人｜需求｜交付域｜节点｜"
             "计划 DDL｜最晚安全 DDL｜状态"
@@ -222,17 +325,17 @@ def _daily_project_units(
             rendered_owner = (
                 mention(owner_id, owner_name)
                 if row.node.level <= RiskLevel.WARNING
-                else _md(owner_name)
+                else escape_value(owner_name, 180)
             )
             units.append(
                 "- {}｜{}｜{}｜{}｜{}｜{}｜{}（{}）".format(
                     rendered_owner,
-                    _md(row.requirement_name),
-                    _md(row.node.domain),
-                    _md(row.node.node_name),
+                    escape_value(row.requirement_name, 300),
+                    escape_value(row.node.domain, 120),
+                    escape_value(row.node.node_name, 300),
                     _format_datetime(row.node.planned_end),
                     _format_datetime(row.node.safe_deadline),
-                    _md(row.node.status.value),
+                    escape_value(row.node.status.value, 80),
                     _LEVEL_LABELS[row.node.level],
                 )
             )
@@ -246,12 +349,14 @@ def _daily_project_units(
 def _requirement_summary_units(risk: RequirementRisk) -> List[str]:
     blockers = [blocker for blocker in risk.blockers if not _blocker_done(blocker)]
     return [
-        "**需求概览｜{}**".format(_md(risk.requirement_name)),
+        "**需求概览｜{}**".format(
+            escape_value(risk.requirement_name, 600)
+        ),
         (
             "目标版本：{}｜合板：{}｜上线：{}｜"
             "缓冲：{} 天｜阻塞：{}"
         ).format(
-            _md(risk.target_version),
+            escape_value(risk.target_version, 160),
             _format_datetime(risk.merge_at),
             _format_datetime(risk.launch_at),
             _format_number(risk.buffer_days),
@@ -304,7 +409,11 @@ def _node_owners(nodes: List[NodeRisk]) -> str:
         owners[(node.owner_id, node.owner_name)] = None
     if not owners:
         return "未提供"
-    return "、".join(mention(owner_id, name) for owner_id, name in owners)
+    return _bounded_join(
+        [mention(owner_id, name) for owner_id, name in owners],
+        "、",
+        1200,
+    )
 
 
 def _format_blockers(
@@ -315,17 +424,17 @@ def _format_blockers(
         owner = (
             mention(blocker.owner_id, blocker.owner_name)
             if mention_owners
-            else _md(blocker.owner_name)
+            else escape_value(blocker.owner_name, 180)
         )
         rendered.append(
             "{}（{}｜{}｜{}）".format(
-                _md(blocker.title),
+                escape_value(blocker.title, 320),
                 owner,
-                _md(blocker.status),
+                escape_value(blocker.status, 80),
                 _format_datetime(blocker.planned_resolution_at),
             )
         )
-    return "；".join(rendered) if rendered else "无"
+    return _bounded_join(rendered, "；", 1200) if rendered else "无"
 
 
 def _delay_days(predicted: Optional[datetime], merge_at: datetime) -> int:
@@ -365,9 +474,9 @@ def _format_number(value: Optional[float]) -> str:
     return "{:.2f}".format(value).rstrip("0").rstrip(".")
 
 
-def _join_md(values: Iterable[str]) -> str:
-    rendered = [_md(value) for value in values if value]
-    return "、".join(rendered) if rendered else "未提供"
+def _join_values(values: Iterable[str]) -> str:
+    rendered = [escape_value(value, 320) for value in values if value]
+    return _bounded_join(rendered, "、", 1200) if rendered else "未提供"
 
 
 def _issue_value(value: Optional[str]) -> str:
@@ -386,66 +495,53 @@ def _plain(value: object) -> str:
     return str(value)
 
 
-def _md(value: object) -> str:
-    escaped = html.escape(_plain(value), quote=False)
-    escaped = escaped.replace("\\", "\\\\")
-    for character in ("`", "*", "_", "~", "[", "]"):
-        escaped = escaped.replace(character, "\\{}".format(character))
-    return escaped
+def _normalize_text(value: object) -> str:
+    text = _plain(value)
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
-def _chunk_markdown_unit(content: str) -> List[str]:
-    lines = content.splitlines(keepends=True) or [""]
-    chunks: List[str] = []
-    current = ""
-    for line in lines:
-        if len(line) > _MAX_MARKDOWN_BLOCK_LENGTH:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.extend(_split_long_line(line))
-            continue
-        if current and len(current) + len(line) > _MAX_MARKDOWN_BLOCK_LENGTH:
-            chunks.append(current)
-            current = ""
-        current += line
-    if current or not chunks:
-        chunks.append(current)
-    return chunks
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    ellipsis = "…"
+    budget = max(0, max_bytes - len(ellipsis.encode("utf-8")))
+    truncated = encoded[:budget].decode("utf-8", errors="ignore")
+    return truncated + ellipsis
 
 
-def _split_long_line(line: str) -> List[str]:
-    tokens: List[Tuple[bool, str]] = []
+def _truncate_escaped_text(value: str, max_bytes: int) -> str:
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value
+    ellipsis = "…"
+    budget = max(0, max_bytes - len(ellipsis.encode("utf-8")))
+    output: List[str] = []
+    used = 0
     position = 0
-    for match in _ATOMIC_MARKUP_PATTERN.finditer(line):
-        if match.start() > position:
-            tokens.append((False, line[position : match.start()]))
-        tokens.append((True, match.group(0)))
-        position = match.end()
-    if position < len(line):
-        tokens.append((False, line[position:]))
+    while position < len(value):
+        match = _ATOMIC_ESCAPED_PATTERN.match(value, position)
+        token = match.group(0) if match is not None else value[position]
+        token_bytes = len(token.encode("utf-8"))
+        if used + token_bytes > budget:
+            break
+        output.append(token)
+        used += token_bytes
+        position += len(token)
+    return "".join(output) + ellipsis
 
-    chunks: List[str] = []
-    current = ""
-    for atomic, token in tokens:
-        if atomic:
-            if current and len(current) + len(token) > _MAX_MARKDOWN_BLOCK_LENGTH:
-                chunks.append(current)
-                current = ""
-            current += token
-            continue
-        remaining = token
-        while remaining:
-            room = _MAX_MARKDOWN_BLOCK_LENGTH - len(current)
-            if room == 0:
-                chunks.append(current)
-                current = ""
-                room = _MAX_MARKDOWN_BLOCK_LENGTH
-            current += remaining[:room]
-            remaining = remaining[room:]
-            if len(current) == _MAX_MARKDOWN_BLOCK_LENGTH:
-                chunks.append(current)
-                current = ""
-    if current:
-        chunks.append(current)
-    return chunks
+
+def _bounded_join(
+    values: Iterable[str], separator: str, max_bytes: int
+) -> str:
+    selected: List[str] = []
+    for value in values:
+        candidate = separator.join(selected + [value])
+        if len(candidate.encode("utf-8")) > max_bytes:
+            if selected:
+                overflow = separator.join(selected + ["…"])
+                if len(overflow.encode("utf-8")) <= max_bytes:
+                    return overflow
+            return "…"
+        selected.append(value)
+    return separator.join(selected)
