@@ -203,10 +203,10 @@ def test_long_bold_value_is_truncated_before_trusted_markdown_wrapper():
 
     payload = build_daily_card(make_report([risk]))
     contents = [element["text"]["content"] for element in payload["card"]["elements"]]
-    bold_lines = [content for content in contents if content.startswith("**需求概览｜")]
+    bold_lines = [content for content in contents if content.startswith("**需求摘要｜")]
 
     assert bold_lines
-    assert all(content.endswith("**") for content in bold_lines)
+    assert all("**｜项目：" in content for content in bold_lines)
     assert all(content.count("**") % 2 == 0 for content in bold_lines)
     assert payload_bytes(payload) <= 18 * 1024
 
@@ -215,7 +215,7 @@ def test_interactive_card_does_not_split_multiline_markdown_markers():
     payload = interactive_card("模板完整性", "blue", ["**粗体\n续行**"])
     contents = [element["text"]["content"] for element in payload["card"]["elements"]]
 
-    assert contents == ["**粗体 续行**"]
+    assert contents == ["**粗体\n续行**"]
     assert contents[0].count("**") == 2
 
 
@@ -335,6 +335,7 @@ def test_daily_card_groups_projects_and_owners_with_required_ordering():
         make_report([first, second], llm_attempted=True, llm_degraded=True)
     )
     text = card_text(payload)
+    first_element = payload["card"]["elements"][0]["text"]["content"]
 
     assert payload["card"]["header"]["template"] == "red"
     assert "需求 2｜普通 0｜预警 1｜严重 1" in payload["card"]["header"]["title"]["content"]
@@ -349,13 +350,53 @@ def test_daily_card_groups_projects_and_owners_with_required_ordering():
     assert '<at id="ou-zhang">张三</at>' in text
     assert "账号&lt;迁移&gt;" in text
     assert "需求｜交付域｜节点｜计划 DDL｜最晚安全 DDL｜状态" in text
-    assert "目标版本：8.0" in text
+    assert "版本：8.0" in text
     assert "合板：2026-08-03 18:00" in text
     assert "上线：2026-08-05 18:00" in text
     assert "缓冲：3 天" in text
     assert "阻塞：等待 API &amp; 权限" in text
     assert "AI 补充分析不可用，基础规则正常运行" in text
+    assert "### 张三" in first_element
+    assert '<at id="ou-zhang">张三</at>' in first_element
+    assert "逾期节点" in first_element
+    assert text.index("普通未来节点") < text.index("**需求摘要｜")
     assert_no_none(payload)
+
+
+def test_daily_card_keeps_every_owner_and_top_node_before_30_summaries():
+    risks = []
+    for index in range(30):
+        requirement_id = "REQ-{:02d}".format(index)
+        owner_id = "ou-owner-{:02d}".format(index)
+        owner_name = "负责人{:02d}".format(index)
+        risks.append(
+            make_risk(
+                requirement_id=requirement_id,
+                name="需求{:02d}".format(index),
+                project="项目{}".format(index // 10),
+                nodes=[
+                    make_node_risk(
+                        "node-{:02d}".format(index),
+                        "节点{:02d}".format(index),
+                        at(25 + index % 5),
+                        requirement_id=requirement_id,
+                        owner_id=owner_id,
+                        owner_name=owner_name,
+                    )
+                ],
+            )
+        )
+
+    payload = build_daily_card(make_report(risks))
+    text = card_text(payload)
+
+    assert payload_bytes(payload) <= 18 * 1024
+    for index in range(30):
+        owner_id = "ou-owner-{:02d}".format(index)
+        owner_name = "负责人{:02d}".format(index)
+        assert owner_name in text
+        assert '<at id="{}">{}</at>'.format(owner_id, owner_name) in text
+        assert "节点{:02d}".format(index) in text
 
 
 @pytest.mark.parametrize(

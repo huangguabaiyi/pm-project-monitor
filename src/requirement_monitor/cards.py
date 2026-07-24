@@ -57,14 +57,24 @@ class _DailyRow:
     node: NodeRisk
 
 
-def mention(open_id: str, name: str) -> str:
+@dataclass
+class _OwnerDelivery:
+    rows: List[_DailyRow]
+    later_count: int = 0
+
+
+def mention(
+    open_id: str,
+    name: str,
+    max_bytes: int = _MAX_MENTION_BYTES,
+) -> str:
     escaped_id = html.escape(_normalize_text(open_id), quote=True)
     escaped_id = _truncate_escaped_text(escaped_id, _MAX_MENTION_ID_BYTES)
     prefix = '<at id="{}">'.format(escaped_id)
     suffix = "</at>"
     name_budget = max(
         1,
-        _MAX_MENTION_BYTES
+        max_bytes
         - len(prefix.encode("utf-8"))
         - len(suffix.encode("utf-8")),
     )
@@ -165,8 +175,8 @@ def _payload_bytes(payload: Dict[str, object]) -> int:
 
 
 def _trusted_business_lines(block: str) -> List[str]:
-    normalized = re.sub(r"[\r\n\t]+", " ", block)
-    return [re.sub(r" {2,}", " ", normalized)]
+    normalized = block.replace("\r\n", "\n").replace("\r", "\n")
+    return [normalized.replace("\t", " ")]
 
 
 def build_daily_card(report: RunReport) -> Dict[str, object]:
@@ -183,19 +193,15 @@ def build_daily_card(report: RunReport) -> Dict[str, object]:
         )
     )
 
-    project_risks: "OrderedDict[str, List[RequirementRisk]]" = OrderedDict()
-    for risk in risks:
-        project_risks.setdefault(risk.project, []).append(risk)
-
-    units: List[str] = []
-    for project, project_items in project_risks.items():
-        units.extend(
-            _daily_project_units(project, project_items, report.started_at.date())
-        )
+    primary, secondary, summaries = _daily_content_units(
+        risks, report.started_at.date()
+    )
+    units = primary + secondary
     if not units:
         units.append("暂无符合提醒条件的未完成节点。")
     if report.llm_attempted and report.llm_degraded:
         units.extend(["---", "AI 补充分析不可用，基础规则正常运行"])
+    units.extend(summaries)
     return interactive_card(title, _LEVEL_TEMPLATES[highest_level], units)
 
 
@@ -293,76 +299,114 @@ def build_plain_text_fallback(
     }
 
 
-def _daily_project_units(
-    project: str, risks: List[RequirementRisk], report_day: date
-) -> List[str]:
-    units = ["## {}".format(escape_value(project, 240))]
+def _daily_content_units(
+    risks: List[RequirementRisk], report_day: date
+) -> Tuple[List[str], List[str], List[str]]:
+    projects: "OrderedDict[str, OrderedDict[Tuple[str, str], _OwnerDelivery]]" = (
+        OrderedDict()
+    )
+    project_risks: "OrderedDict[str, List[RequirementRisk]]" = OrderedDict()
     for risk in risks:
-        units.extend(_requirement_summary_units(risk))
-
-    owners: "OrderedDict[Tuple[str, str], List[_DailyRow]]" = OrderedDict()
-    later_counts: "OrderedDict[Tuple[str, str], int]" = OrderedDict()
-    for risk in risks:
+        project_risks.setdefault(risk.project, []).append(risk)
+        owners = projects.setdefault(risk.project, OrderedDict())
         for node in risk.node_risks:
             if _node_done(node):
                 continue
             owner = (node.owner_id, node.owner_name)
-            owners.setdefault(owner, [])
-            later_counts.setdefault(owner, 0)
+            delivery = owners.setdefault(owner, _OwnerDelivery(rows=[]))
             if (node.planned_end.date() - report_day).days <= 7:
-                owners[owner].append(_DailyRow(risk.requirement_name, node))
+                delivery.rows.append(_DailyRow(risk.requirement_name, node))
             else:
-                later_counts[owner] += 1
+                delivery.later_count += 1
 
-    for owner, rows in owners.items():
-        owner_id, owner_name = owner
-        units.append("### {}".format(escape_value(owner_name, 180)))
-        units.append(
-            "@负责人｜需求｜交付域｜节点｜"
-            "计划 DDL｜最晚安全 DDL｜状态"
-        )
-        for row in sorted(rows, key=lambda item: _daily_sort_key(item, report_day)):
-            rendered_owner = (
-                mention(owner_id, owner_name)
-                if row.node.level <= RiskLevel.WARNING
-                else escape_value(owner_name, 180)
+    primary: List[str] = []
+    secondary: List[str] = []
+    summaries: List[str] = []
+    for project, owners in projects.items():
+        first_owner = True
+        for (_, owner_name), delivery in owners.items():
+            rows = sorted(
+                delivery.rows,
+                key=lambda item: _daily_sort_key(item, report_day),
             )
-            units.append(
-                "- {}｜{}｜{}｜{}｜{}｜{}｜{}（{}）".format(
-                    rendered_owner,
-                    escape_value(row.requirement_name, 300),
-                    escape_value(row.node.domain, 120),
-                    escape_value(row.node.node_name, 300),
-                    _format_datetime(row.node.planned_end),
-                    _format_datetime(row.node.safe_deadline),
-                    escape_value(row.node.status.value, 80),
-                    _LEVEL_LABELS[row.node.level],
+            owner_lines = []
+            if first_owner:
+                owner_lines.extend(
+                    [
+                        "## {}".format(escape_value(project, 160)),
+                        (
+                            "@负责人｜需求｜交付域｜节点｜"
+                            "计划 DDL｜最晚安全 DDL｜状态"
+                        ),
+                    ]
                 )
-            )
-        if not rows:
-            units.append("- 未来 7 天无未完成节点")
-        if later_counts[owner]:
-            units.append("- 7 天后待办：{} 项".format(later_counts[owner]))
-    return units
+                first_owner = False
+            owner_lines.append("### {}".format(escape_value(owner_name, 80)))
+            if rows:
+                owner_lines.append(_render_daily_row(rows[0], compact=True))
+                secondary.extend(_render_daily_row(row) for row in rows[1:])
+            else:
+                owner_lines.append("- 未来 7 天无未完成节点")
+            if delivery.later_count:
+                later_line = "- 7 天后待办：{} 项".format(delivery.later_count)
+                if rows:
+                    secondary.append(later_line)
+                else:
+                    owner_lines.append(later_line)
+            primary.append("\n".join(owner_lines))
+
+        summaries.extend(
+            _requirement_summary_unit(risk)
+            for risk in project_risks.get(project, [])
+        )
+
+    return primary, secondary, summaries
 
 
-def _requirement_summary_units(risk: RequirementRisk) -> List[str]:
+def _render_daily_row(row: _DailyRow, compact: bool = False) -> str:
+    if compact:
+        owner_budget = 112
+        requirement_budget = 72
+        domain_budget = 36
+        node_budget = 72
+        status_budget = 36
+    else:
+        owner_budget = _MAX_MENTION_BYTES
+        requirement_budget = 300
+        domain_budget = 120
+        node_budget = 300
+        status_budget = 80
+    rendered_owner = (
+        mention(row.node.owner_id, row.node.owner_name, owner_budget)
+        if row.node.level <= RiskLevel.WARNING
+        else escape_value(row.node.owner_name, owner_budget)
+    )
+    return "- {}｜{}｜{}｜{}｜{}｜{}｜{}（{}）".format(
+        rendered_owner,
+        escape_value(row.requirement_name, requirement_budget),
+        escape_value(row.node.domain, domain_budget),
+        escape_value(row.node.node_name, node_budget),
+        _format_datetime(row.node.planned_end),
+        _format_datetime(row.node.safe_deadline),
+        escape_value(row.node.status.value, status_budget),
+        _LEVEL_LABELS[row.node.level],
+    )
+
+
+def _requirement_summary_unit(risk: RequirementRisk) -> str:
     blockers = [blocker for blocker in risk.blockers if not _blocker_done(blocker)]
-    return [
-        "**需求概览｜{}**".format(
-            escape_value(risk.requirement_name, 600)
-        ),
-        (
-            "目标版本：{}｜合板：{}｜上线：{}｜"
-            "缓冲：{} 天｜阻塞：{}"
-        ).format(
-            escape_value(risk.target_version, 160),
-            _format_datetime(risk.merge_at),
-            _format_datetime(risk.launch_at),
-            _format_number(risk.buffer_days),
-            _format_blockers(blockers),
-        ),
-    ]
+    return (
+        "**需求摘要｜{}**｜项目：{}｜版本：{}｜合板：{}｜上线：{}｜"
+        "缓冲：{} 天｜阻塞：{}"
+    ).format(
+        escape_value(risk.requirement_name, 240),
+        escape_value(risk.project, 120),
+        escape_value(risk.target_version, 120),
+        _format_datetime(risk.merge_at),
+        _format_datetime(risk.launch_at),
+        _format_number(risk.buffer_days),
+        _format_blockers(blockers),
+    )
 
 
 def _effective_level(risk: RequirementRisk) -> RiskLevel:
