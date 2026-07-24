@@ -196,13 +196,13 @@ def build_daily_card(report: RunReport) -> Dict[str, object]:
     owner_groups, secondary, summaries = _daily_content_units(
         risks, report.started_at.date()
     )
-    remaining_units = secondary
+    required_system_units: List[str] = []
     if report.llm_attempted and report.llm_degraded:
-        remaining_units = remaining_units + [
+        required_system_units = [
             "---",
             "AI 补充分析不可用，基础规则正常运行",
         ]
-    remaining_units = remaining_units + summaries
+    remaining_units = secondary + required_system_units + summaries
     if not owner_groups and not remaining_units:
         remaining_units = ["暂无符合提醒条件的未完成节点。"]
     return _daily_interactive_card(
@@ -210,6 +210,7 @@ def build_daily_card(report: RunReport) -> Dict[str, object]:
         _LEVEL_TEMPLATES[highest_level],
         owner_groups,
         remaining_units,
+        required_system_units,
     )
 
 
@@ -218,6 +219,7 @@ def _daily_interactive_card(
     template: str,
     owner_groups: List[str],
     remaining_units: List[str],
+    required_system_units: List[str],
 ) -> Dict[str, object]:
     if not owner_groups:
         return interactive_card(title, template, remaining_units)
@@ -235,6 +237,7 @@ def _daily_interactive_card(
             safe_title,
             safe_template,
             owner_groups,
+            required_system_units,
         )
 
     optional_elements, discarded = _optional_markdown_elements(remaining_units)
@@ -293,15 +296,18 @@ def _truncated_owner_payload(
     title: str,
     template: str,
     owner_groups: List[str],
+    required_system_units: List[str],
 ) -> Dict[str, object]:
     total = len(owner_groups)
     best_count = 0
     best_elements: List[Dict[str, object]] = []
     best_notice = _owner_count_notice(0, total)
+    required_elements, _ = _optional_markdown_elements(required_system_units)
     for count in range(1, total + 1):
         blocks = _pack_owner_groups(owner_groups[:count])
         notice = _owner_count_notice(count, total)
         elements = [_markdown_element(block) for block in blocks]
+        elements.extend(required_elements)
         elements.append(_markdown_element(notice))
         candidate = _interactive_payload(title, template, elements)
         if (
@@ -310,12 +316,12 @@ def _truncated_owner_payload(
         ):
             break
         best_count = count
-        best_elements = elements[:-1]
+        best_elements = elements[: len(blocks)]
         best_notice = notice
     return _interactive_payload(
         title,
         template,
-        best_elements + [_markdown_element(best_notice)],
+        best_elements + required_elements + [_markdown_element(best_notice)],
     )
 
 

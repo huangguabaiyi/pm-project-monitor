@@ -451,6 +451,34 @@ def test_daily_card_reports_owner_count_when_owner_groups_exceed_budget():
     assert text.count('<at id="ou-owner-') == shown
 
 
+def test_daily_card_reserves_llm_footer_before_owner_truncation_notice():
+    owner_count = 150
+    payload = build_daily_card(
+        make_report(
+            make_owner_risks(owner_count),
+            llm_attempted=True,
+            llm_degraded=True,
+        )
+    )
+    text = card_text(payload)
+    match = re.search(
+        r"负责人信息已展示 (\d+)/150，剩余 (\d+) 位请查看多维表格",
+        text,
+    )
+    llm_notice = "AI 补充分析不可用，基础规则正常运行"
+
+    assert payload_bytes(payload) <= 18 * 1024
+    assert len(payload["card"]["elements"]) <= 40
+    assert match is not None
+    shown = int(match.group(1))
+    remaining = int(match.group(2))
+    assert shown + remaining == owner_count
+    assert text.count('<at id="ou-owner-') == shown
+    assert llm_notice in text
+    assert text.index('<at id="ou-owner-') < text.index(llm_notice)
+    assert text.index(llm_notice) < text.index(match.group(0))
+
+
 @pytest.mark.parametrize(
     ("level", "template"),
     [
