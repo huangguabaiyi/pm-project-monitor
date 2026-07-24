@@ -1,0 +1,12 @@
+{
+  "bitable_url": "https://mi.feishu.cn/wiki/TA6nwzFi0i4fdOkIamzcxj34nRd?fromScene=spaceOverview&table=tblQlOtlW0xmcKBE&view=vewCeVIyDY",
+  "fixed_rules_path": "固定业务规则",
+  "timezone": "Asia/Shanghai",
+  "send_hour": 20,
+  "send_minute": 0,
+  "state_dir": ".state",
+  "log_dir": "logs",
+  "llm": {
+    "enabled": false
+  }
+}
