@@ -51,6 +51,29 @@ def test_parse_fixed_rules_lists_every_missing_rule_once():
         assert message.count(missing_rule) == 1
 
 
+def test_parse_fixed_rules_rejects_additional_server_launch_weekday():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "每周二和周四", "每周一、周二和周四"
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("server_launch_weekdays",)
+
+
+def test_unrelated_1730_does_not_satisfy_server_launch_cutoff():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "，且下午5点30分后禁止上线", ""
+    )
+    rules_text += "每日例会时间为17:30\n"
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("server_launch_cutoff",)
+
+
 def test_load_fixed_rules_reads_utf8_without_writing(tmp_path, monkeypatch):
     rules_path = tmp_path / "固定业务规则"
     rules_path.write_text(CURRENT_FIXED_RULES, encoding="utf-8")
