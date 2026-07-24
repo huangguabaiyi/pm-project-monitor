@@ -192,7 +192,12 @@ def _evaluate_domain(
     rules: EffectiveRules,
     now: datetime,
 ) -> _DomainEvaluation:
-    events = _build_events(domain, nodes, rules)
+    checklist_nodes = [node for node in nodes if _is_checklist(node)]
+    events = _build_events(
+        domain,
+        [node for node in nodes if not _is_checklist(node)],
+        rules,
+    )
     node_risks: List[NodeRisk] = []
     reasons: List[str] = []
     level = RiskLevel.NORMAL
@@ -209,12 +214,6 @@ def _evaluate_domain(
             _downstream_duration(events, event.order),
             rules.duration_mode,
         )
-        if _is_checklist(event.node) and requirement.launch_at is not None:
-            safe_deadline = subtract_days(
-                requirement.launch_at,
-                rules.checklist_days_before,
-                "natural",
-            )
         node_level, node_reasons, node_buffer = _evaluate_node(
             event,
             safe_deadline,
@@ -223,9 +222,6 @@ def _evaluate_domain(
             rules,
             now,
         )
-        if _checklist_is_due(event.node, requirement, rules, now):
-            node_level = RiskLevel.SEVERE
-            node_reasons.append("服务端上线 Checklist 未完成")
         level = max(level, node_level)
         reasons.extend(node_reasons)
         node_risks.append(
@@ -244,6 +240,14 @@ def _evaluate_domain(
                 actions=[],
             )
         )
+
+    for checklist_node in checklist_nodes:
+        checklist_risk = _evaluate_checklist_node(
+            checklist_node, requirement, rules, now
+        )
+        level = max(level, checklist_risk.level)
+        reasons.extend(checklist_risk.reasons)
+        node_risks.append(checklist_risk)
 
     for event in events:
         if (
@@ -265,18 +269,32 @@ def _evaluate_domain(
             level = max(level, RiskLevel.WARNING)
             reasons.append("测试排期缺少计划开始时间")
 
+    if not events:
+        return _DomainEvaluation(
+            domain=domain,
+            predicted_completion=None,
+            buffer_days=None,
+            level=level,
+            reasons=_deduplicate(reasons),
+            node_risks=node_risks,
+        )
+
     predicted_completion = _predict_domain_completion(events, rules, now)
     remaining_duration = sum(
         event.duration for event in events if _event_is_unfinished(event, events)
     )
     available = days_available(now, requirement.merge_at, rules.duration_mode)
     minimum_buffer = available - remaining_duration
-    schedule_buffer = (
-        days_available(predicted_completion, requirement.merge_at, rules.duration_mode)
-        if predicted_completion is not None
-        else minimum_buffer
+    minimum_completion = add_days(now, remaining_duration, rules.duration_mode)
+    workday_minimum_buffer = days_available(
+        minimum_completion, requirement.merge_at, "workday"
     )
-    buffer_days = min(minimum_buffer, schedule_buffer)
+    workday_schedule_buffer = (
+        days_available(predicted_completion, requirement.merge_at, "workday")
+        if predicted_completion is not None
+        else workday_minimum_buffer
+    )
+    buffer_days = min(workday_minimum_buffer, workday_schedule_buffer)
 
     if minimum_buffer < 0:
         level = RiskLevel.SEVERE
@@ -340,12 +358,16 @@ def _evaluate_node(
             level = RiskLevel.SEVERE
             reasons.append(f"{event.label}计划测试周期低于最低要求")
 
-    if node is first_unfinished:
-        update_reference = node.updated_at or node.planned_start
-        if (
-            update_reference is not None
-            and days_available(update_reference, now, "workday") >= 2
-        ):
+    if (
+        node is first_unfinished
+        and node.planned_start is not None
+        and node.planned_start <= now
+    ):
+        update_reference = max(
+            node.updated_at or node.planned_start,
+            node.planned_start,
+        )
+        if days_available(update_reference, now, "workday") >= 2:
             level = max(level, RiskLevel.WARNING)
             reasons.append("连续2个工作日没有进展更新")
 
@@ -590,6 +612,42 @@ def _blocker_done(blocker: Blocker) -> bool:
 
 def _is_checklist(node: DeliveryNode) -> bool:
     return node.domain == "服务端" and "checklist" in node.name.lower()
+
+
+def _evaluate_checklist_node(
+    node: DeliveryNode,
+    requirement: Requirement,
+    rules: EffectiveRules,
+    now: datetime,
+) -> NodeRisk:
+    safe_deadline = (
+        subtract_days(
+            requirement.launch_at,
+            rules.checklist_days_before,
+            "natural",
+        )
+        if requirement.launch_at is not None
+        else None
+    )
+    reasons = (
+        ["服务端上线 Checklist 未完成"]
+        if _checklist_is_due(node, requirement, rules, now)
+        else []
+    )
+    return NodeRisk(
+        node_record_id=node.record_id,
+        requirement_id=node.requirement_id,
+        node_name=node.name,
+        domain=node.domain,
+        owner_id=node.owner_id,
+        owner_name=node.owner_name,
+        level=RiskLevel.SEVERE if reasons else RiskLevel.NORMAL,
+        predicted_completion=None,
+        safe_deadline=safe_deadline,
+        buffer_days=None,
+        reasons=reasons,
+        actions=[],
+    )
 
 
 def _checklist_is_due(

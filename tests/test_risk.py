@@ -321,6 +321,26 @@ def test_buffer_of_two_days_or_less_is_warning(rules):
     assert "剩余缓冲不超过2天" in result.reasons
 
 
+def test_two_day_buffer_warning_always_uses_workdays(rules):
+    node = make_node(planned_end=at(31, 18))
+    requirement = make_requirement(merge_at=in_aug(3, 18))
+    config = make_config(
+        duration_mode="natural",
+        at_days=0,
+        pv_days=0,
+        bugfix_days=0,
+        regression_days=0,
+    )
+
+    result = evaluate_requirement(
+        requirement, [node], [], rules, NOW, project_config=config
+    )
+
+    assert result.level == RiskLevel.WARNING
+    assert result.buffer_days == 1
+    assert "剩余缓冲不超过2天" in result.reasons
+
+
 def test_minimum_test_duration_that_cannot_fit_is_severe(rules):
     nodes = [
         make_node("AT 测试第一轮", work_type="测试", planned_end=at(28)),
@@ -335,7 +355,7 @@ def test_minimum_test_duration_that_cannot_fit_is_severe(rules):
 
 
 def test_stale_update_for_two_workdays_is_warning(rules):
-    node = make_node(updated_at=at(22, 12))
+    node = make_node(planned_start=at(20, 9), updated_at=at(22, 12))
 
     result = evaluate_requirement(make_requirement(), [node], [], rules, NOW)
 
@@ -350,6 +370,24 @@ def test_missing_update_is_stale_two_workdays_after_node_start(rules):
 
     assert result.level == RiskLevel.WARNING
     assert "连续2个工作日没有进展更新" in result.reasons
+
+
+def test_future_node_does_not_trigger_stale_update_warning(rules):
+    node = make_node(planned_start=at(27, 9), updated_at=at(20, 9))
+
+    result = evaluate_requirement(make_requirement(), [node], [], rules, NOW)
+
+    assert result.level == RiskLevel.NORMAL
+    assert "连续2个工作日没有进展更新" not in result.reasons
+
+
+def test_stale_update_baseline_never_precedes_planned_start(rules):
+    node = make_node(planned_start=at(23, 9), updated_at=at(20, 9))
+
+    result = evaluate_requirement(make_requirement(), [node], [], rules, NOW)
+
+    assert result.level == RiskLevel.NORMAL
+    assert "连续2个工作日没有进展更新" not in result.reasons
 
 
 def test_blocker_due_within_one_workday_is_warning(rules):
@@ -429,6 +467,53 @@ def test_incomplete_checklist_is_severe_on_day_before_launch(rules):
     assert checklist_risk.level == RiskLevel.SEVERE
     assert "服务端上线 Checklist 未完成" in checklist_risk.reasons
     assert checklist_risk.safe_deadline == at(27, 17)
+
+
+def test_checklist_only_participates_in_launch_checks_not_domain_aggregation(rules):
+    now = in_aug(17, 9)
+    requirement = make_requirement(
+        merge_at=in_aug(18, 12),
+        launch_at=in_aug(18, 17),
+    )
+    client_done = make_node(
+        domain="客户端",
+        planned_end=in_aug(10, 18),
+        actual_end=in_aug(10, 18),
+        status=NodeStatus.COMPLETED,
+    )
+    server_done = make_node(
+        domain="服务端",
+        planned_end=in_aug(8, 18),
+        actual_end=in_aug(8, 18),
+        status=NodeStatus.COMPLETED,
+    )
+    checklist = make_node(
+        "上线 Checklist",
+        domain="服务端",
+        work_type="发布",
+        planned_start=None,
+        planned_end=in_aug(18, 16),
+        status=NodeStatus.NOT_STARTED,
+        updated_at=now,
+    )
+
+    result = evaluate_requirement(
+        requirement,
+        [client_done, server_done, checklist],
+        [],
+        rules,
+        now,
+    )
+
+    assert result.predicted_completion == in_aug(10, 18)
+    assert result.buffer_days == 1
+    assert not any(
+        "交付域预计完成时间晚于合板时间" in item for item in result.reasons
+    )
+    checklist_risk = node_result(result, "上线 Checklist", "服务端")
+    assert checklist_risk.level == RiskLevel.SEVERE
+    assert checklist_risk.buffer_days is None
+    assert checklist_risk.reasons == ["服务端上线 Checklist 未完成"]
 
 
 def test_completed_downstream_stages_do_not_consume_remaining_duration(rules):
