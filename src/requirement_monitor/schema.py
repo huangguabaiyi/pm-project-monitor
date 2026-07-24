@@ -603,8 +603,8 @@ def _preflight_existing_schema(
         expected_primary_name = table_spec.primary_field_name
         if (
             table_spec.name == "需求主表"
-            and _table_name(table) == "数据表"
             and "需求编号" not in fields_by_name
+            and "文本" in fields_by_name
         ):
             expected_primary_name = "文本"
         _validate_primary_field(

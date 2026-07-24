@@ -336,6 +336,44 @@ def test_initialize_schema_applies_two_phases_and_seed_is_idempotent():
     assert len(BASIC_CONFIG_SEEDS) == 35
 
 
+def test_apply_recovers_after_table_rename_succeeds_and_field_rename_fails():
+    client = FailingRenameFieldOnceClient()
+
+    with pytest.raises(SchemaError, match="rename_field.*需求编号"):
+        initialize_schema(
+            "https://example.feishu.cn/base/app",
+            apply=True,
+            client=client,
+            sleep_fn=lambda _: None,
+        )
+
+    assert client.tables == [{"table_id": "tbl-main", "name": "需求主表"}]
+    assert client.fields_by_table["tbl-main"][0]["field_name"] == "文本"
+
+    second_operations = initialize_schema(
+        "https://example.feishu.cn/base/app",
+        apply=True,
+        client=client,
+        sleep_fn=lambda _: None,
+    )
+    third_operations = initialize_schema(
+        "https://example.feishu.cn/base/app",
+        apply=True,
+        client=client,
+        sleep_fn=lambda _: None,
+    )
+
+    assert second_operations[0] == Operation(
+        "rename_field",
+        {
+            "table_id": "tbl-main",
+            "field_id": "fld-main-primary",
+            "name": "需求编号",
+        },
+    )
+    assert third_operations == []
+
+
 def test_initialize_schema_rediscovers_tables_for_a_table_scoped_url():
     client = TableScopedMetaClient()
 
@@ -650,6 +688,27 @@ class FailingCreateTableClient(FakeSchemaClient):
             raise RuntimeError("permission denied")
         return super().create_table(
             app_token, name, fields, default_view_name=default_view_name
+        )
+
+
+class FailingRenameFieldOnceClient(FakeSchemaClient):
+    def __init__(self):
+        super().__init__()
+        self.fail_rename_field = True
+
+    def update_field(self, app_token, table_id, field_id, *, name=None, property=None):
+        if self.fail_rename_field:
+            self.fail_rename_field = False
+            self.calls.append(
+                ("update_field", app_token, table_id, field_id, name, property)
+            )
+            raise RuntimeError("rename field failed")
+        return super().update_field(
+            app_token,
+            table_id,
+            field_id,
+            name=name,
+            property=property,
         )
 
 
