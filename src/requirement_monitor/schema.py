@@ -1,8 +1,10 @@
 import json
+import time
+from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from requirement_monitor.feishu_cli import FeishuCLI
+from requirement_monitor.feishu_cli import FeishuCLI, FeishuCLIError
 
 
 TEXT = 1
@@ -29,6 +31,10 @@ class FieldSpec:
 class TableSpec:
     name: str
     fields: Tuple[FieldSpec, ...]
+
+    @property
+    def primary_field_name(self) -> str:
+        return self.fields[0].name
 
 
 @dataclass(frozen=True)
@@ -209,7 +215,9 @@ def build_schema_plan(
     fields_by_table: Mapping[str, Any],
 ) -> List[Operation]:
     tables = _table_items(meta)
+    _require_unique_names(tables, _table_name, "table")
     tables_by_name = {_table_name(table): table for table in tables}
+    _preflight_existing_schema(tables_by_name, fields_by_table)
     operations: List[Operation] = []
     renamed_fields = set()
 
@@ -313,24 +321,28 @@ def initialize_schema(
     *,
     apply: bool,
     client: Optional[FeishuCLI] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> List[Operation]:
     schema_client = client or FeishuCLI()
     meta, fields_by_table = _inspect_schema(schema_client, bitable_url)
     plan = build_schema_plan(meta, fields_by_table)
 
     if not apply:
-        seed_operation = _build_seed_operation(schema_client, meta)
+        seed_operation = _build_seed_operation(
+            schema_client, meta, summary=True
+        )
         if seed_operation is not None:
             plan.append(seed_operation)
         return plan
 
+    executor = _OperationExecutor(schema_client, sleep_fn)
     applied_operations: List[Operation] = []
     for _ in range(3):
         plan = build_schema_plan(meta, fields_by_table)
         if not plan:
             break
         for operation in plan:
-            _apply_operation(schema_client, meta, operation)
+            executor.execute(meta, operation)
             applied_operations.append(operation)
         meta, fields_by_table = _inspect_schema(schema_client, bitable_url)
     else:
@@ -340,9 +352,9 @@ def initialize_schema(
     if remaining_plan:
         raise SchemaError("Schema installation left unapplied operations")
 
-    seed_operation = _build_seed_operation(schema_client, meta)
+    seed_operation = _build_seed_operation(schema_client, meta, summary=False)
     if seed_operation is not None:
-        _apply_operation(schema_client, meta, seed_operation)
+        executor.execute(meta, seed_operation)
         applied_operations.append(seed_operation)
     return applied_operations
 
@@ -360,6 +372,42 @@ def _inspect_schema(
         for table in _table_items(meta)
     }
     return meta, fields_by_table
+
+
+class _OperationExecutor:
+    def __init__(
+        self,
+        client: FeishuCLI,
+        sleep_fn: Callable[[float], None],
+        write_delay: float = 0.6,
+    ) -> None:
+        self.client = client
+        self.sleep_fn = sleep_fn
+        self.write_delay = write_delay
+        self.has_written = False
+
+    def execute(
+        self, meta: Mapping[str, Any], operation: Operation
+    ) -> None:
+        retries = 0
+        while True:
+            if self.has_written:
+                self.sleep_fn(self.write_delay)
+            self.has_written = True
+            try:
+                _apply_operation(self.client, meta, operation)
+                return
+            except Exception as exc:
+                if (
+                    isinstance(exc, FeishuCLIError)
+                    and "1254291" in str(exc)
+                    and retries < 3
+                ):
+                    retries += 1
+                    continue
+                raise SchemaError(
+                    "Schema operation {} failed: {}".format(operation, exc)
+                ) from exc
 
 
 def _apply_operation(
@@ -397,7 +445,10 @@ def _apply_operation(
 
 
 def _build_seed_operation(
-    client: FeishuCLI, meta: Mapping[str, Any]
+    client: FeishuCLI,
+    meta: Mapping[str, Any],
+    *,
+    summary: bool,
 ) -> Optional[Operation]:
     basic_table = next(
         (
@@ -408,18 +459,29 @@ def _build_seed_operation(
         None,
     )
     if basic_table is None:
+        if summary:
+            return Operation(
+                "seed_records",
+                {
+                    "table_id": "<基础配置表>",
+                    "record_count": len(BASIC_CONFIG_SEEDS),
+                },
+            )
         return None
 
     app_token = _app_token(meta)
     table_id = _table_id(basic_table)
     existing_records = _all_records(client, app_token, table_id)
-    existing_keys = {
-        (
-            record.get("fields", {}).get("配置类型"),
-            record.get("fields", {}).get("配置名称"),
+    existing_keys = set()
+    for record in existing_records:
+        record_fields = record.get("fields")
+        if not isinstance(record_fields, Mapping):
+            raise SchemaError(
+                "Bitable record did not include a fields object"
+            )
+        existing_keys.add(
+            (record_fields.get("配置类型"), record_fields.get("配置名称"))
         )
-        for record in existing_records
-    }
     missing_records = [
         record
         for record in BASIC_CONFIG_SEEDS
@@ -431,6 +493,11 @@ def _build_seed_operation(
     ]
     if not missing_records:
         return None
+    if summary:
+        return Operation(
+            "seed_records",
+            {"table_id": table_id, "record_count": len(missing_records)},
+        )
     return Operation(
         "seed_records", {"table_id": table_id, "records": missing_records}
     )
@@ -446,11 +513,21 @@ def _all_records(
             app_token, table_id, page_size=500, page_token=page_token
         )
         data = _data_object(response)
-        page_records = data.get("items", data.get("records", []))
-        if isinstance(page_records, list):
-            records.extend(
-                record for record in page_records if isinstance(record, Mapping)
+        if "records" in data:
+            page_records = data["records"]
+        elif "items" in data:
+            page_records = data["items"]
+        else:
+            raise SchemaError(
+                "Bitable records response did not include a record list"
             )
+        if not isinstance(page_records, list):
+            raise SchemaError(
+                "Bitable records response did not include a record list"
+            )
+        if any(not isinstance(record, Mapping) for record in page_records):
+            raise SchemaError("Bitable record list contained an invalid record")
+        records.extend(page_records)
         if not data.get("has_more"):
             return records
         next_page_token = data.get("page_token")
@@ -479,7 +556,13 @@ def _validate_existing_field(
         return
     target_id = table_ids.get(field_spec.target_table or "")
     if target_id is None:
-        return
+        raise SchemaError(
+            "Field {}.{} target table is missing: {}".format(
+                table_spec.name,
+                field_spec.name,
+                field_spec.target_table,
+            )
+        )
     property_data = existing_field.get("property")
     if isinstance(property_data, Mapping):
         actual_target = property_data.get("table_id")
@@ -491,6 +574,86 @@ def _validate_existing_field(
             table_spec.name, field_spec.name
         )
     )
+
+
+def _preflight_existing_schema(
+    tables_by_name: Mapping[str, Mapping[str, Any]],
+    fields_by_table: Mapping[str, Any],
+) -> None:
+    effective_tables = dict(tables_by_name)
+    if "需求主表" not in effective_tables and "数据表" in effective_tables:
+        effective_tables["需求主表"] = effective_tables["数据表"]
+    table_ids = {
+        name: _table_id(table) for name, table in effective_tables.items()
+    }
+
+    for table_spec in SCHEMA:
+        table = effective_tables.get(table_spec.name)
+        if table is None:
+            continue
+        table_id = _table_id(table)
+        if table_id not in fields_by_table:
+            raise SchemaError(
+                "Missing field response for table {}".format(table_spec.name)
+            )
+        fields = _field_items(fields_by_table[table_id])
+        _require_unique_names(fields, _field_name, "field")
+        fields_by_name = {_field_name(field): field for field in fields}
+
+        expected_primary_name = table_spec.primary_field_name
+        if (
+            table_spec.name == "需求主表"
+            and _table_name(table) == "数据表"
+            and "需求编号" not in fields_by_name
+        ):
+            expected_primary_name = "文本"
+        _validate_primary_field(
+            table_spec.name, expected_primary_name, fields
+        )
+
+        for field_spec in table_spec.fields:
+            existing_field = fields_by_name.get(field_spec.name)
+            if existing_field is not None:
+                _validate_existing_field(
+                    table_spec, field_spec, existing_field, table_ids
+                )
+
+
+def _validate_primary_field(
+    table_name: str,
+    expected_name: str,
+    fields: Sequence[Mapping[str, Any]],
+) -> None:
+    primary_fields = [field for field in fields if field.get("is_primary") is True]
+    if len(primary_fields) != 1:
+        raise SchemaError(
+            "Table {} must have exactly one primary field".format(table_name)
+        )
+    actual_name = _field_name(primary_fields[0])
+    if actual_name != expected_name:
+        raise SchemaError(
+            "Field {}.{} must be the primary field; found {}".format(
+                table_name, expected_name, actual_name
+            )
+        )
+
+
+def _require_unique_names(
+    items: Sequence[Mapping[str, Any]],
+    name_getter: Callable[[Mapping[str, Any]], str],
+    item_kind: str,
+) -> None:
+    names = [name_getter(item) for item in items]
+    duplicates = sorted(
+        name for name, count in Counter(names).items() if count > 1
+    )
+    if duplicates:
+        label = "table" if item_kind == "table" else "field"
+        raise SchemaError(
+            "Duplicate {} name is ambiguous: {}".format(
+                label, ", ".join(duplicates)
+            )
+        )
 
 
 def _data_object(value: Mapping[str, Any]) -> Mapping[str, Any]:

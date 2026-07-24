@@ -48,7 +48,18 @@ def test_init_table_dry_run_prints_operations_without_applying(capsys):
                 "FakeOperation",
                 (),
                 {"kind": "rename_table", "payload": {"name": "需求主表"}},
-            )()
+            )(),
+            type(
+                "FakeOperation",
+                (),
+                {
+                    "kind": "seed_records",
+                    "payload": {
+                        "table_id": "<基础配置表>",
+                        "record_count": 35,
+                    },
+                },
+            )(),
         ]
 
     exit_code = cli.main(
@@ -61,4 +72,6 @@ def test_init_table_dry_run_prints_operations_without_applying(capsys):
 
     assert exit_code == 0
     assert calls == [("https://example.feishu.cn/base/app", False)]
-    assert "rename_table" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "rename_table" in output
+    assert 'seed_records {"record_count": 35' in output
