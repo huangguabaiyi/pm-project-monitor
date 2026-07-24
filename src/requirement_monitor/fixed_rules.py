@@ -1,46 +1,44 @@
 import re
 from pathlib import Path
-from typing import List, Match, Optional
+from typing import List, Optional, Pattern
 
 from requirement_monitor.models import FixedRules
 
 
 _SERVER_LAUNCH_CONTEXT_PATTERN = re.compile(r"服务端[^。\n]*上线[^。\n]*")
-_WEEKDAY_PATTERN = re.compile(r"周(?P<weekday>[一二三四五六日天])")
-_SERVER_WEEKDAY_NEGATION_PATTERN = re.compile(
-    r"(?:并非|不是|不(?:在|按))[^，。；;\n]{0,24}周[一二三四五六日天]"
+_SERVER_WEEKDAYS_PATTERN = re.compile(
+    r"服务端(?:的)?上线时间\s*固定为\s*每?周二\s*(?:和|及|、)\s*"
+    r"(?:每)?周四(?=\s*[,，。；;\n]|$)"
 )
-_WEEKDAY_NUMBERS = {
-    "一": 0,
-    "二": 1,
-    "三": 2,
-    "四": 3,
-    "五": 4,
-    "六": 5,
-    "日": 6,
-    "天": 6,
-}
-_CHECKLIST_PATTERN = re.compile(r"前\s*一天[^。\n]*checklist", re.IGNORECASE)
+_CHECKLIST_PATTERN = re.compile(
+    r"服务端[^，。；;\n]*上线[^，。；;\n]*[,，]\s*(?:需|需要)\s*在\s*"
+    r"前\s*一天\s*提交[^，。；;\n]*checklist",
+    re.IGNORECASE,
+)
 _CUTOFF_TIME_REGEX = r"(?:17\s*[:：]\s*30|下午\s*5\s*点\s*30\s*分)"
 _CUTOFF_PATTERN = re.compile(
     rf"(?:{_CUTOFF_TIME_REGEX}\s*后\s*禁止上线"
     rf"|上线截止(?:时间)?\s*(?:为|是|[:：])?\s*{_CUTOFF_TIME_REGEX}"
     rf"|{_CUTOFF_TIME_REGEX}\s*(?:为|是)\s*上线截止(?:时间)?)"
 )
-_AT_DURATION_PATTERN = re.compile(r"AT[^。\n]*一\s*周\s*半", re.IGNORECASE)
-_AT_DURATION_NEGATION_PATTERN = re.compile(
-    r"AT[^。\n]*(?:不需要|无需|并非|不是)[^。\n]*一\s*周\s*半",
+_AT_DURATION_PATTERN = re.compile(
+    r"AT[^。\n]*测试周期\s*(?:(?:一般\s*)?需要\s*(?:至少\s*)?"
+    r"|至少\s*(?:需要\s*)?)一\s*周\s*半\s*以上",
     re.IGNORECASE,
 )
 _PV_DAYS_PATTERN = re.compile(
-    r"PV\s*测试[^。\n]*?(?P<days>\d+)\s*天", re.IGNORECASE
+    r"PV\s*(?:测试\s*一般\s*在|测试周期\s*在)\s*"
+    r"(?P<days>\d+)\s*天\s*左右",
+    re.IGNORECASE,
 )
 _BUGFIX_DAYS_PATTERN = re.compile(
-    r"(?:加上|预留)\s*(?P<days>\d+)\s*天\s*(?:解|修复)\s*Bug",
+    r"(?:加上|预留)\s*(?P<days>\d+)\s*天\s*"
+    r"(?:(?:解|修复)\s*Bug|Bug\s*修复)(?:的时间)?",
     re.IGNORECASE,
 )
 _REGRESSION_DAYS_PATTERN = re.compile(
-    r"线上回归[^。\n]*?(?P<days>\d+)\s*天"
+    r"线上回归\s*(?:一般\s*在|测试周期\s*在)\s*"
+    r"(?P<days>\d+)\s*天\s*左右"
 )
 
 
@@ -54,18 +52,7 @@ def parse_fixed_rules(text: str) -> FixedRules:
     missing_rules: List[str] = []
     server_launch_contexts = _server_launch_contexts(text)
 
-    server_launch_weekdays = {
-        _WEEKDAY_NUMBERS[match.group("weekday")]
-        for context in server_launch_contexts
-        for match in _WEEKDAY_PATTERN.finditer(context)
-    }
-    has_negated_server_weekdays = any(
-        _SERVER_WEEKDAY_NEGATION_PATTERN.search(context) is not None
-        for context in server_launch_contexts
-    )
-    has_server_weekdays = (
-        server_launch_weekdays == {1, 3} and not has_negated_server_weekdays
-    )
+    has_server_weekdays = _SERVER_WEEKDAYS_PATTERN.search(text) is not None
     if not has_server_weekdays:
         missing_rules.append("server_launch_weekdays")
 
@@ -76,29 +63,23 @@ def parse_fixed_rules(text: str) -> FixedRules:
     if not has_cutoff:
         missing_rules.append("server_launch_cutoff")
 
-    has_checklist = any(
-        _CHECKLIST_PATTERN.search(context) is not None
-        for context in server_launch_contexts
-    )
+    has_checklist = _CHECKLIST_PATTERN.search(text) is not None
     if not has_checklist:
         missing_rules.append("checklist_days_before")
 
-    has_at_duration = (
-        _AT_DURATION_PATTERN.search(text) is not None
-        and _AT_DURATION_NEGATION_PATTERN.search(text) is None
-    )
+    has_at_duration = _AT_DURATION_PATTERN.search(text) is not None
     if not has_at_duration:
         missing_rules.extend(("at_workdays", "at_natural_days"))
 
-    pv_days = _matched_days(_PV_DAYS_PATTERN.search(text))
+    pv_days = _unique_matched_days(_PV_DAYS_PATTERN, text)
     if pv_days is None:
         missing_rules.append("pv_days")
 
-    bugfix_days = _matched_days(_BUGFIX_DAYS_PATTERN.search(text))
+    bugfix_days = _unique_matched_days(_BUGFIX_DAYS_PATTERN, text)
     if bugfix_days is None:
         missing_rules.append("bugfix_days")
 
-    regression_days = _matched_days(_REGRESSION_DAYS_PATTERN.search(text))
+    regression_days = _unique_matched_days(_REGRESSION_DAYS_PATTERN, text)
     if regression_days is None:
         missing_rules.append("regression_days")
 
@@ -106,7 +87,7 @@ def parse_fixed_rules(text: str) -> FixedRules:
         raise FixedRuleParseError(missing_rules)
 
     return FixedRules(
-        server_launch_weekdays=server_launch_weekdays,
+        server_launch_weekdays={1, 3},
         server_launch_cutoff="17:30",
         checklist_days_before=1,
         at_workdays=8,
@@ -121,10 +102,11 @@ def load_fixed_rules(path: Path) -> FixedRules:
     return parse_fixed_rules(path.read_text(encoding="utf-8"))
 
 
-def _matched_days(match: Optional[Match[str]]) -> Optional[int]:
-    if match is None:
+def _unique_matched_days(pattern: Pattern[str], text: str) -> Optional[int]:
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
         return None
-    return int(match.group("days"))
+    return int(matches[0].group("days"))
 
 
 def _server_launch_contexts(text: str) -> List[str]:

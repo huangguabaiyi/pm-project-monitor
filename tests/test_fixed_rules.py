@@ -62,6 +62,18 @@ def test_parse_fixed_rules_rejects_additional_server_launch_weekday():
     assert exc_info.value.missing_rules == ("server_launch_weekdays",)
 
 
+def test_server_weekdays_require_explicit_fixed_launch_time_structure():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "服务端的上线时间固定为每周二和周四",
+        "服务端每周二和周四上线",
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert "server_launch_weekdays" in exc_info.value.missing_rules
+
+
 def test_unrelated_1730_does_not_satisfy_server_launch_cutoff():
     rules_text = CURRENT_FIXED_RULES.replace(
         "，且下午5点30分后禁止上线", ""
@@ -79,6 +91,30 @@ def test_client_checklist_does_not_satisfy_server_checklist_rule():
         "需在前一天提交对应的 checklist 上线表格，", ""
     )
     rules_text += "客户端需在前一天提交 checklist 上线表格\n"
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("checklist_days_before",)
+
+
+def test_client_checklist_subclause_is_not_a_server_checklist_rule():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "需在前一天提交对应的 checklist 上线表格",
+        "客户端需在前一天提交对应的 checklist 上线表格",
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("checklist_days_before",)
+
+
+def test_unneeded_server_checklist_is_rejected():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "需在前一天提交对应的 checklist 上线表格",
+        "无需在前一天提交对应的 checklist 上线表格",
+    )
 
     with pytest.raises(FixedRuleParseError) as exc_info:
         parse_fixed_rules(rules_text)
@@ -108,6 +144,72 @@ def test_negated_at_duration_is_rejected():
         parse_fixed_rules(rules_text)
 
     assert exc_info.value.missing_rules == ("at_workdays", "at_natural_days")
+
+
+@pytest.mark.parametrize(
+    "at_rule",
+    (
+        "AT测试周期最多需要一周半以上",
+        "AT测试周期一般需要一周半以下",
+    ),
+)
+def test_at_duration_requires_positive_minimum_structure(at_rule):
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "AT1轮加二轮的测试周期一般需要一周半以上",
+        at_rule,
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("at_workdays", "at_natural_days")
+
+
+def test_pv_total_days_do_not_count_as_pv_test_days():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "PV 测试一般在 3 天左右，加上 2 天解 Bug 的时间，总计大约 5 天",
+        "PV 测试总计大约 5 天，加上 2 天解 Bug 的时间",
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("pv_days",)
+
+
+def test_ambiguous_pv_test_durations_are_rejected():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "PV 测试一般在 3 天左右",
+        "PV 测试一般在 3 天左右，PV 测试周期在 5 天左右",
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("pv_days",)
+
+
+def test_ambiguous_bugfix_durations_are_rejected():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "加上 2 天解 Bug 的时间",
+        "加上 2 天解 Bug 的时间，预留 4 天修复 Bug",
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("bugfix_days",)
+
+
+def test_regression_days_require_explicit_positive_structure():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "线上回归一般在3天左右", "线上回归最多3天"
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("regression_days",)
 
 
 @pytest.mark.parametrize(
@@ -147,3 +249,9 @@ def test_load_repository_fixed_rules_file():
 
     assert rules.server_launch_weekdays == {1, 3}
     assert rules.server_launch_cutoff == "17:30"
+    assert rules.checklist_days_before == 1
+    assert rules.at_workdays == 8
+    assert rules.at_natural_days == 11
+    assert rules.pv_days == 3
+    assert rules.bugfix_days == 2
+    assert rules.regression_days == 3
