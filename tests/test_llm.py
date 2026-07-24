@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+import requirement_monitor.llm as llm_module
 from requirement_monitor.config import LLMSettings
 from requirement_monitor.llm import LLMClient
 from requirement_monitor.models import RequirementRisk, RiskLevel
@@ -233,6 +234,81 @@ def test_undecodable_http_body_returns_invalid_json(httpx_mock, llm_settings):
     )
 
     assert_unavailable(enrichment, RiskLevel.NORMAL, "invalid_json")
+
+
+def test_json_nested_1100_levels_returns_invalid_json(httpx_mock, llm_settings):
+    nested_value = "[" * 1100 + "0" + "]" * 1100
+    content = (
+        '{"risk_level":"预警","summary":'
+        + nested_value
+        + ',"reasons":[],"actions":[]}'
+    )
+    httpx_mock.add_response(
+        json={"choices": [{"message": {"content": content}}]}
+    )
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "invalid_json")
+
+
+def test_response_extraction_recursion_returns_invalid_json(
+    httpx_mock, llm_settings, monkeypatch
+):
+    httpx_mock.add_response(json=response_content())
+
+    def raise_recursion(response):
+        raise RecursionError(API_KEY)
+
+    monkeypatch.setattr(httpx.Response, "json", raise_recursion)
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "invalid_json")
+    assert API_KEY not in enrichment.model_dump_json()
+
+
+def test_schema_recursion_returns_schema_error(
+    httpx_mock, llm_settings, monkeypatch
+):
+    httpx_mock.add_response(json=response_content())
+
+    def raise_recursion(*args, **kwargs):
+        raise RecursionError(API_KEY)
+
+    monkeypatch.setattr(
+        llm_module._LLMResponse, "model_validate", raise_recursion
+    )
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "schema_error")
+    assert API_KEY not in enrichment.model_dump_json()
+
+
+def test_level_mapping_recursion_returns_schema_error(
+    httpx_mock, llm_settings, monkeypatch
+):
+    httpx_mock.add_response(json=response_content())
+
+    class RecursingLevels(dict):
+        def __getitem__(self, key):
+            raise RecursionError(API_KEY)
+
+    monkeypatch.setattr(llm_module, "_LEVELS", RecursingLevels())
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "schema_error")
+    assert API_KEY not in enrichment.model_dump_json()
 
 
 @pytest.mark.parametrize(

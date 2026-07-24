@@ -6,7 +6,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     StringConstraints,
-    ValidationError,
 )
 
 from .config import LLMSettings
@@ -87,21 +86,13 @@ class LLMClient:
         if response.is_error:
             return self._unavailable(risk.level, "service_error")
 
-        content, failure_reason = self._response_content(response)
+        parsed_response, failure_reason = self._parse_response(response)
         if failure_reason is not None:
             return self._unavailable(risk.level, failure_reason)
-
-        try:
-            raw_result = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            return self._unavailable(risk.level, "invalid_json")
-
-        try:
-            result = _LLMResponse.model_validate(raw_result)
-        except ValidationError:
+        if parsed_response is None:
             return self._unavailable(risk.level, "schema_error")
 
-        llm_level = _LEVELS[result.risk_level]
+        result, llm_level = parsed_response
         return LLMEnrichment(
             available=True,
             rule_level=risk.level,
@@ -139,15 +130,37 @@ class LLMClient:
         }
 
     @staticmethod
+    def _parse_response(
+        response: httpx.Response,
+    ) -> Tuple[
+        Optional[Tuple[_LLMResponse, RiskLevel]], Optional[str]
+    ]:
+        try:
+            content, failure_reason = LLMClient._response_content(response)
+            if failure_reason is not None:
+                return None, failure_reason
+            raw_result = json.loads(content)
+        except MemoryError:
+            raise
+        except Exception:
+            return None, "invalid_json"
+
+        try:
+            result = _LLMResponse.model_validate(raw_result)
+            llm_level = _LEVELS[result.risk_level]
+        except MemoryError:
+            raise
+        except Exception:
+            return None, "schema_error"
+        return (result, llm_level), None
+
+    @staticmethod
     def _response_content(
         response: httpx.Response,
     ) -> Tuple[Optional[str], Optional[str]]:
         if not response.content or not response.content.strip():
             return None, "empty_response"
-        try:
-            payload = response.json()
-        except Exception:
-            return None, "invalid_json"
+        payload = response.json()
 
         if not isinstance(payload, dict):
             return None, "empty_response"
