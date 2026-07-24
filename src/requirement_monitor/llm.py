@@ -56,25 +56,31 @@ class LLMClient:
         fixed_rules: str,
         project_description: str,
     ) -> LLMEnrichment:
+        api_key = self.settings.api_key
+        base_url = self.settings.base_url
+        model = self.settings.model
+
         if not self.settings.enabled:
             return self._unavailable(risk.level, "disabled")
-        if self.settings.api_key is None:
+        if api_key is None:
             return self._unavailable(risk.level, "missing_api_key")
-        if self.settings.base_url is None or self.settings.model is None:
+        if base_url is None or model is None:
             return self._unavailable(risk.level, "invalid_configuration")
-        if not self._is_secure_base_url():
+        if not self._is_secure_base_url(base_url):
             return self._unavailable(risk.level, "insecure_base_url")
 
         try:
             response = httpx.post(
-                self._endpoint(),
+                self._endpoint(base_url),
                 headers={
                     "Authorization": "Bearer {}".format(
-                        self.settings.api_key.get_secret_value()
+                        api_key.get_secret_value()
                     ),
                     "Content-Type": "application/json",
                 },
-                json=self._request_body(risk, fixed_rules, project_description),
+                json=self._request_body(
+                    model, risk, fixed_rules, project_description
+                ),
                 timeout=self.settings.timeout_seconds,
             )
         except MemoryError:
@@ -110,12 +116,14 @@ class LLMClient:
             actions=result.actions,
         )
 
-    def _endpoint(self) -> str:
-        return "{}/chat/completions".format(self.settings.base_url.rstrip("/"))
+    @staticmethod
+    def _endpoint(base_url: str) -> str:
+        return "{}/chat/completions".format(base_url.rstrip("/"))
 
-    def _is_secure_base_url(self) -> bool:
+    @staticmethod
+    def _is_secure_base_url(base_url: str) -> bool:
         try:
-            parsed = urlparse(self.settings.base_url)
+            parsed = urlparse(base_url)
             hostname = parsed.hostname
         except (TypeError, ValueError):
             return False
@@ -129,6 +137,7 @@ class LLMClient:
 
     def _request_body(
         self,
+        model: str,
         risk: RequirementRisk,
         fixed_rules: str,
         project_description: str,
@@ -139,7 +148,7 @@ class LLMClient:
             "project_description": project_description,
         }
         return {
-            "model": self.settings.model,
+            "model": model,
             "temperature": 0,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -160,6 +169,8 @@ class LLMClient:
             content, failure_reason = LLMClient._response_content(response)
             if failure_reason is not None:
                 return None, failure_reason
+            if content is None:
+                return None, "invalid_json"
             raw_result = json.loads(content)
         except MemoryError:
             raise

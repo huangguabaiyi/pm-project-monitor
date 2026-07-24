@@ -243,6 +243,14 @@ def test_http_loopback_base_url_is_allowed(
     assert httpx_mock.get_request().url == expected_url
 
 
+def test_endpoint_accepts_explicit_validated_base_url(llm_settings):
+    client = LLMClient(llm_settings)
+
+    assert client._endpoint("https://safe.example.com/v1/") == (
+        "https://safe.example.com/v1/chat/completions"
+    )
+
+
 def test_request_memory_error_is_not_downgraded(
     httpx_mock, llm_settings, monkeypatch
 ):
@@ -318,6 +326,32 @@ def test_undecodable_http_body_returns_invalid_json(httpx_mock, llm_settings):
     )
 
     assert_unavailable(enrichment, RiskLevel.NORMAL, "invalid_json")
+
+
+def test_none_response_content_is_rejected_before_json_loads(
+    httpx_mock, llm_settings, monkeypatch
+):
+    httpx_mock.add_response(content=b"{}")
+    json_loads_calls = []
+
+    monkeypatch.setattr(
+        LLMClient,
+        "_response_content",
+        staticmethod(lambda response: (None, None)),
+    )
+
+    def track_json_loads(value):
+        json_loads_calls.append(value)
+        return {}
+
+    monkeypatch.setattr(llm_module.json, "loads", track_json_loads)
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "invalid_json")
+    assert json_loads_calls == []
 
 
 def test_json_nested_1100_levels_returns_invalid_json(httpx_mock, llm_settings):
