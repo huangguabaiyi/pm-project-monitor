@@ -107,7 +107,10 @@ def test_client_checklist_subclause_is_not_a_server_checklist_rule():
     with pytest.raises(FixedRuleParseError) as exc_info:
         parse_fixed_rules(rules_text)
 
-    assert exc_info.value.missing_rules == ("checklist_days_before",)
+    assert exc_info.value.missing_rules == (
+        "server_launch_cutoff",
+        "checklist_days_before",
+    )
 
 
 def test_unneeded_server_checklist_is_rejected():
@@ -224,6 +227,113 @@ def test_before_1730_does_not_satisfy_server_launch_cutoff(cutoff_text):
         parse_fixed_rules(rules_text)
 
     assert exc_info.value.missing_rules == ("server_launch_cutoff",)
+
+
+def test_server_cutoff_does_not_inherit_across_semicolon():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "，且下午5点30分后禁止上线", "；且下午5点30分后禁止上线"
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("server_launch_cutoff",)
+
+
+def test_client_cutoff_clause_does_not_inherit_server_context():
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "且下午5点30分后禁止上线", "客户端下午5点30分后禁止上线"
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("server_launch_cutoff",)
+
+
+@pytest.mark.parametrize(
+    ("rules_text", "missing_rules"),
+    (
+        (
+            CURRENT_FIXED_RULES
+            + "服务端上线时间固定为每周二和周四\n",
+            ("server_launch_weekdays",),
+        ),
+        (
+            CURRENT_FIXED_RULES + "服务端17:30后禁止上线\n",
+            ("server_launch_cutoff",),
+        ),
+        (
+            CURRENT_FIXED_RULES.replace(
+                "，且下午5点30分后禁止上线",
+                "，需要在前一天提交 checklist，且下午5点30分后禁止上线",
+            ),
+            ("checklist_days_before",),
+        ),
+        (
+            CURRENT_FIXED_RULES + "AT测试周期至少一周半以上\n",
+            ("at_workdays", "at_natural_days"),
+        ),
+    ),
+)
+def test_duplicate_service_and_at_rules_are_rejected(rules_text, missing_rules):
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == missing_rules
+
+
+@pytest.mark.parametrize(
+    ("conflicting_rule", "missing_rules"),
+    (
+        (
+            "服务端上线时间固定为每周一和周三\n",
+            ("server_launch_weekdays",),
+        ),
+        (
+            "AT测试周期至少两周以上\n",
+            ("at_workdays", "at_natural_days"),
+        ),
+    ),
+)
+def test_conflicting_service_and_at_rules_are_rejected(
+    conflicting_rule, missing_rules
+):
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(CURRENT_FIXED_RULES + conflicting_rule)
+
+    assert exc_info.value.missing_rules == missing_rules
+
+
+@pytest.mark.parametrize(
+    ("source", "replacement", "missing_rule"),
+    (
+        (
+            "PV 测试一般在 3 天左右",
+            "PV 测试一般在 3 天左右以下",
+            "pv_days",
+        ),
+        (
+            "加上 2 天解 Bug 的时间",
+            "加上 2 天解 Bug 的时间以下",
+            "bugfix_days",
+        ),
+        (
+            "线上回归一般在3天左右",
+            "线上回归一般在3天左右以下",
+            "regression_days",
+        ),
+    ),
+)
+def test_duration_rules_reject_reverse_clause_suffix(
+    source, replacement, missing_rule
+):
+    rules_text = CURRENT_FIXED_RULES.replace(source, replacement)
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == (missing_rule,)
 
 
 def test_load_fixed_rules_reads_utf8_without_writing(tmp_path, monkeypatch):
