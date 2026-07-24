@@ -193,16 +193,154 @@ def build_daily_card(report: RunReport) -> Dict[str, object]:
         )
     )
 
-    primary, secondary, summaries = _daily_content_units(
+    owner_groups, secondary, summaries = _daily_content_units(
         risks, report.started_at.date()
     )
-    units = primary + secondary
-    if not units:
-        units.append("暂无符合提醒条件的未完成节点。")
+    remaining_units = secondary
     if report.llm_attempted and report.llm_degraded:
-        units.extend(["---", "AI 补充分析不可用，基础规则正常运行"])
-    units.extend(summaries)
-    return interactive_card(title, _LEVEL_TEMPLATES[highest_level], units)
+        remaining_units = remaining_units + [
+            "---",
+            "AI 补充分析不可用，基础规则正常运行",
+        ]
+    remaining_units = remaining_units + summaries
+    if not owner_groups and not remaining_units:
+        remaining_units = ["暂无符合提醒条件的未完成节点。"]
+    return _daily_interactive_card(
+        title,
+        _LEVEL_TEMPLATES[highest_level],
+        owner_groups,
+        remaining_units,
+    )
+
+
+def _daily_interactive_card(
+    title: str,
+    template: str,
+    owner_groups: List[str],
+    remaining_units: List[str],
+) -> Dict[str, object]:
+    if not owner_groups:
+        return interactive_card(title, template, remaining_units)
+
+    safe_title = _truncate_utf8(_normalize_text(title), _MAX_TITLE_BYTES) or "通知"
+    safe_template = template if template in {"blue", "yellow", "red"} else "blue"
+    owner_blocks = _pack_owner_groups(owner_groups)
+    owner_elements = [_markdown_element(block) for block in owner_blocks]
+    owner_payload = _interactive_payload(safe_title, safe_template, owner_elements)
+    if (
+        len(owner_elements) > _MAX_ELEMENTS
+        or _payload_bytes(owner_payload) > _MAX_PAYLOAD_BYTES
+    ):
+        return _truncated_owner_payload(
+            safe_title,
+            safe_template,
+            owner_groups,
+        )
+
+    optional_elements, discarded = _optional_markdown_elements(remaining_units)
+    full_elements = owner_elements + optional_elements
+    full_payload = _interactive_payload(safe_title, safe_template, full_elements)
+    if (
+        not discarded
+        and len(full_elements) <= _MAX_ELEMENTS
+        and _payload_bytes(full_payload) <= _MAX_PAYLOAD_BYTES
+    ):
+        return full_payload
+
+    notice_element = _markdown_element(_TRUNCATION_NOTICE)
+    kept_elements = list(owner_elements)
+    for element in optional_elements:
+        if len(kept_elements) >= _MAX_ELEMENTS - 1:
+            break
+        candidate = _interactive_payload(
+            safe_title,
+            safe_template,
+            kept_elements + [element, notice_element],
+        )
+        if _payload_bytes(candidate) > _MAX_PAYLOAD_BYTES:
+            break
+        kept_elements.append(element)
+
+    candidate = _interactive_payload(
+        safe_title,
+        safe_template,
+        kept_elements + [notice_element],
+    )
+    if (
+        len(kept_elements) < _MAX_ELEMENTS
+        and _payload_bytes(candidate) <= _MAX_PAYLOAD_BYTES
+    ):
+        return candidate
+    return _interactive_payload(safe_title, safe_template, kept_elements)
+
+
+def _pack_owner_groups(owner_groups: List[str]) -> List[str]:
+    blocks: List[str] = []
+    current: List[str] = []
+    for group in owner_groups:
+        candidate = "\n\n".join(current + [group])
+        if current and len(candidate.encode("utf-8")) > _MAX_ELEMENT_BYTES:
+            blocks.append("\n\n".join(current))
+            current = [group]
+        else:
+            current.append(group)
+    if current:
+        blocks.append("\n\n".join(current))
+    return blocks
+
+
+def _truncated_owner_payload(
+    title: str,
+    template: str,
+    owner_groups: List[str],
+) -> Dict[str, object]:
+    total = len(owner_groups)
+    best_count = 0
+    best_elements: List[Dict[str, object]] = []
+    best_notice = _owner_count_notice(0, total)
+    for count in range(1, total + 1):
+        blocks = _pack_owner_groups(owner_groups[:count])
+        notice = _owner_count_notice(count, total)
+        elements = [_markdown_element(block) for block in blocks]
+        elements.append(_markdown_element(notice))
+        candidate = _interactive_payload(title, template, elements)
+        if (
+            len(elements) > _MAX_ELEMENTS
+            or _payload_bytes(candidate) > _MAX_PAYLOAD_BYTES
+        ):
+            break
+        best_count = count
+        best_elements = elements[:-1]
+        best_notice = notice
+    return _interactive_payload(
+        title,
+        template,
+        best_elements + [_markdown_element(best_notice)],
+    )
+
+
+def _owner_count_notice(shown: int, total: int) -> str:
+    return "负责人信息已展示 {}/{}，剩余 {} 位请查看多维表格".format(
+        shown,
+        total,
+        total - shown,
+    )
+
+
+def _optional_markdown_elements(
+    units: List[str],
+) -> Tuple[List[Dict[str, object]], bool]:
+    elements: List[Dict[str, object]] = []
+    discarded = False
+    for unit in units:
+        for block in _trusted_business_lines(_plain(unit)):
+            if not block.strip():
+                continue
+            if len(block.encode("utf-8")) > _MAX_ELEMENT_BYTES:
+                discarded = True
+                continue
+            elements.append(_markdown_element(block))
+    return elements, discarded
 
 
 def build_severe_card(risk: RequirementRisk) -> Dict[str, object]:

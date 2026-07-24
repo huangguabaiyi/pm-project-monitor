@@ -145,6 +145,32 @@ def make_report(risks, *, llm_attempted=False, llm_degraded=False):
     )
 
 
+def make_owner_risks(count):
+    risks = []
+    for index in range(count):
+        requirement_id = "REQ-{:02d}".format(index)
+        owner_id = "ou-owner-{:02d}".format(index)
+        owner_name = "负责人{:02d}".format(index)
+        risks.append(
+            make_risk(
+                requirement_id=requirement_id,
+                name="需求{:02d}".format(index),
+                project="项目{}".format(index // 10),
+                nodes=[
+                    make_node_risk(
+                        "node-{:02d}".format(index),
+                        "节点{:02d}".format(index),
+                        at(25 + index % 5),
+                        requirement_id=requirement_id,
+                        owner_id=owner_id,
+                        owner_name=owner_name,
+                    )
+                ],
+            )
+        )
+    return risks
+
+
 def card_text(payload):
     return "\n".join(
         element["text"]["content"] for element in payload["card"]["elements"]
@@ -364,28 +390,7 @@ def test_daily_card_groups_projects_and_owners_with_required_ordering():
 
 
 def test_daily_card_keeps_every_owner_and_top_node_before_30_summaries():
-    risks = []
-    for index in range(30):
-        requirement_id = "REQ-{:02d}".format(index)
-        owner_id = "ou-owner-{:02d}".format(index)
-        owner_name = "负责人{:02d}".format(index)
-        risks.append(
-            make_risk(
-                requirement_id=requirement_id,
-                name="需求{:02d}".format(index),
-                project="项目{}".format(index // 10),
-                nodes=[
-                    make_node_risk(
-                        "node-{:02d}".format(index),
-                        "节点{:02d}".format(index),
-                        at(25 + index % 5),
-                        requirement_id=requirement_id,
-                        owner_id=owner_id,
-                        owner_name=owner_name,
-                    )
-                ],
-            )
-        )
+    risks = make_owner_risks(30)
 
     payload = build_daily_card(make_report(risks))
     text = card_text(payload)
@@ -397,6 +402,53 @@ def test_daily_card_keeps_every_owner_and_top_node_before_30_summaries():
         assert owner_name in text
         assert '<at id="{}">{}</at>'.format(owner_id, owner_name) in text
         assert "节点{:02d}".format(index) in text
+
+
+@pytest.mark.parametrize("owner_count", [40, 50])
+def test_daily_card_packs_all_short_owner_groups_within_limits(owner_count):
+    payload = build_daily_card(make_report(make_owner_risks(owner_count)))
+    text = card_text(payload)
+    owner_elements = [
+        element
+        for element in payload["card"]["elements"]
+        if '<at id="ou-owner-' in element["text"]["content"]
+    ]
+
+    assert payload_bytes(payload) <= 18 * 1024
+    assert len(payload["card"]["elements"]) <= 40
+    assert len(owner_elements) < owner_count
+    assert any(
+        element["text"]["content"].count('<at id="ou-owner-') > 1
+        for element in owner_elements
+    )
+    assert all(
+        len(element["text"]["content"].encode("utf-8")) <= 1800
+        for element in owner_elements
+    )
+    assert "负责人信息已展示" not in text
+    for index in range(owner_count):
+        owner_id = "ou-owner-{:02d}".format(index)
+        owner_name = "负责人{:02d}".format(index)
+        assert '<at id="{}">{}</at>'.format(owner_id, owner_name) in text
+        assert "节点{:02d}".format(index) in text
+
+
+def test_daily_card_reports_owner_count_when_owner_groups_exceed_budget():
+    owner_count = 150
+    payload = build_daily_card(make_report(make_owner_risks(owner_count)))
+    text = card_text(payload)
+    match = re.search(
+        r"负责人信息已展示 (\d+)/150，剩余 (\d+) 位请查看多维表格",
+        text,
+    )
+
+    assert payload_bytes(payload) <= 18 * 1024
+    assert len(payload["card"]["elements"]) <= 40
+    assert match is not None
+    shown = int(match.group(1))
+    remaining = int(match.group(2))
+    assert shown + remaining == owner_count
+    assert text.count('<at id="ou-owner-') == shown
 
 
 @pytest.mark.parametrize(
