@@ -1,0 +1,308 @@
+import json
+
+import httpx
+import pytest
+
+from requirement_monitor.config import LLMSettings
+from requirement_monitor.llm import LLMClient
+from requirement_monitor.models import RequirementRisk, RiskLevel
+
+
+API_KEY = "sk-super-secret-token"
+
+
+@pytest.fixture
+def llm_settings():
+    return LLMSettings(
+        enabled=True,
+        base_url="https://llm.example.com/v1/",
+        api_key=API_KEY,
+        model="risk-model",
+        timeout_seconds=7,
+    )
+
+
+def make_risk(level=RiskLevel.NORMAL):
+    return RequirementRisk(
+        requirement_record_id="rec-1",
+        requirement_id="REQ-1",
+        requirement_name="语音助手升级",
+        project="车机项目",
+        level=level,
+        buffer_days=2,
+        affected_domains=["客户端"],
+        reasons=["剩余缓冲不超过2天"],
+        actions=["确认提测时间"],
+    )
+
+
+def response_content(
+    risk_level="预警",
+    summary="需要关注测试窗口",
+    reasons=None,
+    actions=None,
+):
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "risk_level": risk_level,
+                            "summary": summary,
+                            "reasons": reasons or ["测试窗口偏紧"],
+                            "actions": actions or ["尽快确认提测计划"],
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+            }
+        ]
+    }
+
+
+def assert_unavailable(enrichment, rule_level, failure_reason):
+    assert enrichment.available is False
+    assert enrichment.rule_level == rule_level
+    assert enrichment.llm_level is None
+    assert enrichment.effective_level == rule_level
+    assert enrichment.summary == ""
+    assert enrichment.reasons == []
+    assert enrichment.actions == []
+    assert enrichment.failure_reason == failure_reason
+
+
+def test_posts_openai_compatible_request_with_guardrails(
+    httpx_mock, llm_settings
+):
+    httpx_mock.add_response(json=response_content())
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "规则原文：上线日期不可变", "项目说明：本周进入测试"
+    )
+
+    request = httpx_mock.get_request()
+    assert request.url == "https://llm.example.com/v1/chat/completions"
+    assert request.headers["Authorization"] == "Bearer {}".format(API_KEY)
+    assert request.extensions["timeout"] == {
+        "connect": 7.0,
+        "read": 7.0,
+        "write": 7.0,
+        "pool": 7.0,
+    }
+
+    payload = json.loads(request.content)
+    assert payload["model"] == "risk-model"
+    assert payload["temperature"] == 0
+    assert len(payload["messages"]) == 2
+
+    system_prompt = payload["messages"][0]["content"]
+    assert "固定规则只读" in system_prompt
+    assert "只读取传入的固定规则文本" in system_prompt
+    assert "不得修改日期" in system_prompt
+    assert "只能升级" in system_prompt
+    assert all(
+        key in system_prompt
+        for key in ("risk_level", "summary", "reasons", "actions")
+    )
+
+    user_input = json.loads(payload["messages"][1]["content"])
+    assert user_input["fixed_rules"] == "规则原文：上线日期不可变"
+    assert user_input["project_description"] == "项目说明：本周进入测试"
+    assert user_input["risk"]["requirement_id"] == "REQ-1"
+    assert user_input["risk"]["level"] == RiskLevel.NORMAL
+
+    assert enrichment.available is True
+    assert enrichment.effective_level == RiskLevel.WARNING
+
+
+@pytest.mark.parametrize(
+    ("chinese_level", "expected"),
+    (
+        ("普通", RiskLevel.NORMAL),
+        ("预警", RiskLevel.WARNING),
+        ("严重", RiskLevel.SEVERE),
+    ),
+)
+def test_maps_chinese_risk_levels(
+    httpx_mock, llm_settings, chinese_level, expected
+):
+    httpx_mock.add_response(json=response_content(risk_level=chinese_level))
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert enrichment.llm_level == expected
+    assert enrichment.effective_level == expected
+
+
+def test_llm_cannot_downgrade_rule_risk(httpx_mock, llm_settings):
+    httpx_mock.add_response(json=response_content(risk_level="普通"))
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(RiskLevel.SEVERE), "固定规则", "项目说明"
+    )
+
+    assert enrichment.available is True
+    assert enrichment.llm_level == RiskLevel.NORMAL
+    assert enrichment.effective_level == RiskLevel.SEVERE
+
+
+def test_llm_can_upgrade_rule_risk(httpx_mock, llm_settings):
+    httpx_mock.add_response(json=response_content(risk_level="严重"))
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(RiskLevel.WARNING), "固定规则", "项目说明"
+    )
+
+    assert enrichment.available is True
+    assert enrichment.effective_level == RiskLevel.SEVERE
+    assert enrichment.summary == "需要关注测试窗口"
+    assert enrichment.reasons == ["测试窗口偏紧"]
+    assert enrichment.actions == ["尽快确认提测计划"]
+
+
+def test_disabled_configuration_does_not_make_request(httpx_mock):
+    settings = LLMSettings(enabled=False)
+
+    enrichment = LLMClient(settings).enrich(
+        make_risk(RiskLevel.WARNING), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.WARNING, "disabled")
+    assert httpx_mock.get_requests() == []
+
+
+def test_missing_api_key_does_not_make_request(httpx_mock, llm_settings):
+    settings = llm_settings.model_copy(update={"api_key": None})
+
+    enrichment = LLMClient(settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "missing_api_key")
+    assert httpx_mock.get_requests() == []
+
+
+@pytest.mark.parametrize(
+    ("status_code", "failure_reason"),
+    ((401, "authentication_error"), (429, "rate_limit_error")),
+)
+def test_expected_http_failures_return_unavailable(
+    httpx_mock, llm_settings, status_code, failure_reason
+):
+    httpx_mock.add_response(
+        status_code=status_code,
+        json={"error": {"message": "request failed for {}".format(API_KEY)}},
+    )
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(RiskLevel.WARNING), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.WARNING, failure_reason)
+    assert API_KEY not in enrichment.model_dump_json()
+
+
+def test_timeout_returns_unavailable(httpx_mock, llm_settings):
+    httpx_mock.add_exception(httpx.ReadTimeout("slow upstream"))
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "timeout")
+
+
+def test_empty_http_body_returns_empty_response(httpx_mock, llm_settings):
+    httpx_mock.add_response(status_code=204)
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "empty_response")
+
+
+def test_undecodable_http_body_returns_invalid_json(httpx_mock, llm_settings):
+    httpx_mock.add_response(content=b"\xff")
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "invalid_json")
+
+
+@pytest.mark.parametrize(
+    ("response", "failure_reason"),
+    (
+        ({"choices": [{"message": {"content": ""}}]}, "empty_response"),
+        ({"choices": []}, "empty_response"),
+        (
+            {"choices": [{"message": {"content": "not-json"}}]},
+            "invalid_json",
+        ),
+        (
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"risk_level":"预警","summary":"缺字段"}'
+                        }
+                    }
+                ]
+            },
+            "schema_error",
+        ),
+        (response_content(risk_level="critical"), "schema_error"),
+    ),
+)
+def test_invalid_model_responses_return_unavailable(
+    httpx_mock, llm_settings, response, failure_reason
+):
+    httpx_mock.add_response(json=response)
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(RiskLevel.SEVERE), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.SEVERE, failure_reason)
+
+
+def test_network_failures_do_not_raise(httpx_mock, llm_settings):
+    httpx_mock.add_exception(
+        httpx.ConnectError("cannot connect {}".format(API_KEY))
+    )
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "request_error")
+    assert API_KEY not in enrichment.model_dump_json()
+
+
+def test_server_failure_returns_unavailable(httpx_mock, llm_settings):
+    httpx_mock.add_response(status_code=503, content=API_KEY)
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "service_error")
+    assert API_KEY not in enrichment.model_dump_json()
+
+
+def test_unexpected_response_body_never_leaks_api_key(httpx_mock, llm_settings):
+    httpx_mock.add_response(
+        json={"choices": [{"message": {"content": API_KEY}}]}
+    )
+
+    enrichment = LLMClient(llm_settings).enrich(
+        make_risk(), "固定规则", "项目说明"
+    )
+
+    assert_unavailable(enrichment, RiskLevel.NORMAL, "invalid_json")
+    assert API_KEY not in enrichment.model_dump_json()
