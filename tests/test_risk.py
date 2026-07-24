@@ -372,8 +372,25 @@ def test_missing_update_is_stale_two_workdays_after_node_start(rules):
     assert "连续2个工作日没有进展更新" in result.reasons
 
 
+def test_in_progress_node_without_planned_start_uses_updated_at_for_staleness(rules):
+    node = make_node(
+        planned_start=None,
+        updated_at=at(22, 9),
+        status=NodeStatus.IN_PROGRESS,
+    )
+
+    result = evaluate_requirement(make_requirement(), [node], [], rules, NOW)
+
+    assert result.level == RiskLevel.WARNING
+    assert "连续2个工作日没有进展更新" in result.reasons
+
+
 def test_future_node_does_not_trigger_stale_update_warning(rules):
-    node = make_node(planned_start=at(27, 9), updated_at=at(20, 9))
+    node = make_node(
+        planned_start=at(27, 9),
+        updated_at=at(20, 9),
+        status=NodeStatus.NOT_STARTED,
+    )
 
     result = evaluate_requirement(make_requirement(), [node], [], rules, NOW)
 

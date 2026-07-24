@@ -358,16 +358,17 @@ def _evaluate_node(
             level = RiskLevel.SEVERE
             reasons.append(f"{event.label}计划测试周期低于最低要求")
 
-    if (
-        node is first_unfinished
-        and node.planned_start is not None
-        and node.planned_start <= now
-    ):
-        update_reference = max(
-            node.updated_at or node.planned_start,
-            node.planned_start,
-        )
-        if days_available(update_reference, now, "workday") >= 2:
+    staleness_enabled = node.status == NodeStatus.IN_PROGRESS or (
+        node.planned_start is not None and node.planned_start <= now
+    )
+    if node is first_unfinished and staleness_enabled:
+        update_references = [
+            value for value in (node.updated_at, node.planned_start) if value is not None
+        ]
+        if (
+            update_references
+            and days_available(max(update_references), now, "workday") >= 2
+        ):
             level = max(level, RiskLevel.WARNING)
             reasons.append("连续2个工作日没有进展更新")
 
