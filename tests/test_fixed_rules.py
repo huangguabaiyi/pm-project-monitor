@@ -74,6 +74,20 @@ def test_unrelated_1730_does_not_satisfy_server_launch_cutoff():
     assert exc_info.value.missing_rules == ("server_launch_cutoff",)
 
 
+@pytest.mark.parametrize(
+    "cutoff_text", ("17:30前禁止上线", "下午5点30分前禁止上线")
+)
+def test_before_1730_does_not_satisfy_server_launch_cutoff(cutoff_text):
+    rules_text = CURRENT_FIXED_RULES.replace(
+        "下午5点30分后禁止上线", cutoff_text
+    )
+
+    with pytest.raises(FixedRuleParseError) as exc_info:
+        parse_fixed_rules(rules_text)
+
+    assert exc_info.value.missing_rules == ("server_launch_cutoff",)
+
+
 def test_load_fixed_rules_reads_utf8_without_writing(tmp_path, monkeypatch):
     rules_path = tmp_path / "固定业务规则"
     rules_path.write_text(CURRENT_FIXED_RULES, encoding="utf-8")

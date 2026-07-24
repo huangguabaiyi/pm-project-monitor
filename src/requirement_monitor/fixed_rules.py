@@ -20,8 +20,9 @@ _WEEKDAY_NUMBERS = {
 _CHECKLIST_PATTERN = re.compile(r"前\s*一天[^。\n]*checklist", re.IGNORECASE)
 _CUTOFF_TIME_REGEX = r"(?:17\s*[:：]\s*30|下午\s*5\s*点\s*30\s*分)"
 _CUTOFF_PATTERN = re.compile(
-    rf"(?:{_CUTOFF_TIME_REGEX}[^。\n]{{0,12}}(?:禁止上线|上线截止)"
-    rf"|(?:禁止上线|上线截止(?:时间)?)[^。\n]{{0,12}}{_CUTOFF_TIME_REGEX})"
+    rf"(?:{_CUTOFF_TIME_REGEX}\s*后\s*禁止上线"
+    rf"|上线截止(?:时间)?\s*(?:为|是|[:：])?\s*{_CUTOFF_TIME_REGEX}"
+    rf"|{_CUTOFF_TIME_REGEX}\s*(?:为|是)\s*上线截止(?:时间)?)"
 )
 _AT_DURATION_PATTERN = re.compile(r"AT[^。\n]*一\s*周\s*半", re.IGNORECASE)
 _PV_DAYS_PATTERN = re.compile(
