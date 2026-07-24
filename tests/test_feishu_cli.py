@@ -1,3 +1,4 @@
+import os
 import subprocess
 
 import pytest
@@ -7,6 +8,10 @@ from requirement_monitor.feishu_cli import FeishuCLI, FeishuCLIError
 
 def test_run_json_executes_feishu_without_shell_and_decodes_json(monkeypatch):
     calls = []
+    monkeypatch.setenv("FEISHU_ACCESS_TOKEN", "feishu-auth-token")
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", "webhook-secret")
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", "llm-secret")
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_MODEL", "model-name")
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
@@ -15,18 +20,23 @@ def test_run_json_executes_feishu_without_shell_and_decodes_json(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert FeishuCLI().run_json(["auth", "status"]) == {"logged_in": True}
-    assert calls == [
-        (
-            ["feishu", "auth", "status"],
-            {
-                "capture_output": True,
-                "text": True,
-                "encoding": "utf-8",
-                "timeout": 60,
-                "shell": False,
-            },
-        )
-    ]
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    subprocess_env = kwargs.pop("env")
+    assert command == ["feishu", "auth", "status"]
+    assert kwargs == {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "timeout": 60,
+        "shell": False,
+    }
+    assert subprocess_env["FEISHU_ACCESS_TOKEN"] == "feishu-auth-token"
+    assert subprocess_env["REQUIREMENT_MONITOR_LLM_MODEL"] == "model-name"
+    assert "REQUIREMENT_MONITOR_WEBHOOK_URL" not in subprocess_env
+    assert "REQUIREMENT_MONITOR_LLM_API_KEY" not in subprocess_env
+    assert os.environ["REQUIREMENT_MONITOR_WEBHOOK_URL"] == "webhook-secret"
+    assert os.environ["REQUIREMENT_MONITOR_LLM_API_KEY"] == "llm-secret"
 
 
 def test_run_json_raises_error_with_stderr_for_nonzero_exit(monkeypatch):
@@ -63,6 +73,49 @@ def test_run_json_redacts_webhook_and_llm_secrets(monkeypatch):
     assert webhook not in message
     assert api_key not in message
     assert "[REDACTED]" in message
+
+
+def test_run_json_redacts_quoted_webhook_url_json_key(monkeypatch):
+    webhook_url = "https://hooks.example.com/path/json-webhook-secret"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, "", f'{{"webhook_url":"{webhook_url}"}}'
+        ),
+    )
+
+    with pytest.raises(FeishuCLIError) as exc_info:
+        FeishuCLI().run_json(["bitable", "meta", "app"])
+
+    message = str(exc_info.value)
+    assert webhook_url not in message
+    assert "json-webhook-secret" not in message
+
+
+def test_run_json_redacts_nested_api_key_json_keys(monkeypatch):
+    api_key = "nested-generic-api-key"
+    llm_api_key = "nested-llm-api-key"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            "",
+            (
+                f'{{"provider":{{"api_key":"{api_key}",'
+                f'"llm_api_key":"{llm_api_key}"}}}}'
+            ),
+        ),
+    )
+
+    with pytest.raises(FeishuCLIError) as exc_info:
+        FeishuCLI().run_json(["bitable", "meta", "app"])
+
+    message = str(exc_info.value)
+    assert api_key not in message
+    assert llm_api_key not in message
 
 
 def test_run_json_redacts_monitor_env_secrets_and_bearer_tokens(monkeypatch):
@@ -128,6 +181,38 @@ def test_run_json_raises_clear_error_when_feishu_is_missing(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     with pytest.raises(FeishuCLIError, match="was not found"):
+        FeishuCLI().run_json(["auth", "status"])
+
+
+def test_run_json_wraps_os_errors(monkeypatch):
+    def fake_run(command, **kwargs):
+        raise OSError("operation not permitted")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(FeishuCLIError, match="could not be executed"):
+        FeishuCLI().run_json(["auth", "status"])
+
+
+def test_run_json_wraps_unicode_decode_errors(monkeypatch):
+    def fake_run(command, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(FeishuCLIError, match="valid UTF-8"):
+        FeishuCLI().run_json(["auth", "status"])
+
+
+@pytest.mark.parametrize("output", ['["item"]', '"text"', "null", "42"])
+def test_run_json_rejects_non_object_json(monkeypatch, output):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, output, ""),
+    )
+
+    with pytest.raises(FeishuCLIError, match="JSON object"):
         FeishuCLI().run_json(["auth", "status"])
 
 
@@ -386,6 +471,24 @@ def test_batch_helpers_serialize_records_as_utf8_json(
             json_text(records),
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [float("nan"), object()],
+)
+def test_json_arguments_reject_non_standard_or_unserializable_values(
+    monkeypatch, invalid_value
+):
+    def fail_run(command, **kwargs):
+        raise AssertionError("subprocess must not run for invalid JSON arguments")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    with pytest.raises(FeishuCLIError, match="could not be serialized"):
+        FeishuCLI().batch_create(
+            "app", "table", [{"field": invalid_value}]
+        )
 
 
 def json_text(value):

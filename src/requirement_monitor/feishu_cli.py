@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -15,8 +16,11 @@ class FeishuCLI:
     def __init__(self, timeout: float = 60) -> None:
         self.timeout = timeout
 
-    def run_json(self, arguments: Sequence[str]) -> Any:
+    def run_json(self, arguments: Sequence[str]) -> JsonObject:
         command = ["feishu", *arguments]
+        environment = os.environ.copy()
+        for variable_name in _SECRET_ENVIRONMENT_VARIABLES:
+            environment.pop(variable_name, None)
         try:
             result = subprocess.run(
                 command,
@@ -25,6 +29,7 @@ class FeishuCLI:
                 encoding="utf-8",
                 timeout=self.timeout,
                 shell=False,
+                env=environment,
             )
         except FileNotFoundError:
             raise FeishuCLIError(
@@ -34,6 +39,16 @@ class FeishuCLI:
             raise FeishuCLIError(
                 f"Feishu CLI timed out after {self.timeout:g} seconds"
             ) from None
+        except UnicodeDecodeError:
+            raise FeishuCLIError(
+                "Feishu CLI output was not valid UTF-8"
+            ) from None
+        except OSError as error:
+            detail = _sanitize_error(str(error)).strip()
+            message = "Feishu CLI could not be executed"
+            if detail:
+                message = f"{message}: {detail}"
+            raise FeishuCLIError(message) from None
 
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
@@ -46,9 +61,18 @@ class FeishuCLI:
             )
 
         try:
-            return json.loads(result.stdout)
+            payload = json.loads(result.stdout)
         except json.JSONDecodeError:
             raise FeishuCLIError("Feishu CLI returned invalid JSON") from None
+        except UnicodeDecodeError:
+            raise FeishuCLIError(
+                "Feishu CLI output was not valid UTF-8"
+            ) from None
+        if not isinstance(payload, dict):
+            raise FeishuCLIError(
+                "Feishu CLI returned JSON but not a JSON object"
+            )
+        return payload
 
     def auth_status(self) -> JsonObject:
         return self.run_json(["auth", "status"])
@@ -237,7 +261,20 @@ def _append_option(
 
 
 def _json_argument(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
+    try:
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise FeishuCLIError(
+            "Feishu CLI JSON argument could not be serialized"
+        ) from None
+
+
+_SECRET_ENVIRONMENT_VARIABLES = frozenset(
+    {
+        "REQUIREMENT_MONITOR_WEBHOOK_URL",
+        "REQUIREMENT_MONITOR_LLM_API_KEY",
+    }
+)
 
 
 _WEBHOOK_PATTERN = re.compile(
@@ -245,9 +282,14 @@ _WEBHOOK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(\b(?:requirement_monitor_(?:llm_api_key|webhook_url)|"
-    r"api[_-]?key|llm[_-]?secret|webhook[_-]?url)\b\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s]+)"
+    r"(?ix)("
+    r"(?<![A-Za-z0-9_])"
+    r"(?P<key_quote>[\"']?)"
+    r"(?:requirement_monitor_(?:llm_api_key|webhook_url)|"
+    r"llm[_-]?api[_-]?key|api[_-]?key|llm[_-]?secret|webhook[_-]?url)"
+    r"(?P=key_quote)\s*[:=]\s*"
+    r")"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s]+)"
 )
 _BEARER_TOKEN_PATTERN = re.compile(
     r"(?i)(\bBearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
