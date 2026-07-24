@@ -100,7 +100,6 @@ def load_settings(path: Optional[Path] = None) -> Settings:
     config_path = _resolve_config_path(path)
     config_data = _read_config(config_path)
     _apply_environment_overrides(config_data)
-    _resolve_relative_paths(config_data, config_path)
 
     webhook_url = config_data.get("webhook_url")
     if not isinstance(webhook_url, str) or not webhook_url.strip():
@@ -173,18 +172,6 @@ def _apply_environment_overrides(config_data: Dict[str, Any]) -> None:
         config_data["llm"] = llm_data
     if isinstance(llm_data, dict):
         llm_data.update(active_overrides)
-
-
-def _resolve_relative_paths(config_data: Dict[str, Any], config_path: Path) -> None:
-    config_directory = config_path.expanduser().resolve().parent
-    for field_name in ("fixed_rules_path", "state_dir", "log_dir"):
-        value = config_data.get(field_name)
-        if not isinstance(value, (str, Path)):
-            continue
-        resolved_path = Path(value).expanduser()
-        if not resolved_path.is_absolute():
-            resolved_path = config_directory / resolved_path
-        config_data[field_name] = resolved_path.resolve()
 
 
 def _validate_http_url(value: str, field_name: str):

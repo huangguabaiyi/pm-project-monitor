@@ -64,9 +64,9 @@ def test_environment_overrides_secret_values(tmp_path, monkeypatch):
     assert settings.llm.base_url == "https://env.example/v1"
     assert settings.llm.model == "env-model"
     assert settings.llm.timeout_seconds == 20
-    assert settings.fixed_rules_path == (tmp_path / "固定业务规则").resolve()
-    assert settings.state_dir == (tmp_path / ".state").resolve()
-    assert settings.log_dir == (tmp_path / "logs").resolve()
+    assert settings.fixed_rules_path == Path("固定业务规则")
+    assert settings.state_dir == Path(".state")
+    assert settings.log_dir == Path("logs")
     assert settings.timezone == "Asia/Shanghai"
     assert settings.send_hour == 20
     assert settings.send_minute == 0
