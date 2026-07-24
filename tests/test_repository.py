@@ -156,6 +156,23 @@ def test_invalid_node_date_isolated_from_valid_sibling(raw_tables):
     assert issues[0].skip_scope == "record"
 
 
+def test_requirement_missing_fields_isolated_while_valid_records_still_parse(
+    raw_tables,
+):
+    raw_tables["需求主表"].append({"record_id": "rec-missing-fields"})
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
+    assert [item.record_id for item in snapshot.nodes] == ["rec-node-1"]
+    assert [item.record_id for item in snapshot.blockers] == ["rec-blocker-1"]
+    assert len(issues) == 1
+    assert issues[0].record_id == "rec-missing-fields"
+    assert issues[0].field_name == "fields"
+    assert issues[0].current_value is None
+    assert issues[0].skip_scope == "requirement"
+
+
 def test_blank_invalid_requirement_id_is_reported_as_none(raw_tables):
     raw_tables["需求主表"][0]["fields"]["需求编号"] = "   "
 

@@ -488,9 +488,7 @@ def _validation_issue(
         record_id=_best_effort_record_id(raw_record),
         requirement_id=requirement_id,
         field_name=field_name,
-        current_value=_display_issue_value(
-            _record_fields(raw_record).get(field_name)
-        ),
+        current_value=_safe_issue_current_value(raw_record, field_name),
         expected_format=_expected_format(field_name),
         fix_suggestion=_fix_suggestion(field_name),
         skip_scope=skip_scope,
@@ -498,15 +496,33 @@ def _validation_issue(
     )
 
 
+def _safe_issue_current_value(
+    raw_record: Mapping[str, Any], field_name: str
+) -> Optional[str]:
+    fields = raw_record.get("fields")
+    if fields is None:
+        return None
+    if not isinstance(fields, Mapping):
+        return _limited_issue_text(repr(fields))
+    return _display_issue_value(fields.get(field_name))
+
+
 def _display_issue_value(value: Any) -> Optional[str]:
     if value is None:
         return None
     if isinstance(value, str):
-        return value
+        return _limited_issue_text(value)
     try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     except (TypeError, ValueError):
-        return str(value)
+        rendered = repr(value)
+    return _limited_issue_text(rendered)
+
+
+def _limited_issue_text(value: str, limit: int = 500) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
 
 
 def _expected_format(field_name: str) -> str:
