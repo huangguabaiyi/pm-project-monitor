@@ -1,4 +1,6 @@
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -10,6 +12,7 @@ from requirement_monitor.models import RequirementRisk, RiskLevel
 
 
 API_KEY = "sk-super-secret-token"
+TZ = ZoneInfo("Asia/Shanghai")
 
 
 @pytest.fixture
@@ -29,6 +32,11 @@ def make_risk(level=RiskLevel.NORMAL):
         requirement_id="REQ-1",
         requirement_name="语音助手升级",
         project="车机项目",
+        target_version="8.0",
+        merge_at=datetime(2026, 8, 3, 18, tzinfo=TZ),
+        launch_at=datetime(2026, 8, 5, 18, tzinfo=TZ),
+        project_owner_id="ou-project",
+        project_owner_name="项目负责人",
         level=level,
         buffer_days=2,
         affected_domains=["客户端"],

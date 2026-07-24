@@ -150,6 +150,10 @@ def test_invalid_node_date_isolated_from_valid_sibling(raw_tables):
     assert issues[0].record_id == "rec-node-1"
     assert issues[0].requirement_id == "REQ-1"
     assert issues[0].field_name == "计划完成时间"
+    assert issues[0].current_value == "not-a-date"
+    assert issues[0].expected_format
+    assert issues[0].fix_suggestion
+    assert issues[0].skip_scope == "record"
 
 
 def test_blank_invalid_requirement_id_is_reported_as_none(raw_tables):
@@ -235,6 +239,8 @@ def test_invalid_requirement_excludes_only_it_and_its_children(raw_tables):
     assert len(issues) == 1
     assert issues[0].table_name == "需求主表"
     assert issues[0].field_name == "合板时间"
+    assert issues[0].current_value == "bad-date"
+    assert issues[0].skip_scope == "requirement"
 
 
 def test_invalid_blocker_excludes_only_that_blocker(raw_tables):
@@ -249,6 +255,7 @@ def test_invalid_blocker_excludes_only_that_blocker(raw_tables):
     assert [item.record_id for item in snapshot.nodes] == ["rec-node-1"]
     assert len(issues) == 1
     assert issues[0].field_name == "发现时间"
+    assert issues[0].skip_scope == "record"
 
 
 def test_invalid_project_config_does_not_block_valid_config(raw_tables):
@@ -264,6 +271,7 @@ def test_invalid_project_config_does_not_block_valid_config(raw_tables):
     assert issues[0].table_name == "项目配置表"
     assert issues[0].record_id == "rec-config-bad"
     assert issues[0].field_name == "上线截止时间"
+    assert issues[0].skip_scope == "record"
 
 
 def test_ineligible_requirements_are_filtered_after_parsing(raw_tables):
@@ -447,6 +455,11 @@ def make_requirement_risk(index):
         requirement_id="REQ-{}".format(index),
         requirement_name="需求 {}".format(index),
         project="米家",
+        target_version="8.0",
+        merge_at=datetime(2026, 8, 3, 18, 0, tzinfo=SHANGHAI),
+        launch_at=datetime(2026, 8, 5, 18, 0, tzinfo=SHANGHAI),
+        project_owner_id="ou-project",
+        project_owner_name="项目负责人",
         level=RiskLevel.SEVERE,
         predicted_completion=datetime(2026, 7, 29, 12, 0, tzinfo=SHANGHAI),
         buffer_days=-1.5,
@@ -462,6 +475,8 @@ def make_node_risk(index):
         domain="客户端",
         owner_id="ou-owner",
         owner_name="负责人",
+        planned_end=datetime(2026, 7, 27, 18, 0, tzinfo=SHANGHAI),
+        status="进行中",
         level=RiskLevel.WARNING,
         safe_deadline=datetime(2026, 7, 28, 18, 0, tzinfo=SHANGHAI),
         reasons=["缓冲不足"],

@@ -18,6 +18,7 @@ from requirement_monitor.models import (
     Requirement,
     RequirementRisk,
     RiskLevel,
+    SkipScope,
     ValidationIssue,
 )
 
@@ -62,6 +63,7 @@ def parse_snapshot(
                     error,
                     requirement_id=requirement_id,
                     field_names=_REQUIREMENT_FIELD_NAMES,
+                    skip_scope="requirement",
                 )
             )
             continue
@@ -94,6 +96,7 @@ def parse_snapshot(
                     error,
                     requirement_id=requirement_id,
                     field_names=_NODE_FIELD_NAMES,
+                    skip_scope="record",
                 )
             )
 
@@ -120,6 +123,7 @@ def parse_snapshot(
                     error,
                     requirement_id=requirement_id,
                     field_names=_BLOCKER_FIELD_NAMES,
+                    skip_scope="record",
                 )
             )
 
@@ -134,6 +138,7 @@ def parse_snapshot(
                     raw_record,
                     error,
                     field_names=_PROJECT_CONFIG_FIELD_NAMES,
+                    skip_scope="record",
                 )
             )
 
@@ -464,6 +469,7 @@ def _validation_issue(
     *,
     requirement_id: Optional[str] = None,
     field_names: Mapping[str, str],
+    skip_scope: SkipScope,
 ) -> ValidationIssue:
     if isinstance(error, _FieldParseError):
         field_name = error.field_name
@@ -482,8 +488,43 @@ def _validation_issue(
         record_id=_best_effort_record_id(raw_record),
         requirement_id=requirement_id,
         field_name=field_name,
+        current_value=_display_issue_value(
+            _record_fields(raw_record).get(field_name)
+        ),
+        expected_format=_expected_format(field_name),
+        fix_suggestion=_fix_suggestion(field_name),
+        skip_scope=skip_scope,
         message=message,
     )
+
+
+def _display_issue_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _expected_format(field_name: str) -> str:
+    if "截止时间" in field_name:
+        return "HH:MM 时间"
+    if "时间" in field_name or "DDL" in field_name:
+        return "RFC3339 时间、13 位毫秒时间戳或飞书日期值"
+    if "负责人" in field_name:
+        return "单个飞书人员"
+    if field_name.startswith("关联"):
+        return "单个有效关联记录"
+    if "天数" in field_name:
+        return "非负整数"
+    return "符合字段类型和必填约束的值"
+
+
+def _fix_suggestion(field_name: str) -> str:
+    return "将「{}」修正为{}".format(field_name, _expected_format(field_name))
 
 
 def _record_fields(raw_record: Mapping[str, Any]) -> Mapping[str, Any]:

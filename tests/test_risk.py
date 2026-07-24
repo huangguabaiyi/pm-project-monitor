@@ -117,6 +117,33 @@ def node_result(result, name, domain="客户端"):
     )
 
 
+def test_risk_result_carries_complete_card_context(rules):
+    requirement = make_requirement(launch_at=in_aug(16, 18))
+    node = make_node(
+        "各端开发",
+        planned_end=at(30, 18),
+        status=NodeStatus.IN_PROGRESS,
+    )
+    blocker = make_blocker()
+
+    result = evaluate_requirement(
+        requirement,
+        [node],
+        [blocker],
+        rules,
+        NOW,
+    )
+
+    assert result.target_version == requirement.target_version
+    assert result.merge_at == requirement.merge_at
+    assert result.launch_at == requirement.launch_at
+    assert result.project_owner_id == requirement.project_owner_id
+    assert result.project_owner_name == requirement.project_owner_name
+    assert result.blockers == [blocker]
+    assert result.node_risks[0].planned_end == node.planned_end
+    assert result.node_risks[0].status == node.status
+
+
 def test_project_structured_fields_override_fixed_rules_without_reading_notes(rules):
     config = make_config(
         duration_mode="natural",

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import get_type_hints
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -11,7 +12,16 @@ from requirement_monitor.cards import (
     interactive_card,
     mention,
 )
-from requirement_monitor.models import RiskLevel, ValidationIssue
+from requirement_monitor.models import (
+    Blocker,
+    LLMEnrichment,
+    NodeRisk,
+    NodeStatus,
+    RequirementRisk,
+    RiskLevel,
+    RunReport,
+    ValidationIssue,
+)
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -26,87 +36,116 @@ def in_aug(day, hour=18):
     return datetime(2026, 8, day, hour, 0, tzinfo=TZ)
 
 
-def requirement(
-    requirement_id,
-    name,
-    *,
-    project="米家",
-    version="8.0",
-    owner_id="ou-project",
-    owner_name="项目负责人",
-):
-    return {
-        "record_id": f"rec-{requirement_id}",
-        "requirement_id": requirement_id,
-        "name": name,
-        "project": project,
-        "target_version": version,
-        "merge_at": in_aug(3),
-        "launch_at": in_aug(5),
-        "project_owner_id": owner_id,
-        "project_owner_name": owner_name,
-    }
-
-
-def node(
+def make_node_risk(
     record_id,
-    requirement_id,
     name,
     planned_end,
     *,
+    requirement_id="REQ-1",
     owner_id="ou-zhang",
     owner_name="张三",
     domain="服务端",
-    status="进行中",
+    status=NodeStatus.IN_PROGRESS,
     level=RiskLevel.NORMAL,
     safe_deadline=None,
 ):
-    return {
-        "record_id": record_id,
-        "requirement_id": requirement_id,
-        "name": name,
-        "planned_end": planned_end,
-        "owner_id": owner_id,
-        "owner_name": owner_name,
-        "domain": domain,
-        "status": status,
-        "risk_level": level,
-        "safe_deadline": safe_deadline or planned_end,
-    }
+    return NodeRisk(
+        node_record_id=record_id,
+        requirement_id=requirement_id,
+        node_name=name,
+        domain=domain,
+        owner_id=owner_id,
+        owner_name=owner_name,
+        planned_end=planned_end,
+        status=status,
+        level=level,
+        predicted_completion=planned_end,
+        safe_deadline=safe_deadline or planned_end,
+        buffer_days=1,
+    )
 
 
-def risk(requirement_value, level, nodes, **overrides):
-    values = {
-        "requirement_record_id": requirement_value["record_id"],
-        "requirement_id": requirement_value["requirement_id"],
-        "requirement_name": requirement_value["name"],
-        "project": requirement_value["project"],
-        "level": level,
-        "predicted_completion": in_aug(6),
-        "buffer_days": -1.5 if level == RiskLevel.SEVERE else 3.0,
-        "affected_domains": ["服务端"],
-        "reasons": ["合板缓冲不足"],
-        "actions": ["今天完成联调"],
-        "node_risks": [
-            {
-                "node_record_id": value["record_id"],
-                "requirement_id": value["requirement_id"],
-                "node_name": value["name"],
-                "domain": value["domain"],
-                "owner_id": value["owner_id"],
-                "owner_name": value["owner_name"],
-                "level": value["risk_level"],
-                "predicted_completion": value["planned_end"],
-                "safe_deadline": value["safe_deadline"],
-                "buffer_days": 1.0,
-                "reasons": [],
-                "actions": [],
-            }
-            for value in nodes
-        ],
-    }
-    values.update(overrides)
-    return values
+def make_blocker(
+    *,
+    requirement_id="REQ-1",
+    title="等待 API & 权限",
+    owner_id="ou-blocker",
+    owner_name="王五",
+    planned_resolution_at=None,
+):
+    return Blocker(
+        record_id="rec-blocker-{}".format(requirement_id),
+        requirement_id=requirement_id,
+        title=title,
+        owner_id=owner_id,
+        owner_name=owner_name,
+        found_at=at(23, 9),
+        planned_resolution_at=planned_resolution_at or at(26),
+        status="处理中",
+        affects_merge=True,
+    )
+
+
+def make_risk(
+    requirement_id="REQ-1",
+    name="账号<迁移>",
+    *,
+    project="米家",
+    version="8.0",
+    level=RiskLevel.WARNING,
+    owner_id="ou-project",
+    owner_name="项目负责人",
+    nodes=None,
+    blockers=None,
+    buffer_days=3,
+    predicted_completion=None,
+    affected_domains=None,
+    reasons=None,
+    actions=None,
+    llm_enrichment=None,
+):
+    return RequirementRisk(
+        requirement_record_id="rec-{}".format(requirement_id),
+        requirement_id=requirement_id,
+        requirement_name=name,
+        project=project,
+        target_version=version,
+        merge_at=in_aug(3),
+        launch_at=in_aug(5),
+        project_owner_id=owner_id,
+        project_owner_name=owner_name,
+        level=level,
+        predicted_completion=predicted_completion or in_aug(2),
+        buffer_days=buffer_days,
+        affected_domains=affected_domains or ["服务端"],
+        reasons=reasons or ["合板缓冲不足"],
+        actions=actions or ["今天完成联调"],
+        node_risks=nodes or [],
+        blockers=blockers or [],
+        llm_enrichment=llm_enrichment,
+    )
+
+
+def make_report(risks, *, llm_attempted=False, llm_degraded=False):
+    return RunReport(
+        trigger="manual",
+        started_at=NOW,
+        total_requirements=len(risks),
+        eligible_requirement_count=len(risks),
+        processed_requirements=len(risks),
+        normal_requirements=sum(item.level == RiskLevel.NORMAL for item in risks),
+        warning_requirements=sum(item.level == RiskLevel.WARNING for item in risks),
+        severe_requirements=sum(item.level == RiskLevel.SEVERE for item in risks),
+        llm_attempted=llm_attempted,
+        llm_degraded=llm_degraded,
+        requirement_risks=risks,
+    )
+
+
+def card_text(payload):
+    return "\n".join(
+        element["text"]["content"] for element in payload["card"]["elements"]
+    )
 
 
 def assert_no_none(value):
@@ -120,103 +159,92 @@ def assert_no_none(value):
             assert_no_none(item)
 
 
+def test_card_builders_use_strict_domain_model_signatures():
+    assert get_type_hints(build_daily_card)["report"] is RunReport
+    assert get_type_hints(build_severe_card)["risk"] is RequirementRisk
+    assert get_type_hints(build_data_error_card)["issues"] == list[ValidationIssue]
+
+
 def test_mention_escapes_identifier_and_visible_name():
     rendered = mention('ou-"bad', "张<三>&")
 
     assert rendered == '<at id="ou-&quot;bad">张&lt;三&gt;&amp;</at>'
 
 
-def test_interactive_card_uses_wide_screen_and_chunks_long_blocks():
-    payload = interactive_card(
-        title=None,
-        template="yellow",
-        markdown_blocks=["x" * 7000, None],
-    )
+def test_interactive_card_chunks_lines_without_splitting_mentions():
+    atomic_mention = mention("ou-owner", "负责人")
+    escaped_entity = "&lt;"
+    long_line = "x" * 2998 + escaped_entity + atomic_mention + "y" * 100
 
-    assert payload["msg_type"] == "interactive"
-    assert payload["card"]["config"]["wide_screen_mode"] is True
-    assert payload["card"]["header"]["title"]["content"] == ""
+    payload = interactive_card("长内容", "yellow", [long_line, None])
     contents = [element["text"]["content"] for element in payload["card"]["elements"]]
-    assert "".join(contents) == "x" * 7000
+
+    assert payload["card"]["config"]["wide_screen_mode"] is True
+    assert "".join(contents) == long_line
     assert all(len(content) <= 3000 for content in contents)
+    assert any(escaped_entity in content for content in contents)
+    assert any(atomic_mention in content for content in contents)
+    assert all(content.count("<at ") == content.count("</at>") for content in contents)
     assert_no_none(payload)
 
 
-def test_daily_card_groups_by_project_then_owner_and_orders_visible_nodes():
-    first = requirement("REQ-1", "账号<迁移>")
+def test_daily_card_groups_projects_and_owners_with_required_ordering():
     first_nodes = [
-        node("late", "REQ-1", "逾期节点", at(23), safe_deadline=at(22)),
-        node("today", "REQ-1", "今日节点", at(24), domain="客户端"),
-        node(
-            "future",
-            "REQ-1",
-            "普通未来节点",
-            at(25),
-            domain="车辆",
-        ),
-        node(
+        make_node_risk("late", "逾期节点", at(23), safe_deadline=at(22)),
+        make_node_risk("today", "今日节点", at(24), domain="客户端"),
+        make_node_risk("future", "普通未来节点", at(25), domain="车辆"),
+        make_node_risk(
             "warning",
-            "REQ-1",
             "预警节点",
             at(28),
             level=RiskLevel.WARNING,
             safe_deadline=at(26),
         ),
-        node("parallel", "REQ-1", "并行节点", at(28)),
-        node("later", "REQ-1", "八天后节点", in_aug(5)),
-        node("done", "REQ-1", "已完成节点", at(24), status="已完成"),
+        make_node_risk("parallel", "并行节点", at(28)),
+        make_node_risk("later", "八天后节点", in_aug(5)),
+        make_node_risk(
+            "done",
+            "已完成节点",
+            at(24),
+            status=NodeStatus.COMPLETED,
+        ),
     ]
-    second = requirement(
-        "REQ-2",
-        "固件升级",
+    first = make_risk(
+        nodes=first_nodes,
+        blockers=[make_blocker()],
+        llm_enrichment=LLMEnrichment(
+            available=False,
+            rule_level=RiskLevel.WARNING,
+            effective_level=RiskLevel.WARNING,
+            failure_reason="timeout",
+        ),
+    )
+    second = make_risk(
+        requirement_id="REQ-2",
+        name="固件升级",
         project="车载",
+        level=RiskLevel.SEVERE,
         owner_id="ou-car-owner",
         owner_name="车载负责人",
-    )
-    second_nodes = [
-        node(
-            "li",
-            "REQ-2",
-            "嵌入式开发",
-            at(27),
-            owner_id="ou-li",
-            owner_name="李四",
-            domain="嵌入式",
-        )
-    ]
-    report = {
-        "started_at": NOW,
-        "requirements": [
-            {
-                "requirement": first,
-                "risk": risk(first, RiskLevel.WARNING, first_nodes),
-                "nodes": first_nodes,
-                "blockers": [
-                    {
-                        "title": "等待 API & 权限",
-                        "owner_id": "ou-blocker",
-                        "owner_name": "王五",
-                        "status": "处理中",
-                    }
-                ],
-                "enrichment": {
-                    "available": False,
-                    "failure_reason": "timeout",
-                },
-            },
-            {
-                "requirement": second,
-                "risk": risk(second, RiskLevel.SEVERE, second_nodes),
-                "nodes": second_nodes,
-                "blockers": [],
-            },
+        nodes=[
+            make_node_risk(
+                "li",
+                "嵌入式开发",
+                at(27),
+                requirement_id="REQ-2",
+                owner_id="ou-li",
+                owner_name="李四",
+                domain="嵌入式",
+                level=RiskLevel.SEVERE,
+            )
         ],
-    }
-
-    payload = build_daily_card(report)
-    text = "\n".join(
-        element["text"]["content"] for element in payload["card"]["elements"]
+        buffer_days=-1,
     )
+
+    payload = build_daily_card(
+        make_report([first, second], llm_attempted=True, llm_degraded=True)
+    )
+    text = card_text(payload)
 
     assert payload["card"]["header"]["template"] == "red"
     assert "需求 2｜普通 0｜预警 1｜严重 1" in payload["card"]["header"]["title"]["content"]
@@ -249,131 +277,59 @@ def test_daily_card_groups_by_project_then_owner_and_orders_visible_nodes():
     ],
 )
 def test_daily_card_header_matches_highest_risk(level, template):
-    item_requirement = requirement("REQ-3", "风险颜色")
-    item_nodes = [node("node-3", "REQ-3", "开发", at(25), level=level)]
-
-    payload = build_daily_card(
-        {
-            "started_at": NOW,
-            "requirements": [
-                {
-                    "requirement": item_requirement,
-                    "risk": risk(item_requirement, level, item_nodes),
-                    "nodes": item_nodes,
-                }
-            ],
-        }
+    risk = make_risk(
+        level=level,
+        nodes=[make_node_risk("node", "开发", at(25), level=level)],
     )
+
+    payload = build_daily_card(make_report([risk]))
 
     assert payload["card"]["header"]["template"] == template
 
 
-def test_daily_card_has_no_llm_footer_when_enrichment_was_not_attempted():
-    item_requirement = requirement("REQ-4", "不启用 AI")
-    item_nodes = [node("node-4", "REQ-4", "开发", at(25))]
+def test_daily_card_footer_requires_attempted_failed_llm():
+    risk = make_risk(nodes=[make_node_risk("node", "开发", at(25))])
 
-    payload = build_daily_card(
-        {
-            "started_at": NOW,
-            "requirements": [
-                {
-                    "requirement": item_requirement,
-                    "risk": risk(item_requirement, RiskLevel.NORMAL, item_nodes),
-                    "nodes": item_nodes,
-                }
-            ],
-        }
+    not_attempted = build_daily_card(make_report([risk], llm_degraded=False))
+    successful = build_daily_card(
+        make_report([risk], llm_attempted=True, llm_degraded=False)
     )
 
-    assert "AI 补充分析不可用" not in str(payload)
+    assert "AI 补充分析不可用" not in str(not_attempted)
+    assert "AI 补充分析不可用" not in str(successful)
 
 
-def test_daily_card_can_render_requirement_risk_node_details_without_source_nodes():
-    report = {
-        "started_at": NOW,
-        "risks": [
-            {
-                "requirement_record_id": "rec-risk-only",
-                "requirement_id": "REQ-5",
-                "requirement_name": "仅风险结果",
-                "project": "米家",
-                "level": RiskLevel.WARNING,
-                "node_risks": [
-                    {
-                        "node_record_id": "node-risk-only",
-                        "requirement_id": "REQ-5",
-                        "node_name": "联调",
-                        "domain": "服务端",
-                        "owner_id": "ou-risk-owner",
-                        "owner_name": "风险负责人",
-                        "level": RiskLevel.WARNING,
-                        "predicted_completion": at(26),
-                        "safe_deadline": at(25),
-                    },
-                    {
-                        "node_record_id": "node-without-date",
-                        "requirement_id": "REQ-5",
-                        "node_name": "待补日期",
-                        "domain": "客户端",
-                        "owner_id": "ou-risk-owner",
-                        "owner_name": "风险负责人",
-                        "level": RiskLevel.WARNING,
-                    },
-                ],
-            }
+def test_severe_card_mentions_project_owner_and_has_complete_context():
+    risk = make_risk(
+        requirement_id="REQ-9",
+        name="登陆安全",
+        level=RiskLevel.SEVERE,
+        nodes=[
+            make_node_risk(
+                "node-9",
+                "服务端联调",
+                in_aug(6),
+                requirement_id="REQ-9",
+                safe_deadline=in_aug(2),
+                level=RiskLevel.SEVERE,
+            )
         ],
-    }
-
-    payload = build_daily_card(report)
-    text = str(payload)
-
-    assert '<at id="ou-risk-owner">风险负责人</at>' in text
-    assert "仅风险结果" in text
-    assert "服务端" in text
-    assert "联调" in text
-    assert "2026-07-26 18:00" in text
-    assert "2026-07-25 18:00" in text
-    assert "待补日期" in text
-
-
-def test_severe_card_mentions_project_owner_and_contains_complete_actions():
-    item_requirement = requirement("REQ-9", "登陆安全")
-    item_nodes = [
-        node(
-            "node-9",
-            "REQ-9",
-            "服务端联调",
-            in_aug(6),
-            safe_deadline=in_aug(2),
-        )
-    ]
-    item_risk = risk(
-        item_requirement,
-        RiskLevel.SEVERE,
-        item_nodes,
+        blockers=[
+            make_blocker(
+                requirement_id="REQ-9",
+                title="等待鉴权方案",
+                planned_resolution_at=in_aug(1),
+            )
+        ],
         predicted_completion=in_aug(6),
+        buffer_days=-3,
         affected_domains=["服务端", "客户端"],
         reasons=["联调已晚于安全截止"],
         actions=["项目负责人协调资源", "节点负责人今日反馈"],
     )
-    payload = build_severe_card(
-        {
-            "requirement": item_requirement,
-            "risk": item_risk,
-            "nodes": item_nodes,
-            "blockers": [
-                {
-                    "title": "等待鉴权方案",
-                    "owner_id": "ou-blocker",
-                    "owner_name": "王五",
-                    "status": "处理中",
-                    "planned_resolution_at": in_aug(1),
-                    "affects_merge": True,
-                }
-            ],
-        }
-    )
-    text = str(payload)
+
+    payload = build_severe_card(risk)
+    text = card_text(payload)
 
     assert payload["card"]["header"]["template"] == "red"
     assert '<at id="ou-project">项目负责人</at>' in text
@@ -397,30 +353,29 @@ def test_severe_card_mentions_project_owner_and_contains_complete_actions():
     assert_no_none(payload)
 
 
-def test_data_error_card_has_all_fields_and_escapes_values():
-    issues = [
-        {
-            "table_name": "进展<节点>表",
-            "requirement_id": "REQ-10",
-            "record_id": "rec-10",
-            "field_name": "计划 DDL",
-            "current_value": "tomorrow & later",
-            "expected_format": "RFC3339 <datetime>",
-            "suggestion": "改为 2026-07-25T18:00:00+08:00",
-            "skip_requirement": True,
-            "message": "日期格式错误",
-        },
-        ValidationIssue(
-            table_name="需求主表",
-            requirement_id=None,
-            record_id=None,
-            field_name="项目",
-            message="不能为空",
-        ),
-    ]
+@pytest.mark.parametrize(
+    ("scope", "scope_text", "skip_text"),
+    [
+        ("record", "隔离范围：仅跳过当前记录", "是否跳过该需求：否"),
+        ("requirement", "隔离范围：跳过当前需求", "是否跳过该需求：是"),
+        ("run", "隔离范围：停止本次运行", "是否跳过该需求：整次运行停止"),
+    ],
+)
+def test_data_error_card_uses_explicit_skip_scope(scope, scope_text, skip_text):
+    issue = ValidationIssue(
+        table_name="进展<节点>表",
+        requirement_id="REQ-10",
+        record_id="rec-10",
+        field_name="计划 DDL",
+        current_value="tomorrow & later",
+        expected_format="RFC3339 <datetime>",
+        fix_suggestion="改为 2026-07-25T18:00:00+08:00",
+        skip_scope=scope,
+        message="日期格式错误",
+    )
 
-    payload = build_data_error_card(issues)
-    text = str(payload)
+    payload = build_data_error_card([issue])
+    text = card_text(payload)
 
     assert payload["card"]["header"]["template"] == "red"
     for label in (
@@ -431,12 +386,11 @@ def test_data_error_card_has_all_fields_and_escapes_values():
         "当前错误值：tomorrow &amp; later",
         "预期格式：RFC3339 &lt;datetime&gt;",
         "修复建议：改为 2026-07-25T18:00:00+08:00",
-        "是否跳过该需求：是",
+        scope_text,
+        skip_text,
         "错误说明：日期格式错误",
     ):
         assert label in text
-    assert "当前错误值：未提供" in text
-    assert "是否跳过该需求：否" in text
     assert_no_none(payload)
 
 

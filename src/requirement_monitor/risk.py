@@ -180,6 +180,11 @@ def evaluate_requirement(
         requirement_id=requirement.requirement_id,
         requirement_name=requirement.name,
         project=requirement.project,
+        target_version=requirement.target_version,
+        merge_at=requirement.merge_at,
+        launch_at=requirement.launch_at,
+        project_owner_id=requirement.project_owner_id,
+        project_owner_name=requirement.project_owner_name,
         level=level,
         predicted_completion=max(predictions) if predictions else None,
         buffer_days=min(buffers) if buffers else None,
@@ -191,6 +196,7 @@ def evaluate_requirement(
             for domain_result in domain_results
             for node_risk in domain_result.node_risks
         ],
+        blockers=list(relevant_blockers),
     )
 
 
@@ -249,6 +255,8 @@ def _evaluate_domain(
                     domain=event.node.domain,
                     owner_id=event.node.owner_id,
                     owner_name=event.node.owner_name,
+                    planned_end=event.node.planned_end,
+                    status=event.node.status,
                     level=node_level,
                     predicted_completion=_predict_node_completion(event, rules, now),
                     safe_deadline=safe_deadline,
@@ -834,6 +842,8 @@ def _evaluate_checklist_node(
         domain=node.domain,
         owner_id=node.owner_id,
         owner_name=node.owner_name,
+        planned_end=node.planned_end,
+        status=node.status,
         level=RiskLevel.SEVERE if reasons else RiskLevel.NORMAL,
         predicted_completion=None,
         safe_deadline=safe_deadline,

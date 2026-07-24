@@ -14,6 +14,7 @@ from pydantic import (
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 StrippedStr = Annotated[str, StringConstraints(strip_whitespace=True)]
+SkipScope = Literal["record", "requirement", "run"]
 
 
 class RiskLevel(IntEnum):
@@ -35,6 +36,10 @@ class ValidationIssue(BaseModel):
     record_id: Optional[NonEmptyStr] = None
     requirement_id: Optional[NonEmptyStr] = None
     field_name: NonEmptyStr
+    current_value: Optional[StrippedStr] = None
+    expected_format: Optional[NonEmptyStr] = None
+    fix_suggestion: Optional[NonEmptyStr] = None
+    skip_scope: SkipScope = "record"
     message: NonEmptyStr
 
     @field_validator("requirement_id", mode="before")
@@ -209,26 +214,14 @@ class NodeRisk(BaseModel):
     domain: NonEmptyStr
     owner_id: NonEmptyStr
     owner_name: NonEmptyStr
+    planned_end: AwareDatetime
+    status: NodeStatus
     level: RiskLevel = RiskLevel.NORMAL
     predicted_completion: Optional[AwareDatetime] = None
     safe_deadline: Optional[AwareDatetime] = None
     buffer_days: Optional[float] = None
     reasons: List[NonEmptyStr] = Field(default_factory=list)
     actions: List[NonEmptyStr] = Field(default_factory=list)
-
-
-class RequirementRisk(BaseModel):
-    requirement_record_id: NonEmptyStr
-    requirement_id: NonEmptyStr
-    requirement_name: NonEmptyStr
-    project: NonEmptyStr
-    level: RiskLevel = RiskLevel.NORMAL
-    predicted_completion: Optional[AwareDatetime] = None
-    buffer_days: Optional[float] = None
-    affected_domains: List[NonEmptyStr] = Field(default_factory=list)
-    reasons: List[NonEmptyStr] = Field(default_factory=list)
-    actions: List[NonEmptyStr] = Field(default_factory=list)
-    node_risks: List[NodeRisk] = Field(default_factory=list)
 
 
 class LLMEnrichment(BaseModel):
@@ -240,6 +233,33 @@ class LLMEnrichment(BaseModel):
     reasons: List[NonEmptyStr] = Field(default_factory=list)
     actions: List[NonEmptyStr] = Field(default_factory=list)
     failure_reason: Optional[NonEmptyStr] = None
+
+
+class RequirementRisk(BaseModel):
+    requirement_record_id: NonEmptyStr
+    requirement_id: NonEmptyStr
+    requirement_name: NonEmptyStr
+    project: NonEmptyStr
+    target_version: NonEmptyStr
+    merge_at: AwareDatetime
+    launch_at: Optional[AwareDatetime] = None
+    project_owner_id: NonEmptyStr
+    project_owner_name: NonEmptyStr
+    level: RiskLevel = RiskLevel.NORMAL
+    predicted_completion: Optional[AwareDatetime] = None
+    buffer_days: Optional[float] = None
+    affected_domains: List[NonEmptyStr] = Field(default_factory=list)
+    reasons: List[NonEmptyStr] = Field(default_factory=list)
+    actions: List[NonEmptyStr] = Field(default_factory=list)
+    node_risks: List[NodeRisk] = Field(default_factory=list)
+    blockers: List[Blocker] = Field(default_factory=list)
+    llm_enrichment: Optional[LLMEnrichment] = None
+
+    @model_validator(mode="after")
+    def validate_schedule(self):
+        if self.launch_at is not None and self.launch_at < self.merge_at:
+            raise ValueError("launch_at must not precede merge_at")
+        return self
 
 
 class SendResult(BaseModel):
@@ -265,7 +285,11 @@ class RunReport(BaseModel):
     sent_cards: int = Field(default=0, ge=0)
     severe_cards: int = Field(default=0, ge=0)
     failed_sends: int = Field(default=0, ge=0)
+    requirement_risks: List[RequirementRisk] = Field(default_factory=list)
+    validation_issues: List[ValidationIssue] = Field(default_factory=list)
+    llm_attempted: bool = False
     llm_degraded: bool = False
+    llm_failure_reasons: List[NonEmptyStr] = Field(default_factory=list)
     send_results: List[SendResult] = Field(default_factory=list)
     errors: List[NonEmptyStr] = Field(default_factory=list)
 

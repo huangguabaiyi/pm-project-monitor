@@ -12,6 +12,7 @@ from requirement_monitor.models import (
     NodeStatus,
     ProjectConfig,
     Requirement,
+    RequirementRisk,
     RiskLevel,
     RunReport,
     ValidationIssue,
@@ -116,6 +117,60 @@ def test_validation_issue_normalizes_blank_requirement_id_to_none():
     )
 
     assert issue.requirement_id is None
+
+
+def test_validation_issue_preserves_repair_and_isolation_contract():
+    issue = ValidationIssue(
+        table_name="进展节点表",
+        record_id="rec-node",
+        requirement_id="REQ-1",
+        field_name="计划完成时间",
+        current_value="tomorrow",
+        expected_format="RFC3339 datetime",
+        fix_suggestion="填写带时区的时间",
+        skip_scope="record",
+        message="invalid datetime",
+    )
+
+    assert issue.current_value == "tomorrow"
+    assert issue.expected_format == "RFC3339 datetime"
+    assert issue.fix_suggestion == "填写带时区的时间"
+    assert issue.skip_scope == "record"
+
+
+def test_run_report_carries_card_inputs_and_llm_state():
+    risk = RequirementRisk(
+        requirement_record_id="rec-req",
+        requirement_id="REQ-1",
+        requirement_name="需求进展提醒",
+        project="工作小工具",
+        target_version="1.0.0",
+        merge_at=aware_datetime(3),
+        launch_at=aware_datetime(4),
+        project_owner_id="ou-project",
+        project_owner_name="项目负责人",
+    )
+    issue = ValidationIssue(
+        table_name="需求主表",
+        field_name="合板时间",
+        message="invalid datetime",
+        skip_scope="requirement",
+    )
+
+    report = RunReport(
+        trigger="manual",
+        started_at=aware_datetime(),
+        requirement_risks=[risk],
+        validation_issues=[issue],
+        llm_attempted=True,
+        llm_degraded=True,
+        llm_failure_reasons=["timeout"],
+    )
+
+    assert report.requirement_risks == [risk]
+    assert report.validation_issues == [issue]
+    assert report.llm_attempted is True
+    assert report.llm_failure_reasons == ["timeout"]
 
 
 @pytest.mark.parametrize(
