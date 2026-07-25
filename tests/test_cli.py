@@ -994,6 +994,67 @@ def test_stop_returns_locked_without_launchctl_actions(tmp_path, capsys):
     assert calls == []
 
 
+def test_lifecycle_lock_path_survives_plist_symlink_replacement(tmp_path):
+    agent_dir = tmp_path / "LaunchAgents"
+    target_dir = tmp_path / "targets"
+    agent_dir.mkdir()
+    target_dir.mkdir()
+    target_path = target_dir / "monitor.plist"
+    target_path.write_text("old plist", encoding="utf-8")
+    plist_path = agent_dir / "monitor.plist"
+    plist_path.symlink_to(target_path)
+
+    before = cli._lifecycle_lock_path(plist_path)
+    cli.write_plist(plist_path, "new plist")
+    after = cli._lifecycle_lock_path(plist_path)
+
+    expected = agent_dir.resolve() / cli.LIFECYCLE_LOCK_FILENAME
+    assert not plist_path.is_symlink()
+    assert before == expected
+    assert after == expected
+
+
+@pytest.mark.parametrize("command", ("start", "stop", "restart"))
+def test_plist_symlink_replacement_does_not_change_held_lifecycle_lock(
+    tmp_path, capsys, command
+):
+    agent_dir = tmp_path / "LaunchAgents"
+    target_dir = tmp_path / "targets"
+    agent_dir.mkdir()
+    target_dir.mkdir()
+    target_path = target_dir / "monitor.plist"
+    target_path.write_text("old plist", encoding="utf-8")
+    plist_path = agent_dir / "monitor.plist"
+    plist_path.symlink_to(target_path)
+    config_path = tmp_path / "config.json"
+    settings = start_settings(state_dir=tmp_path / ".state")
+    calls = []
+    argv = [command]
+    if command != "stop":
+        argv.extend(("--config", str(config_path)))
+
+    with cli._lifecycle_lock(cli._lifecycle_lock_path(plist_path)):
+        cli.write_plist(plist_path, "replacement plist")
+        exit_code = cli.main(
+            argv,
+            load_settings_fn=lambda path: settings,
+            plist_path=plist_path,
+            status_fn=lambda: calls.append("status") or False,
+            disabled_status_fn=lambda: calls.append("disabled-status")
+            or False,
+            enable_fn=lambda: calls.append("enable"),
+            bootstrap_fn=lambda path: calls.append("bootstrap"),
+            bootout_fn=lambda: calls.append("bootout"),
+            disable_fn=lambda: calls.append("disable"),
+            system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+        )
+
+    captured = capsys.readouterr()
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert "locked" in (captured.out + captured.err).lower()
+    assert calls == []
+
+
 def test_lifecycle_lock_is_released_after_start_exception(tmp_path):
     settings = start_settings(state_dir=tmp_path / ".state")
     config_path = tmp_path / "config.json"

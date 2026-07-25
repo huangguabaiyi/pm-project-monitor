@@ -710,8 +710,8 @@ def _write_private_bytes(path: Path, content: bytes) -> None:
 
 
 def _lifecycle_lock_path(plist_path: Optional[Path]) -> Path:
-    target = Path(plist_path or default_plist_path()).expanduser().resolve()
-    return target.parent / LIFECYCLE_LOCK_FILENAME
+    target = Path(plist_path or default_plist_path()).expanduser()
+    return target.parent.resolve() / LIFECYCLE_LOCK_FILENAME
 
 
 @contextmanager
