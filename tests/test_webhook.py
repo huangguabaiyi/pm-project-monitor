@@ -137,6 +137,84 @@ def test_http_200_invalid_card_code_degrades_to_plain_text(
     assert WEBHOOK_TOKEN not in repr(result)
 
 
+def test_http_200_custom_bot_9499_degrades_to_plain_text(
+    httpx_mock, webhook_url, card_payload
+):
+    httpx_mock.add_response(json={"code": 9499, "msg": "Bad Request"})
+    httpx_mock.add_response(json={"code": 0})
+
+    result = WebhookSender(webhook_url, sleep=lambda seconds: None).send(
+        card_payload
+    )
+
+    assert result.success is True
+    assert result.attempts == 2
+    assert result.status_code == 200
+    assert result.feishu_code == 0
+    assert result.format_used == "text"
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_explicit_bad_request_message_degrades_to_plain_text(
+    httpx_mock, webhook_url, card_payload
+):
+    httpx_mock.add_response(
+        status_code=400,
+        json={"code": 190099, "msg": "Bad Request"},
+    )
+    httpx_mock.add_response(json={"code": 0})
+
+    result = WebhookSender(webhook_url, sleep=lambda seconds: None).send(
+        card_payload
+    )
+
+    assert result.success is True
+    assert result.attempts == 2
+    assert result.format_used == "text"
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_message_api_230022_never_degrades_to_plain_text(
+    httpx_mock, webhook_url, card_payload
+):
+    httpx_mock.add_response(
+        json={"code": 230022, "msg": "content contains sensitive information"}
+    )
+
+    result = WebhookSender(webhook_url, sleep=lambda seconds: None).send(
+        card_payload
+    )
+
+    assert result.success is False
+    assert result.attempts == 1
+    assert result.status_code == 200
+    assert result.feishu_code == 230022
+    assert result.format_used == "card"
+    assert result.error == "feishu_error_230022"
+    assert len(httpx_mock.get_requests()) == 1
+
+
+def test_message_api_230001_never_degrades_to_plain_text(
+    httpx_mock, webhook_url, card_payload
+):
+    httpx_mock.add_response(
+        status_code=400,
+        json={"code": 230001, "msg": "invalid message content"},
+    )
+
+    result = WebhookSender(webhook_url, sleep=lambda seconds: None).send(
+        card_payload
+    )
+
+    assert result.success is False
+    assert result.attempts == 1
+    assert result.status_code == 400
+    assert result.feishu_code == 230001
+    assert result.format_used == "card"
+    assert result.error == "http_400"
+    assert len(httpx_mock.get_requests()) == 1
+
+
 def test_http_400_invalid_card_degrades_once_to_plain_text(
     httpx_mock, webhook_url, card_payload
 ):

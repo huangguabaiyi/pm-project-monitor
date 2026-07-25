@@ -14,7 +14,8 @@ MAX_PAYLOAD_BYTES = 20 * 1024
 _RETRY_DELAYS = (10, 30, 120)
 _OFFICIAL_WEBHOOK_HOSTS = {"open.feishu.cn", "open.larksuite.com"}
 _OFFICIAL_WEBHOOK_PATH = "/open-apis/bot/v2/hook/"
-_CARD_FORMAT_CODES = {190001, 230001, 230021, 230022, 230099}
+_CARD_FORMAT_CODES = {9499, 190001}
+_CARD_FORMAT_EXACT_MESSAGES = {"bad request"}
 _CARD_FORMAT_MESSAGES = (
     "invalid card",
     "card invalid",
@@ -364,7 +365,9 @@ class WebhookSender:
             return False
         if feishu_code in _CARD_FORMAT_CODES:
             return True
-        normalized_message = feishu_message.casefold()
+        normalized_message = feishu_message.strip().casefold()
+        if normalized_message in _CARD_FORMAT_EXACT_MESSAGES:
+            return True
         return any(
             marker in normalized_message for marker in _CARD_FORMAT_MESSAGES
         )
