@@ -869,6 +869,7 @@ def test_stop_retains_runtime_snapshot(tmp_path):
 
     exit_code = cli.main(
         ["stop"],
+        plist_path=tmp_path / "monitor.plist",
         bootout_fn=lambda: None,
         disable_fn=lambda: None,
     )
@@ -877,29 +878,38 @@ def test_stop_retains_runtime_snapshot(tmp_path):
     assert runtime_path.read_text(encoding="utf-8") == "private runtime config"
 
 
-def test_start_uses_nonblocking_lifecycle_lock_across_threads(
+def test_restart_and_start_with_different_configs_share_lifecycle_lock(
     tmp_path, monkeypatch, capsys
 ):
-    config_path = tmp_path / "config.json"
-    write_operational_config(config_path)
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_config_path = first_dir / "config.json"
+    second_config_path = second_dir / "config.json"
+    write_operational_config(first_config_path)
+    write_operational_config(second_config_path)
     monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
     plist_path = tmp_path / "monitor.plist"
     entered = threading.Event()
     release = threading.Event()
     first_result = []
 
-    def blocking_bootstrap(path):
+    def blocking_bootout():
         entered.set()
         assert release.wait(timeout=5)
 
     def run_first():
         first_result.append(
             cli.main(
-                ["start", "--config", str(config_path)],
+                ["restart", "--config", str(first_config_path)],
                 plist_path=plist_path,
                 status_fn=lambda: False,
+                disabled_status_fn=lambda: False,
                 enable_fn=lambda: None,
-                bootstrap_fn=blocking_bootstrap,
+                bootstrap_fn=lambda path: None,
+                bootout_fn=blocking_bootout,
+                disable_fn=lambda: None,
                 system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
             )
         )
@@ -908,7 +918,7 @@ def test_start_uses_nonblocking_lifecycle_lock_across_threads(
     thread.start()
     assert entered.wait(timeout=5)
     second_exit = cli.main(
-        ["start", "--config", str(config_path)],
+        ["start", "--config", str(second_config_path)],
         plist_path=plist_path,
         status_fn=lambda: (_ for _ in ()).throw(
             AssertionError("locked command must not query launchctl")
@@ -921,7 +931,7 @@ def test_start_uses_nonblocking_lifecycle_lock_across_threads(
     thread.join(timeout=5)
 
     captured = capsys.readouterr()
-    lock_path = tmp_path / ".state" / "lifecycle.lock"
+    lock_path = tmp_path / ".com.mi.requirement-monitor.lifecycle.lock"
     assert first_result == [0]
     assert second_exit == cli.EXIT_UNEXPECTED
     assert "locked" in (captured.out + captured.err).lower()
@@ -932,8 +942,7 @@ def test_start_lifecycle_lock_blocks_another_process(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     write_operational_config(config_path)
     monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
-    lock_path = tmp_path / ".state" / "lifecycle.lock"
-    lock_path.parent.mkdir()
+    lock_path = tmp_path / ".com.mi.requirement-monitor.lifecycle.lock"
     script = (
         "import fcntl, os, sys; "
         "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); "
@@ -964,6 +973,25 @@ def test_start_lifecycle_lock_blocks_another_process(tmp_path, monkeypatch):
         process.wait(timeout=5)
 
     assert exit_code == cli.EXIT_UNEXPECTED
+
+
+def test_stop_returns_locked_without_launchctl_actions(tmp_path, capsys):
+    plist_path = tmp_path / "monitor.plist"
+    lock_path = tmp_path / ".com.mi.requirement-monitor.lifecycle.lock"
+    calls = []
+
+    with cli._lifecycle_lock(lock_path):
+        exit_code = cli.main(
+            ["stop"],
+            plist_path=plist_path,
+            bootout_fn=lambda: calls.append("bootout"),
+            disable_fn=lambda: calls.append("disable"),
+        )
+
+    captured = capsys.readouterr()
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert "locked" in (captured.out + captured.err).lower()
+    assert calls == []
 
 
 def test_lifecycle_lock_is_released_after_start_exception(tmp_path):
@@ -1285,11 +1313,12 @@ def test_start_failure_restores_previously_loaded_service(tmp_path):
     assert calls == ["enable", "bootout", "enable", "disable"]
 
 
-def test_stop_boots_out_then_persistently_disables_agent():
+def test_stop_boots_out_then_persistently_disables_agent(tmp_path):
     calls = []
 
     exit_code = cli.main(
         ["stop"],
+        plist_path=tmp_path / "monitor.plist",
         bootout_fn=lambda: calls.append("bootout"),
         disable_fn=lambda: calls.append("disable"),
     )

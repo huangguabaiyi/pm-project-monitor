@@ -177,7 +177,7 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 
 后台模式必须通过 `start` 或 `restart` 生成配置，不能手工让 LaunchAgent 直接指向仓库中的源配置。macOS LaunchAgent 不继承执行 `start` 时的 shell 环境，因此 `start` 会先解析源配置和当前环境变量，再将完整运行设置写入 `state_dir/runtime-config.json`；该文件使用原子写入、`0600` 权限，包含 Webhook、可选 LLM key 和机器人关键词，plist 的 `scheduled-run --config` 只指向这份私密快照。源配置不需要、也不应保存 Webhook 或 LLM key。`stop` 会卸载并禁用任务，但保留 runtime snapshot；它位于本地状态目录，不得提交或共享。
 
-`start` 和 `restart` 使用 `state_dir/lifecycle.lock` 的非阻塞跨进程文件锁串行化整个生命周期事务；并发命令会明确返回 locked 错误，不会互相覆盖 runtime snapshot 或 plist。锁文件权限为 `0600`，异常退出也会释放锁。只有 `llm.enabled=true` 时 runtime snapshot 才保存 LLM API key；关闭 LLM 时即使环境中仍有旧 key，也会强制写入 `null`。
+`start`、`stop` 和 `restart` 使用 LaunchAgent plist 同目录下基于固定 label 的 `.com.mi.requirement-monitor.lifecycle.lock` 非阻塞跨进程文件锁，串行化状态查询、launchctl 操作和文件事务；锁不依赖可变的源配置或 `state_dir`，因此不同配置发起的生命周期命令也不会互相覆盖。并发命令会明确返回 locked 错误，锁文件权限为 `0600`，异常退出也会释放锁。只有 `llm.enabled=true` 时 runtime snapshot 才保存 LLM API key；关闭 LLM 时即使环境中仍有旧 key，也会强制写入 `null`。
 
 Task12 已处理夏令时到系统时区的调度转换。修改 Webhook、LLM key、机器人关键词、表格地址、规则路径、状态/日志目录、时区、发送时间、虚拟环境路径或配置路径后，必须在新环境变量已生效的终端执行 `restart`，以重写 runtime snapshot 并重新加载 LaunchAgent；发生系统时区或夏令时切换后也建议重启服务，以确保 plist 中的下一组触发时间已刷新。
 

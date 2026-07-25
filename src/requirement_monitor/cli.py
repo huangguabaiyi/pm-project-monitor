@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from requirement_monitor import __version__
 from requirement_monitor.config import ConfigError
 from requirement_monitor.launchd import (
+    LAUNCH_AGENT_LABEL,
     LaunchdError,
     bootstrap,
     bootout,
@@ -34,7 +35,7 @@ EXIT_FEISHU = 3
 EXIT_WEBHOOK = 4
 EXIT_UNEXPECTED = 5
 RUNTIME_CONFIG_FILENAME = "runtime-config.json"
-LIFECYCLE_LOCK_FILENAME = "lifecycle.lock"
+LIFECYCLE_LOCK_FILENAME = f".{LAUNCH_AGENT_LABEL}.lifecycle.lock"
 
 
 class LifecycleLockedError(RuntimeError):
@@ -319,7 +320,7 @@ def _start(
     lifecycle_lock_held: bool = False,
 ) -> int:
     if not lifecycle_lock_held:
-        with _lifecycle_lock(_lifecycle_lock_path(settings, config_path)):
+        with _lifecycle_lock(_lifecycle_lock_path(plist_path)):
             return _start(
                 settings,
                 config_path,
@@ -402,10 +403,21 @@ def _start(
 
 def _stop(
     *,
+    plist_path: Optional[Path],
     bootout_fn: Optional[Callable[[], Any]],
     disable_fn: Optional[Callable[[], Any]],
     announce: bool = True,
+    lifecycle_lock_held: bool = False,
 ) -> int:
+    if not lifecycle_lock_held:
+        with _lifecycle_lock(_lifecycle_lock_path(plist_path)):
+            return _stop(
+                plist_path=plist_path,
+                bootout_fn=bootout_fn,
+                disable_fn=disable_fn,
+                announce=announce,
+                lifecycle_lock_held=True,
+            )
     (bootout_fn or bootout)()
     (disable_fn or disable)()
     if announce:
@@ -429,7 +441,7 @@ def _restart(
     lifecycle_lock_held: bool = False,
 ) -> int:
     if not lifecycle_lock_held:
-        with _lifecycle_lock(_lifecycle_lock_path(settings, config_path)):
+        with _lifecycle_lock(_lifecycle_lock_path(plist_path)):
             return _restart(
                 settings,
                 config_path,
@@ -459,9 +471,11 @@ def _restart(
     )
     try:
         _stop(
+            plist_path=target,
             bootout_fn=bootout_fn,
             disable_fn=disable_fn,
             announce=False,
+            lifecycle_lock_held=True,
         )
         return _start(
             settings,
@@ -695,10 +709,9 @@ def _write_private_bytes(path: Path, content: bytes) -> None:
                 pass
 
 
-def _lifecycle_lock_path(settings: Any, config_path: Path) -> Path:
-    state_dir = _absolute_setting_path(settings.state_dir, config_path)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    return state_dir / LIFECYCLE_LOCK_FILENAME
+def _lifecycle_lock_path(plist_path: Optional[Path]) -> Path:
+    target = Path(plist_path or default_plist_path()).expanduser().resolve()
+    return target.parent / LIFECYCLE_LOCK_FILENAME
 
 
 @contextmanager
@@ -849,7 +862,11 @@ def main(
 
     try:
         if args.command == "stop":
-            return _stop(bootout_fn=bootout_fn, disable_fn=disable_fn)
+            return _stop(
+                plist_path=plist_path,
+                bootout_fn=bootout_fn,
+                disable_fn=disable_fn,
+            )
 
         config_path = _resolve_config_path(args.config)
         settings = _load_settings(
