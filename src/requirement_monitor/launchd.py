@@ -3,8 +3,9 @@
 launchd evaluates ``StartCalendarInterval`` in the host system timezone.
 The plist therefore stores intervals converted from the configured timezone
 using the current system zone.  ``scheduled-run`` remains the final guard in
-the configured timezone, and ``start`` should be rerun after a system
-timezone or DST transition so the static calendar mapping is refreshed.
+the configured timezone, and ``start`` should be rerun after a system,
+configured-business timezone, or DST transition so the static calendar
+mapping is refreshed.
 """
 
 import os
@@ -72,9 +73,32 @@ def in_scheduled_window(
     return scheduled_at <= now < scheduled_at + timedelta(minutes=window_minutes)
 
 
-def current_system_timezone() -> tzinfo:
+def system_timezone_provider() -> tzinfo:
+    candidates = []
+    environment_timezone = os.getenv("TZ", "").strip()
+    if environment_timezone:
+        candidates.append(environment_timezone.lstrip(":"))
+
+    try:
+        localtime = Path("/etc/localtime").resolve()
+        marker = f"{os.sep}zoneinfo{os.sep}"
+        resolved = str(localtime)
+        if marker in resolved:
+            candidates.append(resolved.split(marker, 1)[1])
+    except OSError:
+        pass
+
+    for candidate in candidates:
+        try:
+            return ZoneInfo(candidate)
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            continue
+
     current = datetime.now().astimezone()
     return current.tzinfo or utc_timezone.utc
+
+
+current_system_timezone = system_timezone_provider
 
 
 def _coerce_timezone(value: TimezoneValue) -> tzinfo:
@@ -101,17 +125,33 @@ def scheduled_intervals_in_system_timezone(
     hour: int,
     minute: int,
     configured_timezone: TimezoneValue,
-    system_timezone: TimezoneValue,
-    reference_date: date,
+    system_timezone: Optional[TimezoneValue] = None,
+    reference_date: Optional[date] = None,
+    now: Optional[datetime] = None,
+    system_timezone_provider_fn: Optional[Callable[[], TimezoneValue]] = None,
 ) -> List[Dict[str, int]]:
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         raise ValueError("scheduled time is invalid")
     configured_zone = _coerce_timezone(configured_timezone)
-    system_zone = _coerce_timezone(system_timezone)
-    monday = reference_date - timedelta(days=reference_date.weekday())
+    system_zone = _coerce_timezone(
+        system_timezone
+        if system_timezone is not None
+        else (system_timezone_provider_fn or system_timezone_provider)()
+    )
+    if now is not None:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        start_date = now.astimezone(configured_zone).date()
+    elif reference_date is not None:
+        start_date = reference_date
+    else:
+        start_date = datetime.now(configured_zone).date()
     intervals: List[Dict[str, int]] = []
-    for weekday in range(5):
-        local_date = monday + timedelta(days=weekday)
+    local_date = start_date
+    while len(intervals) < 5:
+        if local_date.weekday() >= 5:
+            local_date += timedelta(days=1)
+            continue
         local_datetime = _resolve_local_datetime(
             datetime.combine(
                 local_date,
@@ -127,6 +167,7 @@ def scheduled_intervals_in_system_timezone(
                 "Minute": system_datetime.minute,
             }
         )
+        local_date += timedelta(days=1)
     return intervals
 
 
@@ -139,6 +180,8 @@ def render_plist(
     timezone: str = "Asia/Shanghai",
     system_timezone: Optional[TimezoneValue] = None,
     reference_date: Optional[date] = None,
+    now: Optional[datetime] = None,
+    system_timezone_provider_fn: Optional[Callable[[], TimezoneValue]] = None,
     working_directory: Optional[Path] = None,
     label: str = LAUNCH_AGENT_LABEL,
 ) -> str:
@@ -146,14 +189,15 @@ def render_plist(
     host_zone = (
         _coerce_timezone(system_timezone)
         if system_timezone is not None
-        else current_system_timezone()
+        else (system_timezone_provider_fn or system_timezone_provider)()
     )
     intervals = scheduled_intervals_in_system_timezone(
         hour=hour,
         minute=minute,
         configured_timezone=configured_zone,
         system_timezone=host_zone,
-        reference_date=reference_date or datetime.now().date(),
+        reference_date=reference_date,
+        now=now,
     )
     config = Path(config_path).expanduser().resolve()
     python = Path(python_path).expanduser()

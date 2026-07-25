@@ -1,3 +1,4 @@
+import stat
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -327,7 +328,10 @@ def test_start_write_failure_restores_plist_and_disables_agent(tmp_path):
     plist_path = tmp_path / "monitor.plist"
     plist_path.write_text("old plist", encoding="utf-8")
 
+    write_calls = []
+
     def failing_write(path, content):
+        write_calls.append("failed")
         Path(path).write_text("new plist", encoding="utf-8")
         raise OSError("write failed")
 
@@ -344,6 +348,86 @@ def test_start_write_failure_restores_plist_and_disables_agent(tmp_path):
     assert exit_code == 5
     assert plist_path.read_text(encoding="utf-8") == "old plist"
     assert calls == ["enable", "disable"]
+
+
+def test_start_uses_default_status_query_for_loaded_rollback(
+    tmp_path, monkeypatch
+):
+    calls = []
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+        fixed_rules_path=tmp_path / "固定业务规则",
+    )
+    plist_path = tmp_path / "monitor.plist"
+    plist_path.write_text("old plist", encoding="utf-8")
+    monkeypatch.setattr(cli, "launchd_status", lambda: True)
+
+    def failing_bootstrap(path):
+        raise LaunchdError("bootstrap failed", stderr="bootstrap stderr")
+
+    exit_code = cli.main(
+        ["start", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        plist_path=plist_path,
+        enable_fn=lambda: calls.append("enable"),
+        write_plist_fn=lambda path, content: Path(path).write_text(content),
+        bootstrap_fn=failing_bootstrap,
+        bootout_fn=lambda: calls.append("bootout"),
+        disable_fn=lambda: calls.append("disable"),
+    )
+
+    assert exit_code == 5
+    assert calls == ["enable", "bootout", "enable", "disable"]
+
+
+def test_start_rollback_reuses_atomic_private_plist_writer(tmp_path, monkeypatch):
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+        fixed_rules_path=tmp_path / "固定业务规则",
+    )
+    plist_path = tmp_path / "monitor.plist"
+    old_content = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<plist><string>a &amp; b</string></plist>"
+    )
+    plist_path.write_text(old_content, encoding="utf-8")
+    calls = []
+    real_write_plist = cli.write_plist
+
+    def fail_once(path, content):
+        calls.append(content)
+        if len(calls) == 1:
+            Path(path).write_text("broken", encoding="utf-8")
+            raise OSError("permission denied")
+        return real_write_plist(path, content)
+
+    monkeypatch.setattr(cli, "write_plist", fail_once)
+
+    exit_code = cli.main(
+        ["start", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: (_ for _ in ()).throw(
+            LaunchdError("bootstrap failed", stderr="bootstrap stderr")
+        ),
+        bootout_fn=lambda: None,
+        disable_fn=lambda: None,
+    )
+
+    assert exit_code == 5
+    assert calls[-1] == old_content
+    assert plist_path.read_text(encoding="utf-8") == old_content
+    assert stat.S_IMODE(plist_path.stat().st_mode) == 0o600
 
 
 def test_start_bootstrap_retry_failure_cleans_up_and_preserves_stderr(tmp_path, capsys):

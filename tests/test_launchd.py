@@ -93,6 +93,26 @@ def test_schedule_conversion_uses_injected_zoneinfo_dst_offset():
     assert intervals[0] == {"Weekday": 2, "Hour": 0, "Minute": 0}
 
 
+def test_sunday_start_uses_next_weekday_after_dst_transition():
+    intervals = scheduled_intervals_in_system_timezone(
+        hour=20,
+        minute=0,
+        configured_timezone="America/New_York",
+        system_timezone=ZoneInfo("UTC"),
+        now=datetime(2026, 3, 8, 12, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert intervals[0] == {"Weekday": 2, "Hour": 0, "Minute": 0}
+
+
+def test_system_timezone_provider_accepts_injected_tz_environment(monkeypatch):
+    monkeypatch.setenv("TZ", "America/New_York")
+
+    from requirement_monitor.launchd import system_timezone_provider
+
+    assert getattr(system_timezone_provider(), "key", None) == "America/New_York"
+
+
 def test_launchctl_status_distinguishes_missing_service_from_execution_error():
     missing = lambda command, **kwargs: SimpleNamespace(
         returncode=1,

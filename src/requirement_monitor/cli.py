@@ -305,11 +305,10 @@ def _start(
     target = Path(plist_path or default_plist_path()).expanduser()
     previous_plist = _snapshot_plist(target)
     previous_loaded = None
-    if status_fn is not None:
-        try:
-            previous_loaded = bool(status_fn())
-        except LaunchdError:
-            previous_loaded = None
+    try:
+        previous_loaded = bool((status_fn or launchd_status)())
+    except LaunchdError:
+        previous_loaded = None
     state_changed = True
     try:
         (enable_fn or enable)()
@@ -348,6 +347,7 @@ def _start(
             previous_loaded,
             enable_fn or enable,
             bootstrap_fn or bootstrap,
+            write_plist_fn or write_plist,
         )
         raise
     print(f"started: {target}")
@@ -381,15 +381,23 @@ def _rollback_start(
     previous_loaded: Optional[bool],
     enable_fn,
     bootstrap_fn,
+    write_plist_fn,
 ):
     try:
         if snapshot is None:
             path.unlink(missing_ok=True)
         else:
             content, mode = snapshot
-            path.write_bytes(content)
-            os.chmod(path, mode)
-    except OSError:
+            text = content.decode("utf-8")
+            try:
+                write_plist_fn(path, text)
+            except Exception:
+                if write_plist_fn is not write_plist:
+                    write_plist(path, text)
+                else:
+                    raise
+            os.chmod(path, 0o600)
+    except (OSError, UnicodeError):
         pass
     if state_changed and previous_loaded:
         try:
