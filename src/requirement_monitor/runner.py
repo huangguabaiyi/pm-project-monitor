@@ -165,7 +165,11 @@ class MonitorRunner:
         report.eligible_requirement_count = len(eligible)
         project_configs = self._project_configs(snapshot.project_configs)
         risks: List[RequirementRisk] = []
-        failed_requirement_ids = set()
+        failed_requirement_ids = {
+            issue.requirement_id
+            for issue in issues
+            if issue.requirement_id is not None
+        }
         for requirement in eligible:
             project_config = project_configs.get(requirement.project)
             try:

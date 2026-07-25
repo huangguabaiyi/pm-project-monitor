@@ -957,3 +957,82 @@ def test_complete_evaluation_clears_obsolete_legacy_unmapped_fingerprint():
     assert report.invalid_records == 0
     assert dependencies.state_store.state.active_fingerprints == set()
     assert dependencies.state_store.state.active_fingerprint_requirements == {}
+
+
+def test_mapped_fingerprint_survives_requirement_validation_issue_until_recovery():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    requirement = dependencies.repository.snapshot.requirements[0]
+    runner = dependencies.runner()
+
+    first = runner.run(trigger="manual")
+    fingerprint = next(
+        iter(dependencies.state_store.state.active_fingerprints)
+    )
+    dependencies.repository.snapshot.requirements = []
+    dependencies.repository.issues = [
+        ValidationIssue(
+            table_name="需求主表",
+            record_id=requirement.record_id,
+            requirement_id=requirement.requirement_id,
+            field_name="需求名称",
+            expected_format="非空文本",
+            fix_suggestion="补全需求名称后重试",
+            skip_scope="requirement",
+            message="需求记录校验失败",
+        )
+    ]
+
+    invalid = runner.run(trigger="manual")
+    state_after_invalid = dependencies.state_store.state.model_copy(deep=True)
+    dependencies.repository.snapshot.requirements = [requirement]
+    dependencies.repository.issues = []
+    recovered = runner.run(trigger="manual")
+    dependencies.level = RiskLevel.NORMAL
+    normal = runner.run(trigger="manual")
+
+    assert first.severe_cards == 1
+    assert invalid.invalid_records == 1
+    assert state_after_invalid.active_fingerprints == {fingerprint}
+    assert state_after_invalid.active_fingerprint_requirements == {
+        fingerprint: requirement.requirement_id
+    }
+    assert recovered.severe_cards == 0
+    assert normal.invalid_records == 0
+    assert dependencies.state_store.state.active_fingerprints == set()
+    assert dependencies.state_store.state.active_fingerprint_requirements == {}
+
+
+def test_validation_issue_without_requirement_id_only_preserves_legacy_unmapped():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    runner = dependencies.runner()
+    runner.run(trigger="manual")
+    mapped_fingerprint = next(
+        iter(dependencies.state_store.state.active_fingerprints)
+    )
+    legacy_fingerprint = "legacy-unmapped"
+    dependencies.state_store.state.active_fingerprints.add(
+        legacy_fingerprint
+    )
+    dependencies.repository.snapshot.requirements = []
+    dependencies.repository.issues = [
+        ValidationIssue(
+            table_name="需求主表",
+            record_id="bad-requirement",
+            field_name="需求编号",
+            expected_format="非空文本",
+            fix_suggestion="补全需求编号后重试",
+            skip_scope="requirement",
+            message="无法识别需求编号",
+        )
+    ]
+
+    report = runner.run(trigger="manual")
+
+    assert report.invalid_records == 1
+    assert dependencies.state_store.state.active_fingerprints == {
+        legacy_fingerprint
+    }
+    assert mapped_fingerprint not in (
+        dependencies.state_store.state.active_fingerprints
+    )
+    assert dependencies.state_store.state.active_fingerprint_requirements == {}
