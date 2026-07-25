@@ -143,6 +143,7 @@ def test_risk_result_carries_complete_card_context(rules):
         [blocker],
         rules,
         NOW,
+        make_config(llm_notes="项目补充语义"),
     )
 
     assert result.target_version == requirement.target_version
@@ -153,6 +154,16 @@ def test_risk_result_carries_complete_card_context(rules):
     assert result.blockers == [blocker]
     assert result.node_risks[0].planned_end == node.planned_end
     assert result.node_risks[0].status == node.status
+    assert result.project_notes == "项目补充语义"
+    assert result.requirement_notes == requirement.requirement_notes
+    assert result.node_risks[0].progress_note == "推进中"
+    assert {
+        (person.open_id, person.name) for person in result.sensitive_people
+    } == {
+        ("ou-project", "项目负责人"),
+        ("ou-客户端", "客户端负责人"),
+        ("ou-blocker", "阻塞负责人"),
+    }
 
 
 def test_project_structured_fields_override_fixed_rules_without_reading_notes(rules):
@@ -243,6 +254,82 @@ def test_custom_stages_follow_base_table_sort_without_zero_cycle_failure(rules):
         "定制评审A",
         "定制评审B",
     ]
+
+
+def test_disabled_at2_is_not_synthesized_or_counted(rules):
+    configs = [
+        base_config("环节", "AT 测试第一轮", 10),
+        base_config("环节", "AT 测试第二轮", 20, enabled=False),
+    ]
+    effective = resolve_effective_rules(rules, None, configs)
+    at1 = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=at(24),
+        planned_end=at(31),
+    )
+
+    events = risk_module._build_events("客户端", [at1], effective)
+
+    assert [(event.label, event.duration) for event in events] == [("AT1", 4)]
+
+
+def test_each_test_round_and_custom_stage_use_their_own_configured_order(rules):
+    configs = [
+        base_config("环节", "AT 测试第一轮", 10),
+        base_config("环节", "定制验收", 20),
+        base_config("环节", "AT 测试第二轮", 30),
+        base_config("环节", "PV 测试第一轮", 40),
+        base_config("环节", "PV 测试第二轮", 50),
+        base_config("环节", "线上回归", 60),
+    ]
+    effective = resolve_effective_rules(rules, None, configs)
+    nodes = [
+        make_node("PV 测试第二轮", work_type="测试"),
+        make_node("AT 测试第二轮", work_type="测试"),
+        make_node("定制验收", work_type="公共环节"),
+        make_node("AT 测试第一轮", work_type="测试"),
+        make_node("PV 测试第一轮", work_type="测试"),
+    ]
+
+    events = risk_module._build_events("客户端", nodes, effective)
+
+    assert [event.label for event in events if event.node is not None] == [
+        "AT1",
+        "定制验收",
+        "AT2",
+        "PV1",
+        "PV2",
+    ]
+
+
+def test_disabled_domain_test_role_excludes_only_test_nodes(rules):
+    configs = [
+        base_config("测试角色", "客户端测试", 10, enabled=False),
+    ]
+    development = make_node("各端开发", work_type="研发")
+    testing = make_node("AT 测试第一轮", work_type="测试")
+
+    result = evaluate_requirement(
+        make_requirement(), [development, testing], [], rules, NOW, None, configs
+    )
+
+    assert [node.node_name for node in result.node_risks] == ["各端开发"]
+
+
+def test_dynamic_enabled_test_role_allows_new_delivery_domain(rules):
+    configs = [base_config("测试角色", "插件测试", 10)]
+    plugin_test = make_node(
+        "插件专项测试",
+        domain="插件",
+        work_type="测试",
+    )
+
+    result = evaluate_requirement(
+        make_requirement(), [plugin_test], [], rules, NOW, None, configs
+    )
+
+    assert [node.node_name for node in result.node_risks] == ["插件专项测试"]
 
 
 def test_fixed_at_duration_uses_workday_or_natural_mode(rules):

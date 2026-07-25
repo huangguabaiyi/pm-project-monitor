@@ -20,6 +20,7 @@ from requirement_monitor.fixed_rules import parse_fixed_rules
 from requirement_monitor.models import (
     FixedRules,
     LLMEnrichment,
+    Person,
     ProjectConfig,
     Requirement,
     RequirementRisk,
@@ -537,6 +538,34 @@ class MonitorRunner:
         ):
             return risk
         report.llm_attempted = True
+        people = list(risk.sensitive_people)
+        people.append(
+            Person(
+                open_id=requirement.project_owner_id,
+                name=requirement.project_owner_name,
+            )
+        )
+        if requirement.product_owner_id and requirement.product_owner_name:
+            people.append(
+                Person(
+                    open_id=requirement.product_owner_id,
+                    name=requirement.product_owner_name,
+                )
+            )
+        unique_people = {
+            (person.open_id, person.name): person for person in people
+        }
+        contextual_risk = risk.model_copy(
+            update={
+                "project_notes": (
+                    risk.project_notes or project_config.llm_notes
+                ),
+                "requirement_notes": (
+                    risk.requirement_notes or requirement.requirement_notes
+                ),
+                "sensitive_people": list(unique_people.values()),
+            }
+        )
         project_description = "\n".join(
             value
             for value in (project_config.llm_notes, requirement.requirement_notes)
@@ -544,7 +573,7 @@ class MonitorRunner:
         )
         try:
             enrichment = self.llm.enrich(
-                risk, fixed_rules_text, project_description
+                contextual_risk, fixed_rules_text, project_description
             )
         except MemoryError:
             raise
@@ -561,7 +590,7 @@ class MonitorRunner:
                 report.llm_failure_reasons = self._deduplicate(
                     report.llm_failure_reasons + [enrichment.failure_reason]
                 )
-        return risk.model_copy(
+        return contextual_risk.model_copy(
             update={
                 "level": max(risk.level, enrichment.effective_level),
                 "reasons": self._deduplicate(risk.reasons + enrichment.reasons),

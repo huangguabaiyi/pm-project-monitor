@@ -12,6 +12,7 @@ from requirement_monitor.models import (
     FixedRules,
     NodeRisk,
     NodeStatus,
+    Person,
     ProjectConfig,
     Requirement,
     RequirementRisk,
@@ -47,7 +48,10 @@ class EffectiveRules:
     launch_cutoff: str
     checklist_days_before: int
     process_order: Dict[str, int]
+    has_stage_configuration: bool
+    enabled_stages: Set[str]
     disabled_stages: Set[str]
+    test_role_states: Dict[str, bool]
 
 
 @dataclass(frozen=True)
@@ -125,8 +129,15 @@ def resolve_effective_rules(
         ),
         checklist_days_before=fixed.checklist_days_before,
         process_order={name: index for index, name in enumerate(process_names)},
+        has_stage_configuration=bool(stage_configs),
+        enabled_stages=set(enabled_stages),
         disabled_stages={
             config.name for config in stage_configs if not config.enabled
+        },
+        test_role_states={
+            config.name: config.enabled
+            for config in (base_configs or [])
+            if config.config_type == "测试角色"
         },
     )
 
@@ -152,6 +163,7 @@ def evaluate_requirement(
         if node.requirement_id == requirement.requirement_id
         and node.name not in effective.disabled_stages
         and _configured_stage_name(node) not in effective.disabled_stages
+        and _test_role_enabled(node, effective)
     ]
     relevant_blockers = [
         blocker
@@ -215,6 +227,11 @@ def evaluate_requirement(
         affected_domains=_deduplicate(affected_domains),
         reasons=_deduplicate(reasons),
         actions=[],
+        project_notes=project_config.llm_notes if project_config is not None else "",
+        requirement_notes=requirement.requirement_notes,
+        sensitive_people=_requirement_people(
+            requirement, relevant_nodes, relevant_blockers
+        ),
         node_risks=[
             node_risk
             for domain_result in domain_results
@@ -287,6 +304,7 @@ def _evaluate_domain(
                     buffer_days=node_buffer,
                     reasons=_deduplicate(node_reasons),
                     actions=[],
+                    progress_note=event.node.progress_note,
                 )
             )
 
@@ -515,11 +533,19 @@ def _build_events(
     pv_first = ceil(rules.pv_days / 2)
     pv_second = rules.pv_days - pv_first
     events: List[_Event] = []
-    at_order = rules.process_order.get("AT 测试第一轮", _AT1_ORDER)
-    pv_order = rules.process_order.get("PV 测试第一轮", _PV1_ORDER)
+    at1_order = rules.process_order.get("AT 测试第一轮", _AT1_ORDER)
+    at2_order = rules.process_order.get("AT 测试第二轮", _AT1_ORDER + 1)
+    pv1_order = rules.process_order.get("PV 测试第一轮", _PV1_ORDER)
+    pv2_order = rules.process_order.get("PV 测试第二轮", _PV1_ORDER + 1)
     regression_order = rules.process_order.get("线上回归", _REGRESSION_ORDER)
 
     for node in nodes:
+        configured_stage = _configured_stage_name(node)
+        if (
+            rules.has_stage_configuration
+            and configured_stage in rules.disabled_stages
+        ):
+            continue
         order, label, duration = _node_stage(
             node,
             at_first,
@@ -537,20 +563,45 @@ def _build_events(
     has_pv = any(_is_round_label(stage, "PV") for stage in stages)
     has_test_flow = has_at or has_pv or "线上回归" in stages
 
-    if has_at and "AT1" not in stages and at_first:
-        events.append(_Event((at_order, 1), at_first, "AT1"))
-    if has_at and "AT2" not in stages and at_second:
-        events.append(_Event((at_order, 2), at_second, "AT2"))
-    if has_pv and "PV1" not in stages and pv_first:
-        events.append(_Event((pv_order, 1), pv_first, "PV1"))
-    if has_pv and "PV2" not in stages and pv_second:
-        events.append(_Event((pv_order, 2), pv_second, "PV2"))
+    if (
+        has_at
+        and "AT1" not in stages
+        and at_first
+        and _stage_enabled(rules, "AT 测试第一轮")
+    ):
+        events.append(_Event((at1_order, 1), at_first, "AT1"))
+    if (
+        has_at
+        and "AT2" not in stages
+        and at_second
+        and _stage_enabled(rules, "AT 测试第二轮")
+    ):
+        events.append(_Event((at2_order, 2), at_second, "AT2"))
+    if (
+        has_pv
+        and "PV1" not in stages
+        and pv_first
+        and _stage_enabled(rules, "PV 测试第一轮")
+    ):
+        events.append(_Event((pv1_order, 1), pv_first, "PV1"))
+    if (
+        has_pv
+        and "PV2" not in stages
+        and pv_second
+        and _stage_enabled(rules, "PV 测试第二轮")
+    ):
+        events.append(_Event((pv2_order, 2), pv_second, "PV2"))
     if has_pv and rules.bugfix_days:
         events.append(_Event((regression_order, -2), rules.bugfix_days, "Bug修复预留"))
     special_days = rules.special_days.get(domain, 0)
     if special_days:
         events.append(_Event((regression_order, -1), special_days, f"{domain}专项测试"))
-    if has_test_flow and "线上回归" not in stages and rules.regression_days:
+    if (
+        has_test_flow
+        and "线上回归" not in stages
+        and rules.regression_days
+        and _stage_enabled(rules, "线上回归")
+    ):
         events.append(
             _Event((regression_order, 0), rules.regression_days, "线上回归")
         )
@@ -580,8 +631,11 @@ def _node_stage(
                 if round_number == 2
                 else _extra_round_duration(node, duration_mode)
             )
+            stage_name = "AT 测试第{}轮".format(
+                "一" if round_number == 1 else "二"
+            )
             return (
-                process_order.get("AT 测试第一轮", _AT1_ORDER),
+                process_order.get(stage_name, _AT1_ORDER + round_number - 1),
                 round_number,
             ), f"AT{round_number}", duration
         duration = (
@@ -591,8 +645,11 @@ def _node_stage(
             if round_number == 2
             else _extra_round_duration(node, duration_mode)
         )
+        stage_name = "PV 测试第{}轮".format(
+            "一" if round_number == 1 else "二"
+        )
         return (
-            process_order.get("PV 测试第一轮", _PV1_ORDER),
+            process_order.get(stage_name, _PV1_ORDER + round_number - 1),
             round_number,
         ), f"PV{round_number}", duration
     if "线上回归" in node.name:
@@ -683,6 +740,48 @@ def _configured_stage_name(node: DeliveryNode) -> str:
         if family == "PV" and round_number in (1, 2):
             return "PV 测试第{}轮".format("一" if round_number == 1 else "二")
     return _matching_process_name(node)
+
+
+def _stage_enabled(rules: EffectiveRules, stage_name: str) -> bool:
+    if not rules.has_stage_configuration:
+        return True
+    return stage_name in rules.enabled_stages
+
+
+def _test_role_enabled(node: DeliveryNode, rules: EffectiveRules) -> bool:
+    if node.work_type != "测试":
+        return True
+    role_name = "{}测试".format(node.domain)
+    return rules.test_role_states.get(role_name, True)
+
+
+def _requirement_people(
+    requirement: Requirement,
+    nodes: Sequence[DeliveryNode],
+    blockers: Sequence[Blocker],
+) -> List[Person]:
+    people = [
+        Person(
+            open_id=requirement.project_owner_id,
+            name=requirement.project_owner_name,
+        )
+    ]
+    if requirement.product_owner_id and requirement.product_owner_name:
+        people.append(
+            Person(
+                open_id=requirement.product_owner_id,
+                name=requirement.product_owner_name,
+            )
+        )
+    people.extend(Person(open_id=node.owner_id, name=node.owner_name) for node in nodes)
+    people.extend(
+        Person(open_id=blocker.owner_id, name=blocker.owner_name)
+        for blocker in blockers
+    )
+    unique = {}
+    for person in people:
+        unique[(person.open_id, person.name)] = person
+    return list(unique.values())
 
 
 def _build_phase_events(
@@ -900,6 +999,7 @@ def _evaluate_checklist_node(
         buffer_days=None,
         reasons=reasons,
         actions=[],
+        progress_note=node.progress_note,
         planned_end_is_system_managed=True,
     )
 

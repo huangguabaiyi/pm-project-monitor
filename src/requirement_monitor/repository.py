@@ -27,6 +27,13 @@ from requirement_monitor.schema import BASIC_CONFIG_SEEDS, SCHEMA, SINGLE_LINK
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 KEY_TABLE_NAMES = tuple(table.name for table in SCHEMA)
+SNAPSHOT_TABLE_NAMES = (
+    "需求主表",
+    "进展节点表",
+    "阻塞项表",
+    "项目配置表",
+    "基础配置表",
+)
 BATCH_SIZE = 500
 MIN_MILLISECONDS_TIMESTAMP = 1_000_000_000_000
 MAX_MILLISECONDS_TIMESTAMP = 99_999_999_999_999
@@ -213,7 +220,7 @@ class BitableRepository:
         self._validate_runtime_schema(table_ids)
         raw_tables = {
             table_name: self._all_records(table_ids[table_name])
-            for table_name in KEY_TABLE_NAMES
+            for table_name in SNAPSHOT_TABLE_NAMES
         }
         snapshot, issues = parse_snapshot(raw_tables)
         self._validate_base_configuration(snapshot, issues)

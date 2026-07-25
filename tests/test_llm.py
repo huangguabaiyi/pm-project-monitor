@@ -12,6 +12,7 @@ from requirement_monitor.models import (
     Blocker,
     NodeRisk,
     NodeStatus,
+    Person,
     RequirementRisk,
     RiskLevel,
 )
@@ -130,7 +131,12 @@ def test_posts_openai_compatible_request_with_guardrails(
     assert user_input["fixed_rules"] == "规则原文：上线日期不可变"
     assert "project_description" not in user_input
     assert "requirement_id" not in user_input["risk"]
-    assert user_input["risk"]["requirement_name"] == "语音助手升级"
+    assert user_input["risk"]["requirement_ref"].startswith("requirement_")
+    assert user_input["risk"]["project_ref"].startswith("project_")
+    assert (
+        user_input["risk"]["context"]["requirement_notes"]
+        == "项目说明：本周进入测试"
+    )
     assert user_input["risk"]["level"] == RiskLevel.NORMAL
 
     assert enrichment.available is True
@@ -186,6 +192,95 @@ def test_llm_request_body_excludes_all_person_pii(httpx_mock, llm_settings):
         "project_owner_name",
     ):
         assert forbidden not in body
+
+
+def test_llm_request_uses_anonymous_refs_and_sanitized_business_context(
+    httpx_mock, llm_settings
+):
+    httpx_mock.add_response(json=response_content(risk_level="普通"))
+    risk = make_risk(RiskLevel.SEVERE).model_copy(
+        update={
+            "requirement_name": "张三负责的登录改造",
+            "project": "李四专项项目",
+            "project_owner_id": "ou-secret-project",
+            "project_owner_name": "张三",
+            "project_notes": (
+                "联系人：赵六，本周进入灰度；电话13800138000；"
+                "邮箱owner@example.com；身份证11010519491231002X；"
+                "详情https://example.com/path?token=query-secret"
+            ),
+            "requirement_notes": "负责人王五确认接口语义保留",
+            "sensitive_people": [
+                Person(open_id="ou-secret-product", name="赵六")
+            ],
+            "reasons": ["王五反馈存在测试风险"],
+            "node_risks": [
+                NodeRisk(
+                    node_record_id="node-secret",
+                    requirement_id="REQ-1",
+                    node_name="赵六维护的客户端节点",
+                    domain="客户端",
+                    owner_id="ou-secret-node",
+                    owner_name="李四",
+                    planned_end=datetime(2026, 8, 1, 18, tzinfo=TZ),
+                    status=NodeStatus.IN_PROGRESS,
+                    progress_note="由李四跟进，联调完成80%，手机号13900139000",
+                    reasons=["联系人张三需确认"],
+                )
+            ],
+            "blockers": [
+                Blocker(
+                    record_id="blocker-secret",
+                    requirement_id="REQ-1",
+                    title="王五负责的接口阻塞",
+                    owner_id="ou-secret-blocker",
+                    owner_name="王五",
+                    found_at=datetime(2026, 7, 25, 9, tzinfo=TZ),
+                    planned_resolution_at=datetime(2026, 7, 27, 18, tzinfo=TZ),
+                    status="处理中",
+                    affects_merge=True,
+                    resolution_note="由王五处理，接口方案已完成一半",
+                )
+            ],
+        }
+    )
+    fixed_rules = "固定规则全文：服务端周二周四上线，规则只读。"
+
+    enrichment = LLMClient(llm_settings).enrich(
+        risk,
+        fixed_rules,
+        "兼容参数不应覆盖risk中的说明",
+    )
+
+    body = httpx_mock.get_request().content.decode("utf-8")
+    user_input = json.loads(
+        json.loads(body)["messages"][1]["content"]
+    )
+    serialized = json.dumps(user_input, ensure_ascii=False)
+    for forbidden in (
+        "张三",
+        "李四",
+        "赵六",
+        "王五",
+        "ou-secret",
+        "13800138000",
+        "13900139000",
+        "owner@example.com",
+        "11010519491231002X",
+        "query-secret",
+        "登录改造",
+        "专项项目",
+        "客户端节点",
+        "接口阻塞",
+    ):
+        assert forbidden not in serialized
+    assert user_input["fixed_rules"] == fixed_rules
+    assert "本周进入灰度" in serialized
+    assert "接口语义保留" in serialized
+    assert "联调完成80%" in serialized
+    assert "接口方案已完成一半" in serialized
+    assert "[REDACTED]" in serialized
+    assert enrichment.effective_level == RiskLevel.SEVERE
 
 
 @pytest.mark.parametrize(

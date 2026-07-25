@@ -245,6 +245,7 @@ class NodeRisk(BaseModel):
     buffer_days: Optional[float] = None
     reasons: List[NonEmptyStr] = Field(default_factory=list)
     actions: List[NonEmptyStr] = Field(default_factory=list)
+    progress_note: StrippedStr = ""
     planned_end_is_system_managed: bool = False
 
 
@@ -275,6 +276,9 @@ class RequirementRisk(BaseModel):
     affected_domains: List[NonEmptyStr] = Field(default_factory=list)
     reasons: List[NonEmptyStr] = Field(default_factory=list)
     actions: List[NonEmptyStr] = Field(default_factory=list)
+    project_notes: StrippedStr = ""
+    requirement_notes: StrippedStr = ""
+    sensitive_people: List[Person] = Field(default_factory=list)
     node_risks: List[NodeRisk] = Field(default_factory=list)
     blockers: List[Blocker] = Field(default_factory=list)
     llm_enrichment: Optional[LLMEnrichment] = None

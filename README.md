@@ -68,7 +68,7 @@ export REQUIREMENT_MONITOR_LLM_BASE_URL='https://api.example.com/v1'
 export REQUIREMENT_MONITOR_LLM_MODEL='model-name'
 ```
 
-为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。`bot_keyword` 也可写入本地配置，并由 `REQUIREMENT_MONITOR_BOT_KEYWORD` 覆盖。新配置的 Webhook 和 LLM key 应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table` 的 schema 初始化不要求 Webhook；`stop` 和 `version` 也不加载 Webhook 配置。`run-once`、`start`、`status`、`scheduled-run` 和 `logs` 仍按默认配置要求可用 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
+为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。`bot_keyword` 也可写入本地配置，并由 `REQUIREMENT_MONITOR_BOT_KEYWORD` 覆盖。新配置的 Webhook 和 LLM key 应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table`、`status`、`logs`、`run-once --dry-run`、`stop` 和 `version` 不要求 Webhook；普通 `run-once`、`start`、`restart` 和 `scheduled-run` 必须配置 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
 
 飞书 Webhook 返回 HTTP `200` 但业务码 `19024` 时，表示机器人启用了关键词安全校验，而消息中没有找到必需关键词。设置 `bot_keyword` 或 `REQUIREMENT_MONITOR_BOT_KEYWORD` 后，发送器会在文本、互动卡片、降级文本和系统异常卡片中保证该关键词可见，并避免重复注入；未配置关键词的机器人保持原 payload 不变。
 
@@ -148,7 +148,7 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 .venv/bin/requirement-monitor run-once --dry-run
 ```
 
-`--dry-run` 计算并打印待发送 payload，不写系统字段、不写通知记录、不发送 Webhook。确认数据和卡片内容后执行一次真实人工检查：
+`--dry-run` 不要求配置 Webhook；它仍读取并校验飞书表格，计算并打印待发送 payload，但不写系统字段、不写通知记录、不调用 LLM、不发送 Webhook。确认数据和卡片内容后执行一次真实人工检查：
 
 ```bash
 .venv/bin/requirement-monitor run-once
@@ -172,6 +172,8 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 ```bash
 .venv/bin/requirement-monitor logs
 ```
+
+`status` 和 `logs` 仅查看本机运行状态与日志，不要求配置 Webhook。
 
 默认调度为 `Asia/Shanghai` 每个工作日 `20:00`。周六、周日不自动发送；如果 Mac 在 `20:00` 关机或休眠，恢复后也不补发错过的日报。调度进程只接受计划时间后五分钟内的触发，避免休眠恢复导致误补跑。
 

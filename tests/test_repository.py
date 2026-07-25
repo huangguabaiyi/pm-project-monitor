@@ -447,9 +447,6 @@ def test_load_snapshot_discovers_exact_names_and_reads_all_pages(raw_tables):
         (table_ids["基础配置表"], None): {
             "data": {"items": raw_tables["基础配置表"], "has_more": False}
         },
-        (table_ids["通知记录表"], None): {
-            "data": {"records": [], "has_more": False}
-        },
     }
     client = FakeCLI(meta, pages, repository_fields(meta))
 
@@ -457,7 +454,7 @@ def test_load_snapshot_discovers_exact_names_and_reads_all_pages(raw_tables):
 
     assert issues == []
     assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
-    assert len(client.record_calls) == 7
+    assert len(client.record_calls) == 6
     assert len(client.field_calls) == 6
     assert all(call["page_size"] == 500 for call in client.record_calls)
     assert all(call["automatic_fields"] is True for call in client.record_calls)
@@ -470,6 +467,11 @@ def test_load_snapshot_discovers_exact_names_and_reads_all_pages(raw_tables):
         call["table_id"] == table_ids["需求主表备份"]
         for call in client.record_calls
     )
+    assert not any(
+        call["table_id"] == table_ids["通知记录表"]
+        for call in client.record_calls
+    )
+    assert ("app-token", table_ids["通知记录表"]) in client.field_calls
 
 
 def test_load_snapshot_raises_when_a_key_table_is_missing():
