@@ -31,7 +31,7 @@ python -m pip install -e '.[test]'
 feishu auth status
 ```
 
-工具不会代替飞书 CLI 保存或刷新认证信息。认证过期时，`run-once`、`scheduled-run` 或 `init-table` 返回退出码 `3`，本次计算停止；如果 Webhook 仍可用，运行日志会记录认证异常并尝试发送系统异常通知。修复方式是重新执行飞书 CLI 的认证流程，再重试命令；不要把 CLI token 写入项目文件或提交到 Git。
+工具不会代替飞书 CLI 保存或刷新认证信息。认证过期时，`run-once`、`scheduled-run` 或 `init-table` 返回退出码 `3`，本次操作停止。`run-once` 和 `scheduled-run` 进入运行器后可以通过已配置的 Webhook 记录或报告系统异常；`init-table` 不创建运行器，也不发送 Webhook 异常通知，只在终端返回错误并退出。修复方式是重新执行飞书 CLI 的认证流程，再重试命令；不要把 CLI token 写入项目文件或提交到 Git。
 
 ## 本地配置
 
@@ -64,7 +64,7 @@ export REQUIREMENT_MONITOR_LLM_BASE_URL='https://api.example.com/v1'
 export REQUIREMENT_MONITOR_LLM_MODEL='model-name'
 ```
 
-为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。新配置应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table` 是唯一不要求 Webhook 的命令；`run-once`、`start`、`status`、`scheduled-run` 和 `logs` 仍按默认配置要求可用 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
+为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。新配置应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table` 的 schema 初始化不要求 Webhook；`stop` 和 `version` 也不加载 Webhook 配置。`run-once`、`start`、`status`、`scheduled-run` 和 `logs` 仍按默认配置要求可用 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
 
 ## 固定业务规则
 
@@ -180,7 +180,7 @@ LLM 只用于补充风险理由，基础规则和基础通知不依赖 LLM。未
 - `0`：成功，或没有需要处理的业务数据。
 - `2`：配置错误，例如配置文件缺失、字段无效或 Webhook 未设置。
 - `3`：飞书认证、表格访问或表结构错误。
-- `4`：Webhook 完整失败，所有应发送卡片均发送失败。
+- `4`：Webhook 发送出现失败，包括部分卡片失败或全部卡片失败。
 - `5`：未预期的内部错误或本地调度错误。
 
 部分 Webhook 失败但已有卡片发送成功时，会保留已成功/失败的运行结果并返回退出码 `4`；请结合 `status` 和 `logs` 检查失败记录。Webhook 重试和纯文本降级遵循程序内规则；如果唯一 Webhook 本身不可用，依靠本地日志和 `logs` 排查，不能指望机器人通过同一个坏掉的 Webhook 报告自身故障。

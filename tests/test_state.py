@@ -17,6 +17,7 @@ from requirement_monitor.state import (
     StateCorruptionError,
     StatePersistenceError,
     StateStore,
+    normalize_send_error_code,
 )
 
 
@@ -221,6 +222,10 @@ def test_recent_send_error_is_normalized_before_state_is_written(tmp_path):
     assert webhook_token not in rendered
     assert api_key not in rendered
     assert json.loads(rendered)["recent_sends"][0]["error"] == "SEND_ERROR"
+
+
+def test_client_error_remains_diagnostic_after_normalization():
+    assert normalize_send_error_code("client_error") == "client_error"
 
 
 def test_recovery_journal_replays_scheduled_attempt_and_severe_confirmation(

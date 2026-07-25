@@ -15,6 +15,8 @@ from pydantic import (
     field_validator,
 )
 
+from .webhook_url import is_allowed_webhook_url
+
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -85,7 +87,10 @@ class Settings(BaseModel):
             return value
         if not raw_value:
             raise ValueError("webhook_url must not be empty")
-        _validate_http_url(raw_value, "webhook_url")
+        if not is_allowed_webhook_url(raw_value):
+            raise ValueError(
+                "webhook_url must use an official Feishu/Lark endpoint"
+            )
         return raw_value
 
     @field_validator("timezone")

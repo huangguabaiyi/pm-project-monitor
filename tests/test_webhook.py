@@ -517,6 +517,7 @@ def test_unexpected_client_error_is_fixed_without_exposing_secrets(
     webhook_url, card_payload
 ):
     api_key = "complete-api-key-that-must-not-leak"
+    sleeps = []
 
     class ExplodingClient:
         def post(self, *args, **kwargs):
@@ -530,13 +531,15 @@ def test_unexpected_client_error_is_fixed_without_exposing_secrets(
     sender = WebhookSender(
         webhook_url,
         client=ExplodingClient(),
-        sleep=lambda seconds: None,
+        sleep=sleeps.append,
     )
 
     result = sender.send(card_payload)
 
     assert result.success is False
-    assert result.error == "network_error"
+    assert result.attempts == 1
+    assert result.error == "client_error"
+    assert sleeps == []
     assert webhook_url not in repr(result)
     assert api_key not in repr(result)
 
@@ -597,7 +600,7 @@ def test_json_value_error_is_sanitized_failure(webhook_url, card_payload):
     assert result.error == "invalid_response"
 
 
-def test_memory_error_from_response_json_is_fixed(webhook_url, card_payload):
+def test_memory_error_from_response_json_is_reraised(webhook_url, card_payload):
     class MemoryResponse:
         status_code = 200
 
@@ -613,13 +616,15 @@ def test_memory_error_from_response_json_is_fixed(webhook_url, card_payload):
 
     sender = WebhookSender(webhook_url, client=StaticClient())
 
-    result = sender.send(card_payload)
-
-    assert result.success is False
-    assert result.error == "network_error"
+    with pytest.raises(MemoryError):
+        sender.send(card_payload)
 
 
-def test_unexpected_json_error_is_fixed(webhook_url, card_payload):
+def test_unexpected_json_error_is_client_error_without_retry(
+    webhook_url, card_payload
+):
+    sleeps = []
+
     class ExplodingResponse:
         status_code = 200
 
@@ -633,12 +638,18 @@ def test_unexpected_json_error_is_fixed(webhook_url, card_payload):
         def close(self):
             return None
 
-    sender = WebhookSender(webhook_url, client=StaticClient())
+    sender = WebhookSender(
+        webhook_url,
+        client=StaticClient(),
+        sleep=sleeps.append,
+    )
 
     result = sender.send(card_payload)
 
     assert result.success is False
-    assert result.error == "network_error"
+    assert result.attempts == 1
+    assert result.error == "client_error"
+    assert sleeps == []
 
 
 def test_fallback_truncates_by_final_serialized_json_bytes():

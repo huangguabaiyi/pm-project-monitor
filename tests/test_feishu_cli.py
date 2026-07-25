@@ -151,6 +151,38 @@ def test_run_json_redacts_monitor_env_secrets_and_bearer_tokens(monkeypatch):
     assert "Bearer [REDACTED]" in message
 
 
+@pytest.mark.parametrize("failure_source", ("stderr", "stdout", "exception"))
+def test_run_json_redacts_secret_named_environment_values(
+    monkeypatch, failure_source
+):
+    access_token = "feishu-access-token-from-environment"
+    database_password = "database-password-from-environment"
+    monkeypatch.setenv("FEISHU_ACCESS_TOKEN", access_token)
+    monkeypatch.setenv("DATABASE_PASSWORD", database_password)
+
+    def fake_run(command, **kwargs):
+        assert kwargs["env"]["FEISHU_ACCESS_TOKEN"] == access_token
+        detail = "{} {}".format(access_token, database_password)
+        if failure_source == "exception":
+            raise OSError(detail)
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            detail if failure_source == "stdout" else "",
+            detail if failure_source == "stderr" else "",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(FeishuCLIError) as exc_info:
+        FeishuCLI().run_json(["auth", "status"])
+
+    message = str(exc_info.value)
+    assert access_token not in message
+    assert database_password not in message
+    assert "[REDACTED]" in message
+
+
 def test_run_json_raises_clear_error_for_invalid_json(monkeypatch):
     monkeypatch.setattr(
         subprocess,

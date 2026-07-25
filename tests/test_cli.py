@@ -168,6 +168,33 @@ def test_operational_commands_still_require_webhook(
     assert exit_code == cli.EXIT_CONFIG
 
 
+def test_invalid_webhook_url_is_configuration_exit_two(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("REQUIREMENT_MONITOR_WEBHOOK_URL", raising=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "bitable_url": "https://mi.feishu.cn/wiki/base",
+                "webhook_url": (
+                    "https://example.com/open-apis/bot/v2/hook/token"
+                ),
+                "fixed_rules_path": "固定业务规则",
+                "state_dir": ".state",
+                "log_dir": "logs",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = cli.main(
+        ["run-once", "--dry-run", "--config", str(config_path)]
+    )
+
+    assert exit_code == cli.EXIT_CONFIG
+
+
 def test_run_once_dry_run_renders_payload_without_sending(capsys, tmp_path):
     calls = []
 

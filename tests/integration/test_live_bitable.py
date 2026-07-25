@@ -35,7 +35,7 @@ def _has_table(metadata: Mapping[str, Any], data: Mapping[str, Any]) -> bool:
 
 
 def test_live_bitable_metadata_is_readable():
-    settings = load_settings()
+    settings = load_settings(require_webhook=False)
     metadata = FeishuCLI().meta(settings.bitable_url)
     data = _metadata_data(metadata)
 

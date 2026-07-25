@@ -1,19 +1,16 @@
-import ipaddress
 import json
 import math
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
-from urllib.parse import urlparse
 
 import httpx
 
 from .models import SendResult
+from .webhook_url import is_allowed_webhook_url
 
 
 MAX_PAYLOAD_BYTES = 20 * 1024
 _RETRY_DELAYS = (10, 30, 120)
-_OFFICIAL_WEBHOOK_HOSTS = {"open.feishu.cn", "open.larksuite.com"}
-_OFFICIAL_WEBHOOK_PATH = "/open-apis/bot/v2/hook/"
 _CARD_FORMAT_CODES = {9499, 190001}
 _CARD_FORMAT_EXACT_MESSAGES = {"bad request"}
 _CARD_FORMAT_MESSAGES = (
@@ -65,6 +62,8 @@ class WebhookSender:
             return
         try:
             self._client.close()
+        except MemoryError:
+            raise
         except Exception:
             pass
         finally:
@@ -76,7 +75,9 @@ class WebhookSender:
             if self._closed:
                 raise RuntimeError("WebhookSender is closed")
             format_used = self._format_used(payload)
-            serialized_payload, validation_error = self._validated_payload(payload)
+            serialized_payload, validation_error = self._validated_payload(
+                payload
+            )
             if validation_error is not None:
                 return SendResult(
                     success=False,
@@ -94,7 +95,9 @@ class WebhookSender:
                 return result
 
             fallback_payload = self._plain_text_fallback(payload)
-            fallback_body, fallback_error = self._validated_payload(fallback_payload)
+            fallback_body, fallback_error = self._validated_payload(
+                fallback_payload
+            )
             if fallback_error is not None:
                 return SendResult(
                     success=False,
@@ -113,12 +116,14 @@ class WebhookSender:
             return fallback_result.model_copy(
                 update={"attempts": result.attempts + fallback_result.attempts}
             )
+        except MemoryError:
+            raise
         except Exception:
             return SendResult(
                 success=False,
                 attempts=0,
                 format_used=format_used,
-                error="webhook_error",
+                error="client_error",
             )
 
     def _deliver(
@@ -160,15 +165,14 @@ class WebhookSender:
                     format_used=format_used,
                     error=last_error,
                 )
+            except MemoryError:
+                raise
             except Exception:
-                last_error = "network_error"
-                if self._retry(attempts, max_attempts):
-                    continue
                 return SendResult(
                     success=False,
                     attempts=attempts,
                     format_used=format_used,
-                    error=last_error,
+                    error="client_error",
                 )
 
             try:
@@ -240,12 +244,14 @@ class WebhookSender:
                     feishu_code=feishu_code,
                     error=last_error,
                 )
+            except MemoryError:
+                raise
             except Exception:
                 return SendResult(
                     success=False,
                     attempts=attempts,
                     format_used=format_used,
-                    error="network_error",
+                    error="client_error",
                 )
 
         return SendResult(
@@ -408,39 +414,7 @@ class WebhookSender:
         webhook_url: object,
         allow_loopback_http: bool,
     ) -> bool:
-        if not isinstance(webhook_url, str):
-            return False
-        try:
-            parsed = urlparse(webhook_url)
-            hostname = parsed.hostname
-            port = parsed.port
-        except (TypeError, ValueError):
-            return False
-        if (
-            hostname is None
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            return False
-
-        if parsed.scheme == "https":
-            if (
-                hostname.lower() not in _OFFICIAL_WEBHOOK_HOSTS
-                or port not in (None, 443)
-                or parsed.query
-                or parsed.fragment
-                or parsed.params
-                or not parsed.path.startswith(_OFFICIAL_WEBHOOK_PATH)
-            ):
-                return False
-            token = parsed.path[len(_OFFICIAL_WEBHOOK_PATH) :]
-            return bool(token) and "/" not in token
-
-        if parsed.scheme != "http" or not allow_loopback_http:
-            return False
-        if hostname.lower() == "localhost":
-            return True
-        try:
-            return ipaddress.ip_address(hostname).is_loopback
-        except ValueError:
-            return False
+        return is_allowed_webhook_url(
+            webhook_url,
+            allow_loopback_http=allow_loopback_http,
+        )

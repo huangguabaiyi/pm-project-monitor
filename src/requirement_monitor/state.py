@@ -51,6 +51,7 @@ _SAFE_SEND_ERROR_CODES = {
     "request_error",
     "timeout",
     "network_error",
+    "client_error",
     "card_format_rejected",
     "invalid_response",
     "invalid_payload",

@@ -19,6 +19,7 @@ class FeishuCLI:
     def run_json(self, arguments: Sequence[str]) -> JsonObject:
         command = ["feishu", *arguments]
         environment = os.environ.copy()
+        secret_values = _secret_environment_values(environment)
         for variable_name in _SECRET_ENVIRONMENT_VARIABLES:
             environment.pop(variable_name, None)
         try:
@@ -44,7 +45,7 @@ class FeishuCLI:
                 "Feishu CLI output was not valid UTF-8"
             ) from None
         except OSError as error:
-            detail = _sanitize_error(str(error)).strip()
+            detail = _sanitize_error(str(error), secret_values).strip()
             message = "Feishu CLI could not be executed"
             if detail:
                 message = f"{message}: {detail}"
@@ -54,7 +55,7 @@ class FeishuCLI:
             detail = result.stderr.strip() or result.stdout.strip()
             if detail:
                 raise FeishuCLIError(
-                    f"Feishu CLI failed: {_sanitize_error(detail)}"
+                    f"Feishu CLI failed: {_sanitize_error(detail, secret_values)}"
                 )
             raise FeishuCLIError(
                 f"Feishu CLI failed with exit code {result.returncode}"
@@ -310,10 +311,29 @@ _BEARER_TOKEN_PATTERN = re.compile(
     r"(?i)(\bBearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
 )
 _OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+_SECRET_ENVIRONMENT_NAME_PATTERN = re.compile(
+    r"(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|"
+    r"PRIVATE[_-]?KEY|CREDENTIAL)",
+    re.IGNORECASE,
+)
 
 
-def _sanitize_error(message: str) -> str:
-    sanitized = _WEBHOOK_PATTERN.sub("[REDACTED]", message)
+def _secret_environment_values(environment: Mapping[str, str]) -> Sequence[str]:
+    values = {
+        value
+        for name, value in environment.items()
+        if value and _SECRET_ENVIRONMENT_NAME_PATTERN.search(name)
+    }
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _sanitize_error(
+    message: str, secret_values: Sequence[str] = ()
+) -> str:
+    sanitized = message
+    for secret_value in secret_values:
+        sanitized = sanitized.replace(secret_value, "[REDACTED]")
+    sanitized = _WEBHOOK_PATTERN.sub("[REDACTED]", sanitized)
     sanitized = _SECRET_ASSIGNMENT_PATTERN.sub(
         lambda match: f"{match.group(1)}[REDACTED]", sanitized
     )

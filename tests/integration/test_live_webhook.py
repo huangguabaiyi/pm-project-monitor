@@ -23,4 +23,7 @@ def test_live_webhook_connectivity():
     with WebhookSender(webhook_url) as sender:
         result = sender.send(payload)
 
+    assert result.success is True
     assert result.feishu_code == 0
+    assert result.status_code is not None
+    assert 200 <= result.status_code < 300
