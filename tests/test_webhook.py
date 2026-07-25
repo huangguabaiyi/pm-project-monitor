@@ -160,7 +160,7 @@ def test_explicit_bad_request_message_degrades_to_plain_text(
 ):
     httpx_mock.add_response(
         status_code=400,
-        json={"code": 190099, "msg": "Bad Request"},
+        json={"msg": "Bad Request"},
     )
     httpx_mock.add_response(json={"code": 0})
 
@@ -215,6 +215,26 @@ def test_message_api_230001_never_degrades_to_plain_text(
     assert len(httpx_mock.get_requests()) == 1
 
 
+@pytest.mark.parametrize("code", (230022, 230001))
+@pytest.mark.parametrize("message", ("Bad Request", "invalid card"))
+def test_non_format_business_code_takes_priority_over_format_message(
+    httpx_mock, webhook_url, card_payload, code, message
+):
+    httpx_mock.add_response(json={"code": code, "msg": message})
+
+    result = WebhookSender(webhook_url, sleep=lambda seconds: None).send(
+        card_payload
+    )
+
+    assert result.success is False
+    assert result.attempts == 1
+    assert result.status_code == 200
+    assert result.feishu_code == code
+    assert result.format_used == "card"
+    assert result.error == "feishu_error_{}".format(code)
+    assert len(httpx_mock.get_requests()) == 1
+
+
 def test_http_400_invalid_card_degrades_once_to_plain_text(
     httpx_mock, webhook_url, card_payload
 ):
@@ -249,7 +269,7 @@ def test_http_400_card_schema_message_degrades_to_plain_text(
 ):
     httpx_mock.add_response(
         status_code=400,
-        json={"code": 190099, "msg": "card schema validation failed"},
+        json={"msg": "card schema validation failed"},
     )
     httpx_mock.add_response(json={"code": 0})
 

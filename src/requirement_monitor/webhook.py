@@ -363,8 +363,8 @@ class WebhookSender:
     ) -> bool:
         if status_code not in {200, 400} or feishu_code == 0:
             return False
-        if feishu_code in _CARD_FORMAT_CODES:
-            return True
+        if feishu_code is not None:
+            return feishu_code in _CARD_FORMAT_CODES
         normalized_message = feishu_message.strip().casefold()
         if normalized_message in _CARD_FORMAT_EXACT_MESSAGES:
             return True
