@@ -61,6 +61,7 @@ def test_save_atomically_replaces_json_with_private_permissions(tmp_path):
         "last_successful_run": "2026-07-25T09:30:00+08:00",
         "last_scheduled_date": "2026-07-25",
         "active_fingerprints": ["severe:abc"],
+        "active_fingerprint_requirements": {},
         "scheduled_daily_results": {
             "2026-07-25|米家": {
                 "scheduled_date": "2026-07-25",
@@ -81,6 +82,7 @@ def test_save_atomically_replaces_json_with_private_permissions(tmp_path):
                 "error": None,
             }
         ],
+        "recovery_cursor": 0,
     }
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert not list(path.parent.glob(".monitor.json.*.tmp"))
@@ -194,3 +196,34 @@ def test_recent_send_error_is_normalized_before_state_is_written(tmp_path):
     assert webhook_token not in rendered
     assert api_key not in rendered
     assert json.loads(rendered)["recent_sends"][0]["error"] == "SEND_ERROR"
+
+
+def test_recovery_journal_replays_scheduled_attempt_and_severe_confirmation(
+    tmp_path,
+):
+    path = tmp_path / "monitor.json"
+    store = StateStore(path)
+    scheduled = ScheduledDailyResult(
+        scheduled_date=NOW.date(),
+        project="米家",
+        attempted_at=NOW,
+        result="success",
+    )
+
+    store.record_scheduled_attempt("2026-07-25|米家", scheduled)
+    store.record_severe_confirmation(
+        "severe:confirmed", "REQ-001", NOW
+    )
+
+    recovered = store.load()
+    assert recovered.scheduled_daily_results["2026-07-25|米家"] == scheduled
+    assert "severe:confirmed" in recovered.active_fingerprints
+    assert recovered.active_fingerprint_requirements == {
+        "severe:confirmed": "REQ-001"
+    }
+    assert recovered.recovery_cursor == 2
+
+    store.save(recovered)
+    assert store.load() == recovered
+    journal_path = path.with_name("monitor.json.recovery")
+    assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600

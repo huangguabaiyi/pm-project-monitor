@@ -84,13 +84,11 @@ class MonitorRunner:
         self.fixed_rules_loader = fixed_rules_loader
         self.risk_evaluator = risk_evaluator
         self.llm = llm
-        timezone = ZoneInfo(timezone_name)
-        self._now = now or (lambda: datetime.now(timezone))
+        self._timezone = ZoneInfo(timezone_name)
+        self._now = now or (lambda: datetime.now(self._timezone))
 
     def run(self, trigger: str, dry_run: bool = False) -> MonitorRunReport:
-        started_at = self._now()
-        if started_at.tzinfo is None or started_at.utcoffset() is None:
-            raise ValueError("runner clock must return a timezone-aware datetime")
+        started_at = self._current_time()
         report = MonitorRunReport(
             trigger=trigger,
             started_at=started_at,
@@ -134,6 +132,7 @@ class MonitorRunner:
         report.eligible_requirement_count = len(eligible)
         project_configs = self._project_configs(snapshot.project_configs)
         risks: List[RequirementRisk] = []
+        failed_requirement_ids = set()
         for requirement in eligible:
             project_config = project_configs.get(requirement.project)
             try:
@@ -148,6 +147,7 @@ class MonitorRunner:
             except MemoryError:
                 raise
             except Exception as error:
+                failed_requirement_ids.add(requirement.requirement_id)
                 issue = self._evaluation_issue(requirement, error)
                 report.validation_issues.append(issue)
                 report.invalid_records += 1
@@ -192,14 +192,41 @@ class MonitorRunner:
         if dry_run:
             for payload in report.payloads:
                 self._mark_llm_skipped(payload)
-            report.finished_at = self._now()
+            report.finished_at = self._current_time()
             return report
 
         send_records: List[Mapping[str, Any]] = []
         recent_sends: List[RecentSend] = []
         successful_severe = set()
         scheduled_daily_results = dict(state.scheduled_daily_results)
+        recovery_cursor = state.recovery_cursor
+        recovery_write_failed = False
         for item in pending:
+            scheduled_key = None
+            if (
+                trigger == "scheduled"
+                and item.notification_type == "项目日报"
+                and item.project is not None
+            ):
+                scheduled_key = scheduled_daily_key(started_at, item.project)
+                attempted = ScheduledDailyResult(
+                    scheduled_date=started_at.date(),
+                    project=item.project,
+                    attempted_at=started_at,
+                    result="attempted",
+                )
+                try:
+                    sequence = self.state_store.record_scheduled_attempt(
+                        scheduled_key, attempted
+                    )
+                except MemoryError:
+                    raise
+                except Exception:
+                    return self._finish_runtime_failure(
+                        report, "STATE_RECOVERY_WRITE_ERROR", dry_run
+                    )
+                recovery_cursor = max(recovery_cursor, sequence)
+                scheduled_daily_results[scheduled_key] = attempted
             result = self._safe_send(item.payload)
             report.send_results.append(result)
             if result.success:
@@ -207,22 +234,43 @@ class MonitorRunner:
                 if item.notification_type == "严重风险" and item.fingerprint:
                     report.severe_cards += 1
                     successful_severe.add(item.fingerprint)
+                    try:
+                        sequence = self.state_store.record_severe_confirmation(
+                            item.fingerprint,
+                            item.requirement_id or "unknown_requirement",
+                            started_at,
+                        )
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        recovery_write_failed = True
+                        if "STATE_RECOVERY_WRITE_ERROR" not in report.errors:
+                            report.errors.append("STATE_RECOVERY_WRITE_ERROR")
+                    else:
+                        recovery_cursor = max(recovery_cursor, sequence)
             else:
                 report.failed_sends += 1
-            if (
-                trigger == "scheduled"
-                and item.notification_type == "项目日报"
-                and item.project is not None
-            ):
-                scheduled_daily_results[
-                    scheduled_daily_key(started_at, item.project)
-                ] = ScheduledDailyResult(
+            if scheduled_key is not None and item.project is not None:
+                completed_attempt = ScheduledDailyResult(
                     scheduled_date=started_at.date(),
                     project=item.project,
                     attempted_at=started_at,
                     result="success" if result.success else "failed",
                     error_code=result.error,
                 )
+                scheduled_daily_results[scheduled_key] = completed_attempt
+                try:
+                    sequence = self.state_store.record_scheduled_attempt(
+                        scheduled_key, completed_attempt
+                    )
+                except MemoryError:
+                    raise
+                except Exception:
+                    recovery_write_failed = True
+                    if "STATE_RECOVERY_WRITE_ERROR" not in report.errors:
+                        report.errors.append("STATE_RECOVERY_WRITE_ERROR")
+                else:
+                    recovery_cursor = max(recovery_cursor, sequence)
             send_records.append(self._notification_record(item, result, started_at))
             recent_sends.append(self._recent_send(item, result, started_at))
 
@@ -236,13 +284,22 @@ class MonitorRunner:
                 notification_write_failed = True
                 report.errors.append("NOTIFICATION_WRITE_ERROR")
 
-        active_fingerprints = {
-            fingerprint
-            for fingerprint in severe_by_fingerprint
-            if fingerprint in state.active_fingerprints
-            or fingerprint in successful_severe
-        }
-        finished_at = self._now()
+        active_fingerprints = set()
+        active_requirements: Dict[str, str] = {}
+        for fingerprint, risk in severe_by_fingerprint.items():
+            if (
+                fingerprint in state.active_fingerprints
+                or fingerprint in successful_severe
+            ):
+                active_fingerprints.add(fingerprint)
+                active_requirements[fingerprint] = risk.requirement_id
+        for fingerprint, requirement_id in (
+            state.active_fingerprint_requirements.items()
+        ):
+            if requirement_id in failed_requirement_ids:
+                active_fingerprints.add(fingerprint)
+                active_requirements[fingerprint] = requirement_id
+        finished_at = self._current_time()
         report.finished_at = finished_at
         successful_run = report.failed_sends == 0 and not report.errors
         next_state = state.model_copy(
@@ -256,8 +313,10 @@ class MonitorRunner:
                     else state.last_scheduled_date
                 ),
                 "active_fingerprints": active_fingerprints,
+                "active_fingerprint_requirements": active_requirements,
                 "scheduled_daily_results": scheduled_daily_results,
                 "recent_sends": (state.recent_sends + recent_sends)[-50:],
+                "recovery_cursor": recovery_cursor,
             }
         )
         try:
@@ -271,6 +330,10 @@ class MonitorRunner:
         if notification_write_failed:
             return self._finish_runtime_failure(
                 report, "NOTIFICATION_WRITE_ERROR", dry_run
+            )
+        if recovery_write_failed:
+            return self._finish_runtime_failure(
+                report, "STATE_RECOVERY_WRITE_ERROR", dry_run
             )
         return report
 
@@ -320,8 +383,14 @@ class MonitorRunner:
                 report.sent_cards += 1
             else:
                 report.failed_sends += 1
-        report.finished_at = self._now()
+        report.finished_at = self._current_time()
         return report
+
+    def _current_time(self) -> datetime:
+        value = self._now()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("runner clock must return a timezone-aware datetime")
+        return value.astimezone(self._timezone)
 
     def _safe_send(self, payload: Mapping[str, Any]) -> SendResult:
         try:

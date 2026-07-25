@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -232,12 +232,19 @@ class FakeStateStore:
         self.saved = []
         self.load_error = None
         self.save_error = None
+        self.recovery_scheduled = {}
+        self.recovery_severe = {}
+        self.recovery_sequence = 0
 
     def load(self):
         self.events.append("state_load")
         if self.load_error is not None:
             raise self.load_error
-        return self.state.model_copy(deep=True)
+        state = self.state.model_copy(deep=True)
+        state.scheduled_daily_results.update(self.recovery_scheduled)
+        state.active_fingerprints.update(self.recovery_severe)
+        state.active_fingerprint_requirements.update(self.recovery_severe)
+        return state
 
     def save(self, state):
         self.events.append("state_save")
@@ -245,6 +252,20 @@ class FakeStateStore:
             raise self.save_error
         self.state = state.model_copy(deep=True)
         self.saved.append(self.state)
+        self.recovery_scheduled.clear()
+        self.recovery_severe.clear()
+
+    def record_scheduled_attempt(self, key, result):
+        self.events.append("state_schedule_attempt")
+        self.recovery_scheduled[key] = result
+        self.recovery_sequence += 1
+        return self.recovery_sequence
+
+    def record_severe_confirmation(self, fingerprint, requirement_id, confirmed_at):
+        self.events.append("state_severe_confirmation")
+        self.recovery_severe[fingerprint] = requirement_id
+        self.recovery_sequence += 1
+        return self.recovery_sequence
 
 
 class FakeDependencies:
@@ -731,3 +752,76 @@ def test_state_save_failure_is_normalized_and_does_not_escape_secret():
     assert "sk-secret" not in str(report)
     assert len(dependencies.webhook.payloads) == 2
     assert "STATE_WRITE_ERROR" in str(dependencies.webhook.payloads[-1])
+
+
+@pytest.mark.parametrize("level", [RiskLevel.WARNING, RiskLevel.SEVERE])
+def test_main_state_save_failure_recovery_prevents_scheduled_resend(level):
+    dependencies = FakeDependencies(level=level)
+    dependencies.state_store.save_error = StatePersistenceError(
+        "STATE_WRITE_FAILED"
+    )
+
+    first = dependencies.runner().run(trigger="scheduled")
+    payload_count = len(dependencies.webhook.payloads)
+    recovered_scheduled = set(dependencies.state_store.recovery_scheduled)
+    recovered_severe = dict(dependencies.state_store.recovery_severe)
+    dependencies.state_store.save_error = None
+    second = dependencies.runner().run(trigger="scheduled")
+
+    assert first.errors == ["STATE_WRITE_ERROR"]
+    assert second.sent_cards == 0
+    assert second.severe_cards == 0
+    assert len(dependencies.webhook.payloads) == payload_count
+    assert "2026-07-25|米家" in recovered_scheduled
+    if level == RiskLevel.SEVERE:
+        assert recovered_severe
+
+
+def test_temporary_requirement_evaluation_failure_preserves_active_fingerprint():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    call_count = [0]
+
+    def intermittent_evaluator(
+        requirement, nodes, blockers, fixed_rules, now, project_config
+    ):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise RuntimeError("temporary calculation failure")
+        return make_risk(requirement, RiskLevel.SEVERE)
+
+    runner = dependencies.runner()
+    runner.risk_evaluator = intermittent_evaluator
+
+    first = runner.run(trigger="manual")
+    active_after_first = set(dependencies.state_store.state.active_fingerprints)
+    second = runner.run(trigger="manual")
+    third = runner.run(trigger="manual")
+
+    assert first.severe_cards == 1
+    assert active_after_first
+    assert second.invalid_records == 1
+    assert dependencies.state_store.saved[-2].active_fingerprints == active_after_first
+    assert third.severe_cards == 0
+
+
+def test_runner_normalizes_utc_clock_to_configured_timezone_before_date_keys():
+    dependencies = FakeDependencies()
+    utc_cross_day = datetime(2026, 7, 24, 16, 30, tzinfo=timezone.utc)
+    runner = MonitorRunner(
+        feishu=dependencies.feishu,
+        repository=dependencies.repository,
+        fixed_rules_loader=dependencies.load_rules,
+        risk_evaluator=dependencies.evaluate,
+        llm=dependencies.llm,
+        webhook=dependencies.webhook,
+        state_store=dependencies.state_store,
+        now=lambda: utc_cross_day,
+        timezone_name="Asia/Shanghai",
+    )
+
+    report = runner.run(trigger="scheduled")
+
+    assert report.started_at.isoformat() == "2026-07-25T00:30:00+08:00"
+    assert "2026-07-25|米家" in (
+        dependencies.state_store.state.scheduled_daily_results
+    )
