@@ -1,5 +1,6 @@
 import argparse
 import fcntl
+import inspect
 import json
 import os
 import sys
@@ -142,7 +143,15 @@ def _secret_value(value: Any) -> str:
     return getter() if callable(getter) else str(value)
 
 
-def _build_runner(settings: Any, config_path: Path):
+class _NullWebhookSender:
+    def send(self, payload):
+        raise RuntimeError("dry-run webhook sender must not send")
+
+    def close(self) -> None:
+        return None
+
+
+def _build_runner(settings: Any, config_path: Path, *, dry_run: bool = False):
     from requirement_monitor.feishu_cli import FeishuCLI
     from requirement_monitor.llm import LLMClient
     from requirement_monitor.repository import BitableRepository
@@ -155,9 +164,13 @@ def _build_runner(settings: Any, config_path: Path):
     return MonitorRunner(
         feishu=feishu,
         repository=BitableRepository(settings.bitable_url, client=feishu),
-        webhook=WebhookSender(
-            _secret_value(settings.webhook_url),
-            bot_keyword=getattr(settings, "bot_keyword", None),
+        webhook=(
+            _NullWebhookSender()
+            if dry_run
+            else WebhookSender(
+                _secret_value(settings.webhook_url),
+                bot_keyword=getattr(settings, "bot_keyword", None),
+            )
         ),
         state_store=StateStore(state_dir / "monitor.json"),
         fixed_rules_path=fixed_rules_path,
@@ -170,8 +183,18 @@ def _runner_from(
     settings: Any,
     config_path: Path,
     runner_factory_fn: Optional[Callable[..., Any]],
+    *,
+    dry_run: bool,
 ):
     factory = runner_factory_fn or _build_runner
+    parameters = inspect.signature(factory).parameters.values()
+    accepts_dry_run = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or parameter.name == "dry_run"
+        for parameter in parameters
+    )
+    if accepts_dry_run:
+        return factory(settings, config_path, dry_run=dry_run)
     return factory(settings, config_path)
 
 
@@ -202,8 +225,12 @@ def _report_exit_code(report: Any) -> int:
     errors = set(getattr(report, "errors", []))
     if errors & {
         "AUTH_ERROR",
+        "SCHEMA_ERROR",
         "SNAPSHOT_ERROR",
         "SYSTEM_WRITE_ERROR",
+        "DEMAND_WRITE_ERROR",
+        "NODE_WRITE_ERROR",
+        "NOTIFICATION_WRITE_ERROR",
     }:
         return EXIT_FEISHU
     failed_sends = int(getattr(report, "failed_sends", 0))
@@ -221,7 +248,9 @@ def _run_monitor(
     dry_run: bool,
     runner_factory_fn: Optional[Callable[..., Any]],
 ) -> int:
-    runner = _runner_from(settings, config_path, runner_factory_fn)
+    runner = _runner_from(
+        settings, config_path, runner_factory_fn, dry_run=dry_run
+    )
     try:
         report = runner.run(trigger=trigger, dry_run=dry_run)
         if dry_run:
@@ -872,7 +901,10 @@ def main(
         settings = _load_settings(
             config_path,
             load_settings_fn,
-            require_webhook=args.command != "init-table",
+            require_webhook=(
+                args.command not in {"init-table", "status", "logs"}
+                and not (args.command == "run-once" and args.dry_run)
+            ),
         )
 
         if args.command == "init-table":
@@ -984,6 +1016,7 @@ def main(
             return EXIT_CONFIG
         if error_type in {
             "FeishuCLIError",
+            "RepositoryDataError",
             "RepositorySchemaError",
             "SchemaError",
         }:
@@ -995,3 +1028,7 @@ def main(
 
 def console_main() -> None:
     raise SystemExit(main())
+
+
+if __name__ == "__main__":
+    console_main()

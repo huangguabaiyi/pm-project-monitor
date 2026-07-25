@@ -143,9 +143,8 @@ class LLMClient:
         project_description: str,
     ) -> Dict[str, Any]:
         user_input = {
-            "risk": risk.model_dump(mode="json"),
+            "risk": self._anonymous_risk(risk),
             "fixed_rules": fixed_rules,
-            "project_description": project_description,
         }
         return {
             "model": model,
@@ -156,6 +155,63 @@ class LLMClient:
                     "role": "user",
                     "content": json.dumps(user_input, ensure_ascii=False),
                 },
+            ],
+        }
+
+    @staticmethod
+    def _anonymous_risk(risk: RequirementRisk) -> Dict[str, Any]:
+        return {
+            "requirement_name": risk.requirement_name,
+            "project": risk.project,
+            "target_version": risk.target_version,
+            "merge_at": risk.merge_at.isoformat(),
+            "launch_at": risk.launch_at.isoformat() if risk.launch_at else None,
+            "level": int(risk.level),
+            "predicted_completion": (
+                risk.predicted_completion.isoformat()
+                if risk.predicted_completion
+                else None
+            ),
+            "buffer_days": risk.buffer_days,
+            "affected_domains": list(risk.affected_domains),
+            "reasons": list(risk.reasons),
+            "actions": list(risk.actions),
+            "nodes": [
+                {
+                    "node_name": node.node_name,
+                    "domain": node.domain,
+                    "planned_end": node.planned_end.isoformat(),
+                    "status": node.status.value,
+                    "level": int(node.level),
+                    "predicted_completion": (
+                        node.predicted_completion.isoformat()
+                        if node.predicted_completion
+                        else None
+                    ),
+                    "safe_deadline": (
+                        node.safe_deadline.isoformat()
+                        if node.safe_deadline
+                        else None
+                    ),
+                    "buffer_days": node.buffer_days,
+                    "reasons": list(node.reasons),
+                }
+                for node in risk.node_risks
+            ],
+            "blockers": [
+                {
+                    "title": blocker.title,
+                    "found_at": blocker.found_at.isoformat(),
+                    "planned_resolution_at": blocker.planned_resolution_at.isoformat(),
+                    "actual_resolution_at": (
+                        blocker.actual_resolution_at.isoformat()
+                        if blocker.actual_resolution_at
+                        else None
+                    ),
+                    "status": blocker.status,
+                    "affects_merge": blocker.affects_merge,
+                }
+                for blocker in risk.blockers
             ],
         }
 

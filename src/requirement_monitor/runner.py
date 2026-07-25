@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ class _PendingNotification:
     project: Optional[str] = None
     requirement_record_id: Optional[str] = None
     requirement_id: Optional[str] = None
+    requirement_record_ids: Tuple[str, ...] = ()
     recipient_ids: Tuple[str, ...] = ()
     llm_used: bool = False
     llm_degradation_reason: str = ""
@@ -173,13 +175,22 @@ class MonitorRunner:
         for requirement in eligible:
             project_config = project_configs.get(requirement.project)
             try:
-                risk = self.risk_evaluator(
+                evaluator_arguments = (
                     requirement,
                     snapshot.nodes,
                     snapshot.blockers,
                     fixed_rules,
                     started_at,
                     project_config,
+                )
+                parameters = inspect.signature(self.risk_evaluator).parameters.values()
+                accepts_base_configs = any(
+                    parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                    for parameter in parameters
+                ) or len(tuple(parameters)) >= 7
+                risk = self.risk_evaluator(
+                    *evaluator_arguments,
+                    *([snapshot.base_configs] if accepts_base_configs else []),
                 )
             except MemoryError:
                 raise
@@ -208,6 +219,13 @@ class MonitorRunner:
         if not dry_run:
             try:
                 self.repository.write_requirement_risks(risks)
+            except MemoryError:
+                raise
+            except Exception:
+                return self._finish_runtime_failure(
+                    report, "DEMAND_WRITE_ERROR", dry_run
+                )
+            try:
                 self.repository.write_node_risks(
                     [
                         node_risk
@@ -219,7 +237,7 @@ class MonitorRunner:
                 raise
             except Exception:
                 return self._finish_runtime_failure(
-                    report, "SYSTEM_WRITE_ERROR", dry_run
+                    report, "NODE_WRITE_ERROR", dry_run
                 )
 
         pending, severe_by_fingerprint = self._build_notifications(
@@ -238,6 +256,7 @@ class MonitorRunner:
         scheduled_daily_results = dict(state.scheduled_daily_results)
         recovery_cursor = state.recovery_cursor
         recovery_write_failed = False
+        successfully_notified_requirement_ids = set()
         for item in pending:
             scheduled_key = None
             if (
@@ -268,6 +287,9 @@ class MonitorRunner:
             report.send_results.append(result)
             if result.success:
                 report.sent_cards += 1
+                successfully_notified_requirement_ids.update(
+                    item.requirement_record_ids
+                )
                 if item.notification_type == "严重风险" and item.fingerprint:
                     report.severe_cards += 1
                     successful_severe.add(item.fingerprint)
@@ -310,6 +332,18 @@ class MonitorRunner:
                     recovery_cursor = max(recovery_cursor, sequence)
             send_records.append(self._notification_record(item, result, started_at))
             recent_sends.append(self._recent_send(item, result, started_at))
+
+        if successfully_notified_requirement_ids:
+            try:
+                self.repository.write_requirement_notification_times(
+                    sorted(successfully_notified_requirement_ids), started_at
+                )
+            except MemoryError:
+                raise
+            except Exception:
+                return self._finish_runtime_failure(
+                    report, "DEMAND_WRITE_ERROR", dry_run
+                )
 
         notification_write_failed = False
         if send_records:
@@ -578,6 +612,9 @@ class MonitorRunner:
                             default=RiskLevel.NORMAL,
                         ),
                         project=project,
+                        requirement_record_ids=tuple(
+                            risk.requirement_record_id for risk in risks
+                        ),
                         recipient_ids=tuple(
                             self._deduplicate(
                                 [
@@ -620,11 +657,9 @@ class MonitorRunner:
                     project=risk.project,
                     requirement_record_id=risk.requirement_record_id,
                     requirement_id=risk.requirement_id,
+                    requirement_record_ids=(risk.requirement_record_id,),
                     recipient_ids=tuple(
-                        self._deduplicate(
-                            [risk.project_owner_id]
-                            + [node.owner_id for node in risk.node_risks]
-                        )
+                        [risk.project_owner_id]
                     ),
                     llm_used=(
                         risk.llm_enrichment is not None

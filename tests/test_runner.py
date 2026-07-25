@@ -159,6 +159,7 @@ class FakeRepository:
         self.requirement_writes = []
         self.node_writes = []
         self.notification_batches = []
+        self.notification_time_writes = []
         self.load_error = None
         self.requirement_write_error = None
         self.node_write_error = None
@@ -187,6 +188,10 @@ class FakeRepository:
         if self.notification_error is not None:
             raise self.notification_error
         self.notification_batches.append(list(records))
+
+    def write_requirement_notification_times(self, record_ids, notified_at):
+        self.events.append("write_notification_times")
+        self.notification_time_writes.append((list(record_ids), notified_at))
 
 
 class FakeLLM:
@@ -308,7 +313,16 @@ class FakeDependencies:
             raise self.rules_error
         return make_rules(), "服务端周二周四上线，17:30 截止"
 
-    def evaluate(self, requirement, nodes, blockers, fixed_rules, now, project_config):
+    def evaluate(
+        self,
+        requirement,
+        nodes,
+        blockers,
+        fixed_rules,
+        now,
+        project_config,
+        base_configs,
+    ):
         self.events.append("evaluate:{}".format(requirement.requirement_id))
         self.evaluator_calls.append(project_config)
         return make_risk(requirement, self.level)
@@ -359,6 +373,7 @@ def test_run_orders_dependencies_and_writes_before_sending():
         "write_requirements",
         "write_nodes",
         "send",
+        "write_notification_times",
         "notification_records",
         "state_save",
     ]
@@ -595,6 +610,42 @@ def test_state_only_tracks_successful_severe_sends_after_notification_write():
     assert dependencies.state_store.state.last_successful_run is None
 
 
+def test_successful_requirement_notifications_update_recent_notification_time():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.sent_cards == 2
+    assert dependencies.repository.notification_time_writes == [
+        (["rec-req-001"], NOW)
+    ]
+
+
+def test_failed_requirement_notifications_do_not_update_recent_notification_time():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    dependencies.webhook.results = [
+        SendResult(success=False, attempts=1, format_used="card", error="failed"),
+        SendResult(success=False, attempts=1, format_used="card", error="failed"),
+    ]
+
+    dependencies.runner().run(trigger="manual")
+
+    assert dependencies.repository.notification_time_writes == []
+
+
+def test_severe_notification_record_only_targets_project_owner():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+
+    dependencies.runner().run(trigger="manual")
+
+    severe = next(
+        record
+        for record in dependencies.repository.notification_batches[0]
+        if record["notification_type"] == "严重风险"
+    )
+    assert severe["recipient_ids"] == ["ou-project"]
+
+
 def test_authentication_failure_stops_table_work_and_returns_exception_payload():
     dependencies = FakeDependencies()
     dependencies.feishu.error = RuntimeError("not logged in")
@@ -721,8 +772,8 @@ def test_notification_record_failure_persists_scheduled_attempt_and_prevents_ret
         ("rules", "FIXED_RULES_ERROR"),
         ("snapshot", "SNAPSHOT_ERROR"),
         ("state", "STATE_ERROR"),
-        ("requirement_write", "SYSTEM_WRITE_ERROR"),
-        ("node_write", "SYSTEM_WRITE_ERROR"),
+        ("requirement_write", "DEMAND_WRITE_ERROR"),
+        ("node_write", "NODE_WRITE_ERROR"),
     ],
 )
 def test_run_level_failure_stops_daily_and_sends_one_sanitized_system_error(

@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from requirement_monitor.models import (
+    BaseConfig,
     Blocker,
     DeliveryNode,
     FixedRules,
@@ -109,6 +110,16 @@ def make_blocker(**overrides):
     return Blocker(**values)
 
 
+def base_config(config_type, name, order, enabled=True):
+    return BaseConfig(
+        record_id="base-{}-{}".format(config_type, order),
+        name=name,
+        config_type=config_type,
+        sort_order=order,
+        enabled=enabled,
+    )
+
+
 def node_result(result, name, domain="客户端"):
     return next(
         item
@@ -170,6 +181,68 @@ def test_project_structured_fields_override_fixed_rules_without_reading_notes(ru
     assert effective.launch_weekdays == {0, 2, 4}
     assert effective.launch_cutoff == "18:30"
     assert effective.checklist_days_before == 1
+
+
+def test_enabled_stage_configuration_controls_custom_process_order(rules):
+    configs = [
+        base_config("环节", "各端开发", 10),
+        base_config("环节", "定制安全评审", 20),
+        base_config("环节", "联调", 30),
+    ]
+
+    effective = resolve_effective_rules(rules, None, configs)
+
+    assert effective.process_order == {
+        "各端开发": 0,
+        "定制安全评审": 1,
+        "联调": 2,
+    }
+
+
+def test_disabled_stage_node_does_not_participate_in_risk(rules):
+    disabled = make_node(
+        "停用环节",
+        planned_start=at(19),
+        planned_end=at(20),
+        status=NodeStatus.IN_PROGRESS,
+    )
+    active = make_node("各端开发")
+    configs = [
+        base_config("环节", "各端开发", 10),
+        base_config("环节", "停用环节", 20, enabled=False),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(), [disabled, active], [], rules, NOW, None, configs
+    )
+
+    assert [node.node_name for node in result.node_risks] == ["各端开发"]
+
+
+def test_custom_stages_follow_base_table_sort_without_zero_cycle_failure(rules):
+    configs = [
+        base_config("环节", "定制评审A", 10),
+        base_config("环节", "定制评审B", 20),
+    ]
+    later = make_node(
+        "定制评审B",
+        work_type="公共环节",
+        planned_end=at(29),
+    )
+    earlier = make_node(
+        "定制评审A",
+        work_type="公共环节",
+        planned_end=at(28),
+    )
+
+    result = evaluate_requirement(
+        make_requirement(), [later, earlier], [], rules, NOW, None, configs
+    )
+
+    assert [node.node_name for node in result.node_risks] == [
+        "定制评审A",
+        "定制评审B",
+    ]
 
 
 def test_fixed_at_duration_uses_workday_or_natural_mode(rules):

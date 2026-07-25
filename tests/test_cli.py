@@ -83,6 +83,18 @@ def test_version_command(capsys):
     assert capsys.readouterr().out.strip() == "requirement-monitor 0.1.0"
 
 
+def test_python_module_entrypoint_prints_version():
+    result = subprocess.run(
+        [sys.executable, "-m", "requirement_monitor.cli", "version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "requirement-monitor 0.1.0"
+
+
 def test_build_parser_exposes_public_commands():
     parser = cli.build_parser()
 
@@ -205,9 +217,8 @@ def test_init_table_accepts_secret_free_config_example(
     "command_args",
     (
         ["start"],
-        ["status"],
         ["scheduled-run"],
-        ["run-once", "--dry-run"],
+        ["run-once"],
     ),
 )
 def test_operational_commands_still_require_webhook(
@@ -232,6 +243,72 @@ def test_operational_commands_still_require_webhook(
     )
 
     assert exit_code == cli.EXIT_CONFIG
+
+
+@pytest.mark.parametrize("command_args", (["status"], ["logs"]))
+def test_read_only_commands_do_not_require_webhook(
+    tmp_path, monkeypatch, command_args
+):
+    monkeypatch.delenv("REQUIREMENT_MONITOR_WEBHOOK_URL", raising=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "bitable_url": "https://mi.feishu.cn/wiki/base",
+                "fixed_rules_path": "固定业务规则",
+                "state_dir": ".state",
+                "log_dir": "logs",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = cli.main(
+        [*command_args, "--config", str(config_path)],
+        status_fn=lambda: False,
+    )
+
+    assert exit_code == cli.EXIT_OK
+
+
+def test_dry_run_does_not_require_or_construct_real_webhook(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("REQUIREMENT_MONITOR_WEBHOOK_URL", raising=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "bitable_url": "https://mi.feishu.cn/wiki/base",
+                "fixed_rules_path": "固定业务规则",
+                "state_dir": ".state",
+                "log_dir": "logs",
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeRunner:
+        webhook = None
+
+        def run(self, *, trigger, dry_run=False):
+            return SimpleNamespace(
+                payloads=[], errors=[], failed_sends=0, sent_cards=0
+            )
+
+    def factory(settings, path, *, dry_run=False):
+        captured["webhook"] = settings.webhook_url
+        captured["dry_run"] = dry_run
+        return FakeRunner()
+
+    exit_code = cli.main(
+        ["run-once", "--dry-run", "--config", str(config_path)],
+        runner_factory_fn=factory,
+    )
+
+    assert exit_code == cli.EXIT_OK
+    assert captured == {"webhook": None, "dry_run": True}
 
 
 def test_invalid_webhook_url_is_configuration_exit_two(
@@ -374,6 +451,11 @@ def test_scheduled_run_rejects_naive_clock_without_running(tmp_path, capsys):
     ("report", "expected"),
     [
         (SimpleNamespace(errors=["AUTH_ERROR"], failed_sends=0, sent_cards=0), 3),
+        (SimpleNamespace(errors=["SCHEMA_ERROR"], failed_sends=0, sent_cards=0), 3),
+        (SimpleNamespace(errors=["SNAPSHOT_ERROR"], failed_sends=0, sent_cards=0), 3),
+        (SimpleNamespace(errors=["DEMAND_WRITE_ERROR"], failed_sends=0, sent_cards=0), 3),
+        (SimpleNamespace(errors=["NODE_WRITE_ERROR"], failed_sends=0, sent_cards=0), 3),
+        (SimpleNamespace(errors=["NOTIFICATION_WRITE_ERROR"], failed_sends=0, sent_cards=0), 3),
         (SimpleNamespace(errors=[], failed_sends=1, sent_cards=0), 4),
         (SimpleNamespace(errors=["STATE_ERROR"], failed_sends=0, sent_cards=0), 5),
         (SimpleNamespace(errors=[], failed_sends=0, sent_cards=1), 0),

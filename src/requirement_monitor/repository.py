@@ -2,14 +2,15 @@ import json
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from requirement_monitor.feishu_cli import FeishuCLI
 from requirement_monitor.models import (
+    BaseConfig,
     Blocker,
     DataSnapshot,
     DeliveryNode,
@@ -21,10 +22,11 @@ from requirement_monitor.models import (
     SkipScope,
     ValidationIssue,
 )
+from requirement_monitor.schema import BASIC_CONFIG_SEEDS, SCHEMA, SINGLE_LINK
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-KEY_TABLE_NAMES = ("需求主表", "进展节点表", "阻塞项表", "项目配置表")
+KEY_TABLE_NAMES = tuple(table.name for table in SCHEMA)
 BATCH_SIZE = 500
 MIN_MILLISECONDS_TIMESTAMP = 1_000_000_000_000
 MAX_MILLISECONDS_TIMESTAMP = 99_999_999_999_999
@@ -32,6 +34,10 @@ MAX_MILLISECONDS_TIMESTAMP = 99_999_999_999_999
 
 class RepositorySchemaError(RuntimeError):
     """Raised when required Bitable tables or response metadata are missing."""
+
+
+class RepositoryDataError(RuntimeError):
+    """Raised when required configuration data is empty or incomplete."""
 
 
 class _FieldParseError(ValueError):
@@ -87,7 +93,7 @@ def parse_snapshot(
         try:
             if requirement is None:
                 raise _FieldParseError("关联需求", "must reference a valid requirement")
-            nodes.append(_parse_node(raw_record, requirement.requirement_id))
+            nodes.append(_parse_node(raw_record, requirement))
         except (ValidationError, _FieldParseError, TypeError, ValueError) as error:
             issues.append(
                 _validation_issue(
@@ -142,12 +148,47 @@ def parse_snapshot(
                 )
             )
 
+    base_configs: List[BaseConfig] = []
+    for raw_record in raw_tables.get("基础配置表", []):
+        try:
+            base_configs.append(_parse_base_config(raw_record))
+        except (ValidationError, _FieldParseError, TypeError, ValueError) as error:
+            issues.append(
+                _validation_issue(
+                    "基础配置表",
+                    raw_record,
+                    error,
+                    field_names=_BASE_CONFIG_FIELD_NAMES,
+                    skip_scope="run",
+                )
+            )
+
+    enabled_domains = _enabled_config_names(base_configs, "交付域")
+    enabled_work_types = _enabled_config_names(base_configs, "工作类型")
+    configured_stages = {
+        config.name: config.enabled
+        for config in base_configs
+        if config.config_type == "环节"
+    }
+    validated_nodes = []
+    for node in nodes:
+        if node.domain not in enabled_domains:
+            issues.append(_node_config_issue(node, "交付域", node.domain))
+            continue
+        if node.work_type not in enabled_work_types:
+            issues.append(_node_config_issue(node, "工作类型", node.work_type))
+            continue
+        if configured_stages.get(node.name) is False:
+            continue
+        validated_nodes.append(node)
+
     return (
         DataSnapshot(
             requirements=requirements,
-            nodes=nodes,
+            nodes=validated_nodes,
             blockers=blockers,
             project_configs=project_configs,
+            base_configs=base_configs,
         ),
         issues,
     )
@@ -169,11 +210,30 @@ class BitableRepository:
 
     def load_snapshot(self) -> Tuple[DataSnapshot, List[ValidationIssue]]:
         table_ids = self._require_tables(KEY_TABLE_NAMES)
+        self._validate_runtime_schema(table_ids)
         raw_tables = {
             table_name: self._all_records(table_ids[table_name])
             for table_name in KEY_TABLE_NAMES
         }
-        return parse_snapshot(raw_tables)
+        snapshot, issues = parse_snapshot(raw_tables)
+        self._validate_base_configuration(snapshot, issues)
+        return snapshot, issues
+
+    def write_requirement_notification_times(
+        self, record_ids: Sequence[str], notified_at: datetime
+    ) -> None:
+        unique_ids = list(dict.fromkeys(record_id for record_id in record_ids if record_id))
+        if not unique_ids:
+            return
+        table_id = self._require_tables(("需求主表",))["需求主表"]
+        value = _datetime_to_milliseconds(notified_at)
+        self._batch_update(
+            table_id,
+            [
+                {"id": record_id, "fields": {"最近通知时间": value}}
+                for record_id in unique_ids
+            ],
+        )
 
     def write_requirement_risks(
         self, results: Sequence[RequirementRisk]
@@ -203,20 +263,103 @@ class BitableRepository:
         if not results:
             return
         table_id = self._require_tables(("进展节点表",))["进展节点表"]
-        records = [
-            {
-                "id": result.node_record_id,
-                "fields": {
+        records = []
+        for result in results:
+            fields = {
                     "系统风险等级": _risk_level_text(result.level),
                     "系统风险原因": "\n".join(result.reasons),
                     "最晚安全DDL": _optional_datetime_to_milliseconds(
                         result.safe_deadline
                     ),
-                },
             }
-            for result in results
-        ]
+            if result.planned_end_is_system_managed:
+                fields["计划完成时间"] = _datetime_to_milliseconds(
+                    result.planned_end
+                )
+            records.append({"id": result.node_record_id, "fields": fields})
         self._batch_update(table_id, records)
+
+    def _validate_runtime_schema(self, table_ids: Mapping[str, str]) -> None:
+        for table_spec in SCHEMA:
+            table_id = table_ids[table_spec.name]
+            try:
+                response = self.client.fields(self._required_app_token(), table_id)
+                fields = _field_items(response)
+            except RepositorySchemaError:
+                raise
+            except Exception as error:
+                raise RepositorySchemaError(
+                    "Unable to read fields for {}: {}".format(
+                        table_spec.name, error
+                    )
+                ) from error
+            fields_by_name = {}
+            for field in fields:
+                name = _field_name(field)
+                if name in fields_by_name:
+                    raise RepositorySchemaError(
+                        "Duplicate field {}.{}".format(table_spec.name, name)
+                    )
+                fields_by_name[name] = field
+            for field_spec in table_spec.fields:
+                field = fields_by_name.get(field_spec.name)
+                if field is None:
+                    raise RepositorySchemaError(
+                        "Missing required field {}.{}".format(
+                            table_spec.name, field_spec.name
+                        )
+                    )
+                actual_type = field.get("type", field.get("field_type"))
+                if actual_type != field_spec.field_type:
+                    raise RepositorySchemaError(
+                        "Field {}.{} has type {}, expected {}".format(
+                            table_spec.name,
+                            field_spec.name,
+                            actual_type,
+                            field_spec.field_type,
+                        )
+                    )
+                if field_spec.field_type == SINGLE_LINK:
+                    property_data = field.get("property")
+                    expected_target = table_ids[field_spec.target_table]
+                    if not isinstance(property_data, Mapping) or (
+                        property_data.get("table_id") != expected_target
+                        or property_data.get("multiple") is not False
+                    ):
+                        raise RepositorySchemaError(
+                            "Field {}.{} has invalid SingleLink target or multiple property".format(
+                                table_spec.name, field_spec.name
+                            )
+                        )
+
+    @staticmethod
+    def _validate_base_configuration(
+        snapshot: DataSnapshot, issues: Sequence[ValidationIssue]
+    ) -> None:
+        if any(issue.table_name == "基础配置表" for issue in issues):
+            raise RepositoryDataError("基础配置表包含无效记录")
+        if not snapshot.base_configs:
+            raise RepositoryDataError("基础配置表为空，必须初始化种子配置")
+        configured_keys = {
+            (config.config_type, config.name) for config in snapshot.base_configs
+        }
+        missing_seeds = [
+            "{}/{}".format(seed["配置类型"], seed["配置名称"])
+            for seed in BASIC_CONFIG_SEEDS
+            if (seed["配置类型"], seed["配置名称"]) not in configured_keys
+        ]
+        if missing_seeds:
+            raise RepositoryDataError(
+                "基础配置表缺少种子配置: {}".format(", ".join(missing_seeds))
+            )
+        for config_type in ("环节", "交付域", "工作类型", "测试角色"):
+            if not any(
+                config.config_type == config_type and config.enabled
+                for config in snapshot.base_configs
+            ):
+                raise RepositoryDataError(
+                    "基础配置表缺少启用的{}种子配置".format(config_type)
+                )
 
     def append_notification_records(
         self, records: Sequence[Mapping[str, Any]]
@@ -383,20 +526,32 @@ def _parse_requirement(raw_record: Mapping[str, Any]) -> Requirement:
 
 
 def _parse_node(
-    raw_record: Mapping[str, Any], requirement_id: str
+    raw_record: Mapping[str, Any], requirement: Requirement
 ) -> DeliveryNode:
     fields = _record_fields(raw_record)
     owner_id, owner_name = _person(fields.get("负责人"), "负责人", required=True)
+    domain = _single_select(fields.get("交付域"), "交付域")
+    work_type = _single_select(fields.get("工作类型"), "工作类型")
+    name = _required_text(fields, "节点名称")
+    checklist = domain == "服务端" and "checklist" in name.lower()
+    if checklist:
+        if requirement.launch_at is None:
+            raise _FieldParseError(
+                "计划上线时间", "Checklist node requires requirement launch time"
+            )
+        planned_end = requirement.launch_at - timedelta(days=1)
+    else:
+        planned_end = _date_time(fields.get("计划完成时间"), "计划完成时间")
     return DeliveryNode(
         record_id=_record_id(raw_record),
-        requirement_id=requirement_id,
-        domain=_single_select(fields.get("交付域"), "交付域"),
-        work_type=_single_select(fields.get("工作类型"), "工作类型"),
-        name=_required_text(fields, "节点名称"),
+        requirement_id=requirement.requirement_id,
+        domain=domain,
+        work_type=work_type,
+        name=name,
         owner_id=owner_id,
         owner_name=owner_name,
         planned_start=_optional_date_time(fields.get("计划开始时间"), "计划开始时间"),
-        planned_end=_date_time(fields.get("计划完成时间"), "计划完成时间"),
+        planned_end=planned_end,
         actual_end=_optional_date_time(fields.get("实际完成时间"), "实际完成时间"),
         status=_single_select(fields.get("当前状态"), "当前状态"),
         progress_note=_optional_text(fields, "进展说明"),
@@ -459,6 +614,44 @@ def _parse_project_config(raw_record: Mapping[str, Any]) -> ProjectConfig:
         launch_cutoff=_optional_text_value(fields.get("上线截止时间")),
         llm_enabled=_checkbox(fields.get("是否启用 LLM"), "是否启用 LLM"),
         llm_notes=_optional_text(fields, "项目补充说明"),
+    )
+
+
+def _parse_base_config(raw_record: Mapping[str, Any]) -> BaseConfig:
+    fields = _record_fields(raw_record)
+    return BaseConfig(
+        record_id=_record_id(raw_record),
+        name=_required_text(fields, "配置名称"),
+        config_type=_single_select(fields.get("配置类型"), "配置类型"),
+        sort_order=_required_integer(fields.get("排序"), "排序"),
+        enabled=_checkbox(fields.get("是否启用"), "是否启用"),
+        notes=_optional_text(fields, "备注"),
+    )
+
+
+def _enabled_config_names(
+    configs: Sequence[BaseConfig], config_type: str
+) -> Set[str]:
+    return {
+        config.name
+        for config in configs
+        if config.config_type == config_type and config.enabled
+    }
+
+
+def _node_config_issue(
+    node: DeliveryNode, field_name: str, value: str
+) -> ValidationIssue:
+    return ValidationIssue(
+        table_name="进展节点表",
+        record_id=node.record_id,
+        requirement_id=node.requirement_id,
+        field_name=field_name,
+        current_value=value,
+        expected_format="基础配置表中启用的{}".format(field_name),
+        fix_suggestion="在基础配置表启用该值或修正节点字段",
+        skip_scope="record",
+        message="value is not enabled in 基础配置表",
     )
 
 
@@ -769,6 +962,13 @@ def _optional_number(value: Any, field_name: str) -> Optional[int]:
         raise _FieldParseError(field_name, "must be a number") from None
 
 
+def _required_integer(value: Any, field_name: str) -> int:
+    number = _optional_number(value, field_name)
+    if number is None:
+        raise _FieldParseError(field_name, "must be an integer")
+    return number
+
+
 def _launch_weekdays(value: Any) -> Optional[set]:
     text = _optional_text_value(value)
     if not text:
@@ -938,6 +1138,28 @@ def _data_object(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return data if isinstance(data, Mapping) else value
 
 
+def _field_items(value: Any) -> List[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        data = _data_object(value)
+        fields = data.get("items", data.get("fields"))
+    else:
+        fields = value
+    if not isinstance(fields, list):
+        raise RepositorySchemaError(
+            "Bitable field response did not include a field list"
+        )
+    if any(not isinstance(field, Mapping) for field in fields):
+        raise RepositorySchemaError("Bitable field list contained an invalid field")
+    return list(fields)
+
+
+def _field_name(field: Mapping[str, Any]) -> str:
+    name = field.get("field_name", field.get("name"))
+    if not isinstance(name, str) or not name:
+        raise RepositorySchemaError("Bitable field did not include a name")
+    return name
+
+
 _REQUIREMENT_FIELD_NAMES = {
     "record_id": "record_id",
     "requirement_id": "需求编号",
@@ -1004,4 +1226,12 @@ _PROJECT_CONFIG_FIELD_NAMES = {
     "launch_cutoff": "上线截止时间",
     "llm_enabled": "是否启用 LLM",
     "llm_notes": "项目补充说明",
+}
+_BASE_CONFIG_FIELD_NAMES = {
+    "record_id": "record_id",
+    "name": "配置名称",
+    "config_type": "配置类型",
+    "sort_order": "排序",
+    "enabled": "是否启用",
+    "notes": "备注",
 }

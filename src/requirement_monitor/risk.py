@@ -2,10 +2,11 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, time
 from math import ceil
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from requirement_monitor.calendar import DayMode, add_days, days_available, subtract_days
 from requirement_monitor.models import (
+    BaseConfig,
     Blocker,
     DeliveryNode,
     FixedRules,
@@ -45,6 +46,8 @@ class EffectiveRules:
     launch_weekdays: Set[int]
     launch_cutoff: str
     checklist_days_before: int
+    process_order: Dict[str, int]
+    disabled_stages: Set[str]
 
 
 @dataclass(frozen=True)
@@ -75,7 +78,9 @@ class _DomainEvaluation:
 
 
 def resolve_effective_rules(
-    fixed: FixedRules, project_config: Optional[ProjectConfig]
+    fixed: FixedRules,
+    project_config: Optional[ProjectConfig],
+    base_configs: Optional[Sequence[BaseConfig]] = None,
 ) -> EffectiveRules:
     duration_mode: DayMode = (
         project_config.duration_mode if project_config is not None else "workday"
@@ -84,6 +89,16 @@ def resolve_effective_rules(
         fixed.at_workdays if duration_mode == "workday" else fixed.at_natural_days
     )
 
+    stage_configs = sorted(
+        (
+            config
+            for config in (base_configs or [])
+            if config.config_type == "环节"
+        ),
+        key=lambda config: (config.sort_order, config.name),
+    )
+    enabled_stages = [config.name for config in stage_configs if config.enabled]
+    process_names = enabled_stages or list(DEFAULT_PROCESS_NODES)
     return EffectiveRules(
         duration_mode=duration_mode,
         at_days=_override(project_config, "at_days", fixed_at_days),
@@ -109,6 +124,10 @@ def resolve_effective_rules(
             else fixed.server_launch_cutoff
         ),
         checklist_days_before=fixed.checklist_days_before,
+        process_order={name: index for index, name in enumerate(process_names)},
+        disabled_stages={
+            config.name for config in stage_configs if not config.enabled
+        },
     )
 
 
@@ -119,15 +138,20 @@ def evaluate_requirement(
     fixed_rules: FixedRules,
     now: datetime,
     project_config: Optional[ProjectConfig] = None,
+    base_configs: Optional[Sequence[BaseConfig]] = None,
 ) -> Optional[RequirementRisk]:
     if not _is_eligible(requirement):
         return None
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
 
-    effective = resolve_effective_rules(fixed_rules, project_config)
+    effective = resolve_effective_rules(fixed_rules, project_config, base_configs)
     relevant_nodes = [
-        node for node in nodes if node.requirement_id == requirement.requirement_id
+        node
+        for node in nodes
+        if node.requirement_id == requirement.requirement_id
+        and node.name not in effective.disabled_stages
+        and _configured_stage_name(node) not in effective.disabled_stages
     ]
     relevant_blockers = [
         blocker
@@ -491,6 +515,9 @@ def _build_events(
     pv_first = ceil(rules.pv_days / 2)
     pv_second = rules.pv_days - pv_first
     events: List[_Event] = []
+    at_order = rules.process_order.get("AT 测试第一轮", _AT1_ORDER)
+    pv_order = rules.process_order.get("PV 测试第一轮", _PV1_ORDER)
+    regression_order = rules.process_order.get("线上回归", _REGRESSION_ORDER)
 
     for node in nodes:
         order, label, duration = _node_stage(
@@ -501,6 +528,7 @@ def _build_events(
             pv_second,
             rules.regression_days,
             rules.duration_mode,
+            rules.process_order,
         )
         events.append(_Event(order=order, duration=duration, label=label, node=node))
 
@@ -510,21 +538,21 @@ def _build_events(
     has_test_flow = has_at or has_pv or "线上回归" in stages
 
     if has_at and "AT1" not in stages and at_first:
-        events.append(_Event((_AT1_ORDER, 1), at_first, "AT1"))
+        events.append(_Event((at_order, 1), at_first, "AT1"))
     if has_at and "AT2" not in stages and at_second:
-        events.append(_Event((_AT1_ORDER, 2), at_second, "AT2"))
+        events.append(_Event((at_order, 2), at_second, "AT2"))
     if has_pv and "PV1" not in stages and pv_first:
-        events.append(_Event((_PV1_ORDER, 1), pv_first, "PV1"))
+        events.append(_Event((pv_order, 1), pv_first, "PV1"))
     if has_pv and "PV2" not in stages and pv_second:
-        events.append(_Event((_PV1_ORDER, 2), pv_second, "PV2"))
+        events.append(_Event((pv_order, 2), pv_second, "PV2"))
     if has_pv and rules.bugfix_days:
-        events.append(_Event(_BUGFIX_ORDER, rules.bugfix_days, "Bug修复预留"))
+        events.append(_Event((regression_order, -2), rules.bugfix_days, "Bug修复预留"))
     special_days = rules.special_days.get(domain, 0)
     if special_days:
-        events.append(_Event(_SPECIAL_ORDER, special_days, f"{domain}专项测试"))
+        events.append(_Event((regression_order, -1), special_days, f"{domain}专项测试"))
     if has_test_flow and "线上回归" not in stages and rules.regression_days:
         events.append(
-            _Event((_REGRESSION_ORDER, 0), rules.regression_days, "线上回归")
+            _Event((regression_order, 0), rules.regression_days, "线上回归")
         )
 
     return sorted(events, key=_event_sort_key)
@@ -538,6 +566,7 @@ def _node_stage(
     pv_second: int,
     regression_days: int,
     duration_mode: DayMode,
+    process_order: Mapping[str, int],
 ) -> Tuple[_PhaseRank, str, int]:
     normalized = "".join(node.name.upper().split())
     round_stage = _test_round_stage(node, normalized)
@@ -551,7 +580,10 @@ def _node_stage(
                 if round_number == 2
                 else _extra_round_duration(node, duration_mode)
             )
-            return (_AT1_ORDER, round_number), f"AT{round_number}", duration
+            return (
+                process_order.get("AT 测试第一轮", _AT1_ORDER),
+                round_number,
+            ), f"AT{round_number}", duration
         duration = (
             pv_first
             if round_number == 1
@@ -559,13 +591,19 @@ def _node_stage(
             if round_number == 2
             else _extra_round_duration(node, duration_mode)
         )
-        return (_PV1_ORDER, round_number), f"PV{round_number}", duration
+        return (
+            process_order.get("PV 测试第一轮", _PV1_ORDER),
+            round_number,
+        ), f"PV{round_number}", duration
     if "线上回归" in node.name:
-        return (_REGRESSION_ORDER, 0), "线上回归", regression_days
+        return (
+            process_order.get("线上回归", _REGRESSION_ORDER),
+            0,
+        ), "线上回归", regression_days
 
     process_name = _matching_process_name(node)
     return (
-        (_PROCESS_ORDER.get(process_name, len(DEFAULT_PROCESS_NODES)), 0),
+        (process_order.get(process_name, len(process_order)), 0),
         process_name,
         0,
     )
@@ -633,6 +671,18 @@ def _matching_process_name(node: DeliveryNode) -> str:
     if "提测" in node.name:
         return "提测"
     return node.name
+
+
+def _configured_stage_name(node: DeliveryNode) -> str:
+    normalized = "".join(node.name.upper().split())
+    round_stage = _test_round_stage(node, normalized)
+    if round_stage is not None:
+        family, round_number = round_stage
+        if family == "AT" and round_number in (1, 2):
+            return "AT 测试第{}轮".format("一" if round_number == 1 else "二")
+        if family == "PV" and round_number in (1, 2):
+            return "PV 测试第{}轮".format("一" if round_number == 1 else "二")
+    return _matching_process_name(node)
 
 
 def _build_phase_events(
@@ -850,6 +900,7 @@ def _evaluate_checklist_node(
         buffer_days=None,
         reasons=reasons,
         actions=[],
+        planned_end_is_system_managed=True,
     )
 
 

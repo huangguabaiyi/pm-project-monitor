@@ -388,7 +388,7 @@ def build_severe_card(risk: RequirementRisk) -> Dict[str, object]:
         "预计延期：{} 天".format(delayed_days),
         "受影响交付域：{}".format(_join_values(risk.affected_domains)),
         "判定原因：{}".format(_join_values(risk.reasons)),
-        "阻塞：{}".format(_format_blockers(blockers, mention_owners=True)),
+        "阻塞：{}".format(_format_blockers(blockers)),
         "行动：{}".format(_join_values(actions)),
         "最晚处理时间：{}".format(_format_datetime(_latest_action_time(risk))),
         "节点负责人：{}".format(_node_owners(risk.node_risks)),
@@ -611,7 +611,7 @@ def _node_owners(nodes: List[NodeRisk]) -> str:
     if not owners:
         return "未提供"
     return _bounded_join(
-        [mention(owner_id, name) for owner_id, name in owners],
+        [escape_value(name, 180) for _, name in owners],
         "、",
         1200,
     )

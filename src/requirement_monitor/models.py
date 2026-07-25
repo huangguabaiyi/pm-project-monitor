@@ -164,6 +164,15 @@ class ProjectConfig(BaseModel):
         return value
 
 
+class BaseConfig(BaseModel):
+    record_id: NonEmptyStr
+    name: NonEmptyStr
+    config_type: Literal["环节", "交付域", "工作类型", "测试角色"]
+    sort_order: int
+    enabled: bool
+    notes: StrippedStr = ""
+
+
 class FixedRules(BaseModel):
     server_launch_weekdays: Set[int]
     server_launch_cutoff: NonEmptyStr
@@ -196,6 +205,7 @@ class DataSnapshot(BaseModel):
     nodes: List[DeliveryNode] = Field(default_factory=list)
     blockers: List[Blocker] = Field(default_factory=list)
     project_configs: List[ProjectConfig] = Field(default_factory=list)
+    base_configs: List[BaseConfig] = Field(default_factory=list)
 
     def eligible_requirements(self) -> List[Requirement]:
         return [
@@ -204,6 +214,19 @@ class DataSnapshot(BaseModel):
             if requirement.briefing_completed
             and requirement.notification_enabled
             and not requirement.archived
+        ]
+
+    def enabled_config_names(self, config_type: str) -> List[str]:
+        return [
+            item.name
+            for item in sorted(
+                (
+                    config
+                    for config in self.base_configs
+                    if config.config_type == config_type and config.enabled
+                ),
+                key=lambda config: (config.sort_order, config.name),
+            )
         ]
 
 
@@ -222,6 +245,7 @@ class NodeRisk(BaseModel):
     buffer_days: Optional[float] = None
     reasons: List[NonEmptyStr] = Field(default_factory=list)
     actions: List[NonEmptyStr] = Field(default_factory=list)
+    planned_end_is_system_managed: bool = False
 
 
 class LLMEnrichment(BaseModel):

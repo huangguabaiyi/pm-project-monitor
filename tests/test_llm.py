@@ -8,7 +8,13 @@ import pytest
 import requirement_monitor.llm as llm_module
 from requirement_monitor.config import LLMSettings
 from requirement_monitor.llm import LLMClient
-from requirement_monitor.models import RequirementRisk, RiskLevel
+from requirement_monitor.models import (
+    Blocker,
+    NodeRisk,
+    NodeStatus,
+    RequirementRisk,
+    RiskLevel,
+)
 
 
 API_KEY = "sk-super-secret-token"
@@ -122,12 +128,64 @@ def test_posts_openai_compatible_request_with_guardrails(
 
     user_input = json.loads(payload["messages"][1]["content"])
     assert user_input["fixed_rules"] == "规则原文：上线日期不可变"
-    assert user_input["project_description"] == "项目说明：本周进入测试"
-    assert user_input["risk"]["requirement_id"] == "REQ-1"
+    assert "project_description" not in user_input
+    assert "requirement_id" not in user_input["risk"]
+    assert user_input["risk"]["requirement_name"] == "语音助手升级"
     assert user_input["risk"]["level"] == RiskLevel.NORMAL
 
     assert enrichment.available is True
     assert enrichment.effective_level == RiskLevel.WARNING
+
+
+def test_llm_request_body_excludes_all_person_pii(httpx_mock, llm_settings):
+    httpx_mock.add_response(json=response_content())
+    risk = make_risk().model_copy(
+        update={
+            "node_risks": [
+                NodeRisk(
+                    node_record_id="node-1",
+                    requirement_id="REQ-1",
+                    node_name="客户端开发",
+                    domain="客户端",
+                    owner_id="ou-node-secret",
+                    owner_name="节点负责人姓名",
+                    planned_end=datetime(2026, 8, 1, 18, tzinfo=TZ),
+                    status=NodeStatus.IN_PROGRESS,
+                    reasons=["节点延期"],
+                )
+            ],
+            "blockers": [
+                Blocker(
+                    record_id="blocker-1",
+                    requirement_id="REQ-1",
+                    title="等待接口",
+                    owner_id="ou-blocker-secret",
+                    owner_name="阻塞责任人姓名",
+                    found_at=datetime(2026, 7, 25, 9, tzinfo=TZ),
+                    planned_resolution_at=datetime(2026, 7, 27, 18, tzinfo=TZ),
+                    status="处理中",
+                    affects_merge=True,
+                )
+            ],
+        }
+    )
+
+    LLMClient(llm_settings).enrich(risk, "固定规则", "项目说明")
+
+    body = httpx_mock.get_request().content.decode("utf-8")
+    for forbidden in (
+        "ou-project",
+        "项目负责人",
+        "ou-node-secret",
+        "节点负责人姓名",
+        "ou-blocker-secret",
+        "阻塞责任人姓名",
+        "owner_id",
+        "owner_name",
+        "project_owner_id",
+        "project_owner_name",
+    ):
+        assert forbidden not in body
 
 
 @pytest.mark.parametrize(
@@ -279,7 +337,7 @@ def test_request_serialization_error_returns_unavailable(
     httpx_mock, llm_settings
 ):
     enrichment = LLMClient(llm_settings).enrich(
-        make_risk(), "固定规则", object()
+        make_risk(), object(), "项目说明"
     )
 
     assert_unavailable(enrichment, RiskLevel.NORMAL, "request_error")

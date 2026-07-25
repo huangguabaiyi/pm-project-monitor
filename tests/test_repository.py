@@ -6,12 +6,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from requirement_monitor.models import NodeRisk, RequirementRisk, RiskLevel
+from requirement_monitor.models import BaseConfig, NodeRisk, RequirementRisk, RiskLevel
 from requirement_monitor.repository import (
     BitableRepository,
+    RepositoryDataError,
     RepositorySchemaError,
     parse_snapshot,
 )
+from requirement_monitor.schema import BASIC_CONFIG_SEEDS, SCHEMA, SINGLE_LINK
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -100,6 +102,14 @@ def raw_tables():
                 },
             }
         ],
+        "基础配置表": [
+            {
+                "record_id": "rec-base-{}".format(index),
+                "fields": dict(fields),
+            }
+            for index, fields in enumerate(BASIC_CONFIG_SEEDS, start=1)
+        ],
+        "通知记录表": [],
     }
 
 
@@ -301,10 +311,12 @@ def test_ineligible_requirements_are_filtered_after_parsing(raw_tables):
 
 
 class FakeCLI:
-    def __init__(self, meta, pages=None):
+    def __init__(self, meta, pages=None, field_responses=None):
         self.meta_payload = meta
         self.pages = pages or {}
+        self.field_responses = field_responses or {}
         self.record_calls = []
+        self.field_calls = []
         self.batch_updates = []
         self.batch_creates = []
         self.temp_files = []
@@ -332,6 +344,10 @@ class FakeCLI:
             }
         )
         return self.pages[(table_id, page_token)]
+
+    def fields(self, app_token, table_id):
+        self.field_calls.append((app_token, table_id))
+        return self.field_responses[table_id]
 
     def batch_update(self, app_token, table_id, records=None, *, file_path=None):
         loaded_records = self._load_batch(records, file_path)
@@ -369,6 +385,31 @@ def repository_meta(*table_names):
     }
 
 
+def repository_fields(meta):
+    table_ids = {
+        table["name"]: table["table_id"] for table in meta["data"]["tables"]
+    }
+    responses = {}
+    for table_spec in SCHEMA:
+        table_id = table_ids[table_spec.name]
+        items = []
+        for index, field_spec in enumerate(table_spec.fields):
+            field = {
+                "field_id": "fld-{}-{}".format(table_id, index),
+                "field_name": field_spec.name,
+                "type": field_spec.field_type,
+                "is_primary": index == 0,
+            }
+            if field_spec.field_type == SINGLE_LINK:
+                field["property"] = {
+                    "table_id": table_ids[field_spec.target_table],
+                    "multiple": False,
+                }
+            items.append(field)
+        responses[table_id] = {"data": {"items": items}}
+    return responses
+
+
 def test_load_snapshot_discovers_exact_names_and_reads_all_pages(raw_tables):
     table_names = (
         "需求主表备份",
@@ -376,6 +417,7 @@ def test_load_snapshot_discovers_exact_names_and_reads_all_pages(raw_tables):
         "进展节点表",
         "阻塞项表",
         "项目配置表",
+        "基础配置表",
         "通知记录表",
     )
     meta = repository_meta(*table_names)
@@ -402,14 +444,21 @@ def test_load_snapshot_discovers_exact_names_and_reads_all_pages(raw_tables):
         (table_ids["项目配置表"], None): {
             "data": {"records": raw_tables["项目配置表"], "has_more": False}
         },
+        (table_ids["基础配置表"], None): {
+            "data": {"items": raw_tables["基础配置表"], "has_more": False}
+        },
+        (table_ids["通知记录表"], None): {
+            "data": {"records": [], "has_more": False}
+        },
     }
-    client = FakeCLI(meta, pages)
+    client = FakeCLI(meta, pages, repository_fields(meta))
 
     snapshot, issues = BitableRepository("base-token", client=client).load_snapshot()
 
     assert issues == []
     assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
-    assert len(client.record_calls) == 5
+    assert len(client.record_calls) == 7
+    assert len(client.field_calls) == 6
     assert all(call["page_size"] == 500 for call in client.record_calls)
     assert all(call["automatic_fields"] is True for call in client.record_calls)
     assert [
@@ -430,6 +479,187 @@ def test_load_snapshot_raises_when_a_key_table_is_missing():
         BitableRepository("base-token", client=client).load_snapshot()
 
 
+def test_load_snapshot_validates_schema_before_reading_empty_tables():
+    table_names = tuple(table.name for table in SCHEMA)
+    meta = repository_meta(*table_names)
+    fields = repository_fields(meta)
+    requirement_table = next(
+        table for table in meta["data"]["tables"] if table["name"] == "需求主表"
+    )
+    fields[requirement_table["table_id"]]["data"]["items"] = [
+        field
+        for field in fields[requirement_table["table_id"]]["data"]["items"]
+        if field["field_name"] != "项目负责人"
+    ]
+    client = FakeCLI(meta, field_responses=fields)
+
+    with pytest.raises(RepositorySchemaError, match="项目负责人"):
+        BitableRepository("base-token", client=client).load_snapshot()
+
+    assert client.record_calls == []
+
+
+def test_load_snapshot_rejects_wrong_single_link_target():
+    table_names = tuple(table.name for table in SCHEMA)
+    meta = repository_meta(*table_names)
+    fields = repository_fields(meta)
+    node_table = next(
+        table for table in meta["data"]["tables"] if table["name"] == "进展节点表"
+    )
+    link = next(
+        field
+        for field in fields[node_table["table_id"]]["data"]["items"]
+        if field["field_name"] == "关联需求"
+    )
+    link["property"] = {"table_id": "tbl-wrong", "multiple": True}
+
+    with pytest.raises(RepositorySchemaError, match="关联需求"):
+        BitableRepository(
+            "base-token", client=FakeCLI(meta, field_responses=fields)
+        ).load_snapshot()
+
+
+def test_parse_snapshot_loads_base_configuration(raw_tables):
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert isinstance(snapshot.base_configs[0], BaseConfig)
+    assert snapshot.enabled_config_names("环节")[:2] == ["需求撰写", "内部评审"]
+
+
+def test_dynamic_domains_work_types_and_test_roles_are_configuration_driven(
+    raw_tables,
+):
+    raw_tables["基础配置表"].extend(
+        [
+            {
+                "record_id": "rec-custom-domain",
+                "fields": {
+                    "配置名称": "合作伙伴",
+                    "配置类型": "交付域",
+                    "排序": 99,
+                    "是否启用": True,
+                    "备注": "动态参与方",
+                },
+            },
+            {
+                "record_id": "rec-custom-work",
+                "fields": {
+                    "配置名称": "验收",
+                    "配置类型": "工作类型",
+                    "排序": 99,
+                    "是否启用": True,
+                    "备注": "动态工作类型",
+                },
+            },
+            {
+                "record_id": "rec-custom-role",
+                "fields": {
+                    "配置名称": "安全测试",
+                    "配置类型": "测试角色",
+                    "排序": 99,
+                    "是否启用": True,
+                    "备注": "动态测试角色",
+                },
+            },
+        ]
+    )
+    raw_tables["进展节点表"][0]["fields"]["交付域"] = {"name": "合作伙伴"}
+    raw_tables["进展节点表"][0]["fields"]["工作类型"] = {"name": "验收"}
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert snapshot.nodes[0].domain == "合作伙伴"
+    assert snapshot.nodes[0].work_type == "验收"
+    assert "安全测试" in snapshot.enabled_config_names("测试角色")
+
+
+def test_checklist_planned_end_is_derived_from_launch_time(raw_tables):
+    node_fields = raw_tables["进展节点表"][0]["fields"]
+    node_fields.update(
+        {
+            "交付域": {"name": "服务端"},
+            "工作类型": {"name": "发布"},
+            "节点名称": "上线 Checklist",
+        }
+    )
+    node_fields.pop("计划完成时间")
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert snapshot.nodes[0].planned_end == datetime(
+        2026, 7, 29, 18, 0, tzinfo=SHANGHAI
+    )
+
+
+def test_checklist_without_launch_time_is_requirement_data_error(raw_tables):
+    raw_tables["需求主表"][0]["fields"]["计划上线时间"] = None
+    node_fields = raw_tables["进展节点表"][0]["fields"]
+    node_fields.update(
+        {
+            "交付域": {"name": "服务端"},
+            "工作类型": {"name": "发布"},
+            "节点名称": "上线 Checklist",
+        }
+    )
+    node_fields.pop("计划完成时间")
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.nodes == []
+    assert issues[0].field_name == "计划上线时间"
+
+
+def test_load_snapshot_rejects_empty_base_configuration(raw_tables):
+    table_names = tuple(table.name for table in SCHEMA)
+    meta = repository_meta(*table_names)
+    table_ids = {
+        table["name"]: table["table_id"] for table in meta["data"]["tables"]
+    }
+    pages = {
+        (table_ids[name], None): {
+            "data": {"records": raw_tables[name], "has_more": False}
+        }
+        for name in table_names
+    }
+    pages[(table_ids["基础配置表"], None)] = {
+        "data": {"records": [], "has_more": False}
+    }
+
+    with pytest.raises(RepositoryDataError, match="基础配置表"):
+        BitableRepository(
+            "base-token",
+            client=FakeCLI(meta, pages, repository_fields(meta)),
+        ).load_snapshot()
+
+
+def test_load_snapshot_rejects_missing_required_base_seed(raw_tables):
+    table_names = tuple(table.name for table in SCHEMA)
+    meta = repository_meta(*table_names)
+    table_ids = {
+        table["name"]: table["table_id"] for table in meta["data"]["tables"]
+    }
+    raw_tables["基础配置表"] = [
+        record
+        for record in raw_tables["基础配置表"]
+        if record["fields"]["配置名称"] != "线上回归"
+    ]
+    pages = {
+        (table_ids[name], None): {
+            "data": {"records": raw_tables[name], "has_more": False}
+        }
+        for name in table_names
+    }
+
+    with pytest.raises(RepositoryDataError, match="线上回归"):
+        BitableRepository(
+            "base-token",
+            client=FakeCLI(meta, pages, repository_fields(meta)),
+        ).load_snapshot()
+
+
 class SequenceRecordsCLI(FakeCLI):
     def __init__(self, meta, responses):
         super().__init__(meta)
@@ -444,23 +674,27 @@ class SequenceRecordsCLI(FakeCLI):
 
 
 def test_load_snapshot_rejects_repeated_pagination_token():
+    meta = repository_meta(*(table.name for table in SCHEMA))
     client = SequenceRecordsCLI(
-        repository_meta("需求主表", "进展节点表", "阻塞项表", "项目配置表"),
+        meta,
         [
             {"data": {"records": [], "has_more": True, "page_token": "page-1"}},
             {"data": {"records": [], "has_more": True, "page_token": "page-1"}},
         ],
     )
+    client.field_responses = repository_fields(meta)
 
     with pytest.raises(RepositorySchemaError, match="pagination"):
         BitableRepository("base-token", client=client).load_snapshot()
 
 
 def test_load_snapshot_rejects_has_more_without_new_token():
+    meta = repository_meta(*(table.name for table in SCHEMA))
     client = SequenceRecordsCLI(
-        repository_meta("需求主表", "进展节点表", "阻塞项表", "项目配置表"),
+        meta,
         [{"data": {"records": [], "has_more": True, "page_token": ""}}],
     )
+    client.field_responses = repository_fields(meta)
 
     with pytest.raises(RepositorySchemaError, match="pagination"):
         BitableRepository("base-token", client=client).load_snapshot()
@@ -577,6 +811,34 @@ def test_batch_writers_chunk_at_500_and_use_schema_field_names():
     assert all(item["mode"] == 0o600 for item in client.temp_files)
     assert all(item["exists_during_call"] for item in client.temp_files)
     assert all(not os.path.exists(item["path"]) for item in client.temp_files)
+
+
+def test_checklist_node_writer_updates_derived_plan_and_safe_deadline():
+    meta = repository_meta("进展节点表")
+    client = FakeCLI(meta)
+    repository = BitableRepository("base-token", client=client)
+    deadline = datetime(2026, 7, 29, 18, tzinfo=SHANGHAI)
+    repository.write_node_risks(
+        [
+            NodeRisk(
+                node_record_id="node-checklist",
+                requirement_id="REQ-1",
+                node_name="上线 Checklist",
+                domain="服务端",
+                owner_id="ou-node",
+                owner_name="节点负责人",
+                planned_end=deadline,
+                status="进行中",
+                safe_deadline=deadline,
+                planned_end_is_system_managed=True,
+            )
+        ]
+    )
+
+    fields = client.batch_updates[0][2][0]["fields"]
+    expected = int(deadline.timestamp() * 1000)
+    assert fields["计划完成时间"] == expected
+    assert fields["最晚安全DDL"] == expected
 
 
 def test_batch_writers_do_not_send_empty_batches():

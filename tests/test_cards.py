@@ -573,7 +573,11 @@ def test_severe_card_mentions_project_owner_and_has_complete_context():
 
     assert payload["card"]["header"]["template"] == "red"
     assert '<at id="ou-project">项目负责人</at>' in text
-    assert '<at id="ou-zhang">张三</at>' in text
+    assert '<at id="ou-zhang">张三</at>' not in text
+    assert '<at id="ou-blocker">阻塞负责人</at>' not in text
+    assert "张三" in text
+    assert "王五" in text
+    assert set(re.findall(r'<at id="([^"]+)">', text)) == {"ou-project"}
     for label in (
         "需求：登陆安全",
         "项目：米家",
