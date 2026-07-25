@@ -1,5 +1,6 @@
 import ipaddress
 import json
+import math
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlparse
@@ -11,7 +12,19 @@ from .models import SendResult
 
 MAX_PAYLOAD_BYTES = 20 * 1024
 _RETRY_DELAYS = (10, 30, 120)
-_CARD_FORMAT_HTTP_STATUSES = {400, 413, 422}
+_OFFICIAL_WEBHOOK_HOSTS = {"open.feishu.cn", "open.larksuite.com"}
+_OFFICIAL_WEBHOOK_PATH = "/open-apis/bot/v2/hook/"
+_CARD_FORMAT_CODES = {190001, 230001, 230021, 230022, 230099}
+_CARD_FORMAT_MESSAGES = (
+    "invalid card",
+    "card invalid",
+    "card schema",
+    "malformed card",
+    "failed to create card content",
+    "卡片格式",
+    "卡片结构",
+    "卡片校验",
+)
 
 
 class WebhookSender:
@@ -20,16 +33,41 @@ class WebhookSender:
         webhook_url: str,
         sleep: Callable[[float], None] = time.sleep,
         timeout_seconds: float = 10.0,
+        client: Optional[httpx.Client] = None,
+        allow_loopback_http: bool = False,
     ) -> None:
-        if not self._is_secure_webhook_url(webhook_url):
-            raise ValueError(
-                "webhook URL must use HTTPS or loopback HTTP"
-            )
+        if not self._is_allowed_webhook_url(
+            webhook_url, allow_loopback_http=allow_loopback_http
+        ):
+            raise ValueError("webhook URL must use an official endpoint")
+        if isinstance(timeout_seconds, bool) or not isinstance(
+            timeout_seconds, (int, float)
+        ):
+            raise ValueError("timeout_seconds must be positive")
+        normalized_timeout = float(timeout_seconds)
+        if not math.isfinite(normalized_timeout) or normalized_timeout <= 0:
+            raise ValueError("timeout_seconds must be positive")
         self._webhook_url = webhook_url
         self._sleep = sleep
-        self._timeout_seconds = timeout_seconds
+        self._timeout_seconds = normalized_timeout
+        self._client = client if client is not None else httpx.Client()
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._client.close()
+        self._closed = True
 
     def send(self, payload: Mapping[str, Any]) -> SendResult:
+        if self._closed:
+            raise RuntimeError("WebhookSender is closed")
         format_used = self._format_used(payload)
         serialized_payload, validation_error = self._validated_payload(payload)
         if validation_error is not None:
@@ -82,14 +120,12 @@ class WebhookSender:
         while attempts < max_attempts:
             attempts += 1
             try:
-                response = httpx.post(
+                response = self._client.post(
                     self._webhook_url,
                     content=serialized_payload,
                     headers={"Content-Type": "application/json"},
                     timeout=self._timeout_seconds,
                 )
-            except MemoryError:
-                raise
             except httpx.TimeoutException:
                 last_error = "timeout"
                 if self._retry(attempts, max_attempts):
@@ -110,29 +146,9 @@ class WebhookSender:
                     format_used=format_used,
                     error=last_error,
                 )
-            except Exception:
-                return SendResult(
-                    success=False,
-                    attempts=attempts,
-                    format_used=format_used,
-                    error="request_error",
-                )
 
             status_code = response.status_code
-            feishu_code = self._feishu_code(response)
-
-            if (
-                format_used == "card"
-                and status_code in _CARD_FORMAT_HTTP_STATUSES
-            ):
-                return SendResult(
-                    success=False,
-                    attempts=attempts,
-                    format_used=format_used,
-                    status_code=status_code,
-                    feishu_code=feishu_code,
-                    error="card_format_rejected",
-                )
+            feishu_code, feishu_message = self._feishu_response(response)
 
             if status_code == 429 or 500 <= status_code < 600:
                 last_error = "http_{}".format(status_code)
@@ -145,6 +161,21 @@ class WebhookSender:
                     status_code=status_code,
                     feishu_code=feishu_code,
                     error=last_error,
+                )
+
+            if (
+                format_used == "card"
+                and self._is_card_format_rejection(
+                    status_code, feishu_code, feishu_message
+                )
+            ):
+                return SendResult(
+                    success=False,
+                    attempts=attempts,
+                    format_used=format_used,
+                    status_code=status_code,
+                    feishu_code=feishu_code,
+                    error="card_format_rejected",
                 )
 
             if not 200 <= status_code < 300:
@@ -224,14 +255,7 @@ class WebhookSender:
             return None, "invalid_payload"
 
         try:
-            serialized = json.dumps(
-                payload,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        except MemoryError:
-            raise
+            serialized = WebhookSender._serialize_payload(payload)
         except (TypeError, ValueError, OverflowError):
             return None, "invalid_payload"
 
@@ -272,50 +296,113 @@ class WebhookSender:
 
     @staticmethod
     def _truncate_text_payload(text: str) -> str:
-        payload_overhead = len(
-            json.dumps(
-                {"msg_type": "text", "content": {"text": ""}},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        byte_limit = MAX_PAYLOAD_BYTES - payload_overhead
-        encoded = text.encode("utf-8")
-        if len(encoded) <= byte_limit:
+        if len(WebhookSender._serialized_text_payload(text)) <= MAX_PAYLOAD_BYTES:
             return text
-        return encoded[:byte_limit].decode("utf-8", errors="ignore")
+
+        lower_bound = 0
+        upper_bound = len(text)
+        while lower_bound < upper_bound:
+            midpoint = (lower_bound + upper_bound + 1) // 2
+            candidate = text[:midpoint]
+            if (
+                len(WebhookSender._serialized_text_payload(candidate))
+                <= MAX_PAYLOAD_BYTES
+            ):
+                lower_bound = midpoint
+            else:
+                upper_bound = midpoint - 1
+        return text[:lower_bound]
 
     @staticmethod
-    def _feishu_code(response: httpx.Response) -> Optional[int]:
+    def _serialize_payload(payload: Mapping[str, Any]) -> bytes:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    @staticmethod
+    def _serialized_text_payload(text: str) -> bytes:
+        return WebhookSender._serialize_payload(
+            {"msg_type": "text", "content": {"text": text}}
+        )
+
+    @staticmethod
+    def _feishu_response(
+        response: httpx.Response,
+    ) -> Tuple[Optional[int], str]:
         try:
             payload = response.json()
-        except MemoryError:
-            raise
-        except Exception:
-            return None
+        except (ValueError, UnicodeDecodeError, TypeError):
+            return None, ""
         if not isinstance(payload, dict):
-            return None
+            return None, ""
+
+        feishu_code = None
         for key in ("code", "StatusCode", "status_code"):
             value = payload.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
-                return value
-        return None
+                feishu_code = value
+                break
+
+        feishu_message = ""
+        for key in ("msg", "StatusMessage", "message"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                feishu_message = value
+                break
+        return feishu_code, feishu_message
 
     @staticmethod
-    def _is_secure_webhook_url(webhook_url: object) -> bool:
+    def _is_card_format_rejection(
+        status_code: int,
+        feishu_code: Optional[int],
+        feishu_message: str,
+    ) -> bool:
+        if status_code not in {200, 400} or feishu_code == 0:
+            return False
+        if feishu_code in _CARD_FORMAT_CODES:
+            return True
+        normalized_message = feishu_message.casefold()
+        return any(
+            marker in normalized_message for marker in _CARD_FORMAT_MESSAGES
+        )
+
+    @staticmethod
+    def _is_allowed_webhook_url(
+        webhook_url: object,
+        allow_loopback_http: bool,
+    ) -> bool:
         if not isinstance(webhook_url, str):
             return False
         try:
             parsed = urlparse(webhook_url)
             hostname = parsed.hostname
-            parsed.port
+            port = parsed.port
         except (TypeError, ValueError):
             return False
-        if hostname is None or parsed.username is not None:
+        if (
+            hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
             return False
+
         if parsed.scheme == "https":
-            return True
-        if parsed.scheme != "http":
+            if (
+                hostname.lower() not in _OFFICIAL_WEBHOOK_HOSTS
+                or port not in (None, 443)
+                or parsed.query
+                or parsed.fragment
+                or parsed.params
+                or not parsed.path.startswith(_OFFICIAL_WEBHOOK_PATH)
+            ):
+                return False
+            token = parsed.path[len(_OFFICIAL_WEBHOOK_PATH) :]
+            return bool(token) and "/" not in token
+
+        if parsed.scheme != "http" or not allow_loopback_http:
             return False
         if hostname.lower() == "localhost":
             return True
