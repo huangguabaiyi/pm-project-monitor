@@ -28,12 +28,19 @@ from requirement_monitor.models import (
     ValidationIssue,
 )
 from requirement_monitor.risk import evaluate_requirement
-from requirement_monitor.state import MonitorState, RecentSend, StateStore
+from requirement_monitor.state import (
+    MonitorState,
+    RecentSend,
+    ScheduledDailyResult,
+    StateStore,
+    normalize_send_error_code,
+)
 
 
 class MonitorRunReport(RunReport):
     payloads: List[Dict[str, object]] = Field(default_factory=list)
     dry_run: bool = False
+    llm_skipped: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,17 +95,37 @@ class MonitorRunner:
             trigger=trigger,
             started_at=started_at,
             dry_run=dry_run,
+            llm_skipped=dry_run,
         )
 
         authentication_error = self._authentication_error()
         if authentication_error is not None:
-            return self._finish_authentication_failure(
+            return self._finish_runtime_failure(
                 report, authentication_error, dry_run
             )
 
-        fixed_rules, fixed_rules_text = self._load_fixed_rules()
-        snapshot, issues = self.repository.load_snapshot()
-        state = self.state_store.load()
+        try:
+            fixed_rules, fixed_rules_text = self._load_fixed_rules()
+        except MemoryError:
+            raise
+        except Exception:
+            return self._finish_runtime_failure(
+                report, "FIXED_RULES_ERROR", dry_run
+            )
+        try:
+            snapshot, issues = self.repository.load_snapshot()
+        except MemoryError:
+            raise
+        except Exception:
+            return self._finish_runtime_failure(
+                report, "SNAPSHOT_ERROR", dry_run
+            )
+        try:
+            state = self.state_store.load()
+        except MemoryError:
+            raise
+        except Exception:
+            return self._finish_runtime_failure(report, "STATE_ERROR", dry_run)
         report.total_requirements = len(snapshot.requirements)
         report.validation_issues = list(issues)
         report.invalid_records = len(issues)
@@ -133,6 +160,7 @@ class MonitorRunner:
                 fixed_rules_text,
                 requirement,
                 report,
+                dry_run,
             )
             risks.append(risk)
 
@@ -141,25 +169,38 @@ class MonitorRunner:
         self._set_level_counts(report)
 
         if not dry_run:
-            self.repository.write_requirement_risks(risks)
-            self.repository.write_node_risks(
-                [node_risk for risk in risks for node_risk in risk.node_risks]
-            )
+            try:
+                self.repository.write_requirement_risks(risks)
+                self.repository.write_node_risks(
+                    [
+                        node_risk
+                        for risk in risks
+                        for node_risk in risk.node_risks
+                    ]
+                )
+            except MemoryError:
+                raise
+            except Exception:
+                return self._finish_runtime_failure(
+                    report, "SYSTEM_WRITE_ERROR", dry_run
+                )
 
         pending, severe_by_fingerprint = self._build_notifications(
             report, state, trigger
         )
         report.payloads = [item.payload for item in pending]
         if dry_run:
+            for payload in report.payloads:
+                self._mark_llm_skipped(payload)
             report.finished_at = self._now()
             return report
 
         send_records: List[Mapping[str, Any]] = []
         recent_sends: List[RecentSend] = []
         successful_severe = set()
-        daily_results: List[SendResult] = []
+        scheduled_daily_results = dict(state.scheduled_daily_results)
         for item in pending:
-            result = self.webhook.send(item.payload)
+            result = self._safe_send(item.payload)
             report.send_results.append(result)
             if result.success:
                 report.sent_cards += 1
@@ -168,13 +209,32 @@ class MonitorRunner:
                     successful_severe.add(item.fingerprint)
             else:
                 report.failed_sends += 1
-            if item.notification_type == "项目日报":
-                daily_results.append(result)
+            if (
+                trigger == "scheduled"
+                and item.notification_type == "项目日报"
+                and item.project is not None
+            ):
+                scheduled_daily_results[
+                    scheduled_daily_key(started_at, item.project)
+                ] = ScheduledDailyResult(
+                    scheduled_date=started_at.date(),
+                    project=item.project,
+                    attempted_at=started_at,
+                    result="success" if result.success else "failed",
+                    error_code=result.error,
+                )
             send_records.append(self._notification_record(item, result, started_at))
             recent_sends.append(self._recent_send(item, result, started_at))
 
         if send_records:
-            self.repository.append_notification_records(send_records)
+            try:
+                self.repository.append_notification_records(send_records)
+            except MemoryError:
+                raise
+            except Exception:
+                return self._finish_runtime_failure(
+                    report, "NOTIFICATION_WRITE_ERROR", dry_run
+                )
 
         active_fingerprints = {
             fingerprint
@@ -185,12 +245,6 @@ class MonitorRunner:
         finished_at = self._now()
         report.finished_at = finished_at
         successful_run = report.failed_sends == 0 and not report.errors
-        scheduled_daily_complete = (
-            trigger != "scheduled"
-            or state.last_scheduled_date == started_at.date()
-            or (daily_results and all(result.success for result in daily_results))
-            or not self._project_groups(risks)
-        )
         next_state = state.model_copy(
             update={
                 "last_successful_run": (
@@ -198,14 +252,22 @@ class MonitorRunner:
                 ),
                 "last_scheduled_date": (
                     started_at.date()
-                    if trigger == "scheduled" and scheduled_daily_complete
+                    if trigger == "scheduled"
                     else state.last_scheduled_date
                 ),
                 "active_fingerprints": active_fingerprints,
+                "scheduled_daily_results": scheduled_daily_results,
                 "recent_sends": (state.recent_sends + recent_sends)[-50:],
             }
         )
-        self.state_store.save(next_state)
+        try:
+            self.state_store.save(next_state)
+        except MemoryError:
+            raise
+        except Exception:
+            return self._finish_runtime_failure(
+                report, "STATE_WRITE_ERROR", dry_run
+            )
         return report
 
     def _authentication_error(self) -> Optional[str]:
@@ -213,36 +275,85 @@ class MonitorRunner:
             status = self.feishu.auth_status()
         except MemoryError:
             raise
-        except Exception as error:
-            return "Feishu authentication failed: {}".format(error)
+        except Exception:
+            return "AUTH_ERROR"
         if not isinstance(status, Mapping):
-            return "Feishu authentication failed: invalid auth response"
-        authenticated = status.get("authenticated")
-        if authenticated is False:
-            return "Feishu authentication failed: not authenticated"
-        status_text = str(status.get("status", "")).strip().lower()
-        if status_text in {"unauthenticated", "not_authenticated", "expired"}:
-            return "Feishu authentication failed: {}".format(status_text)
-        return None
+            return "AUTH_ERROR"
+        if status.get("logged_in") is True:
+            return None
+        if status.get("authenticated") is True:
+            return None
+        status_value = status.get("status")
+        if isinstance(status_value, str) and status_value.strip().lower() in {
+            "success",
+            "authenticated",
+            "logged_in",
+            "ok",
+        }:
+            return None
+        return "AUTH_ERROR"
 
-    def _finish_authentication_failure(
+    def _finish_runtime_failure(
         self,
         report: MonitorRunReport,
-        message: str,
+        error_code: str,
         dry_run: bool,
     ) -> MonitorRunReport:
-        report.errors.append(message)
-        payload = interactive_card("需求进展监控异常", "red", [message])
-        report.payloads = [payload]
+        report.errors.append(error_code)
+        payload = interactive_card(
+            "需求进展监控异常",
+            "red",
+            ["错误码：{}".format(error_code), "本次运行已停止。"],
+        )
+        if dry_run:
+            self._mark_llm_skipped(payload)
+        report.payloads.append(payload)
         if not dry_run:
-            result = self.webhook.send(payload)
+            result = self._safe_send(payload)
             report.send_results.append(result)
             if result.success:
-                report.sent_cards = 1
+                report.sent_cards += 1
             else:
-                report.failed_sends = 1
+                report.failed_sends += 1
         report.finished_at = self._now()
         return report
+
+    def _safe_send(self, payload: Mapping[str, Any]) -> SendResult:
+        try:
+            result = self.webhook.send(payload)
+        except MemoryError:
+            raise
+        except Exception:
+            return SendResult(
+                success=False,
+                attempts=0,
+                format_used=(
+                    "text" if payload.get("msg_type") == "text" else "card"
+                ),
+                error="WEBHOOK_ERROR",
+            )
+        normalized_error = normalize_send_error_code(result.error)
+        if normalized_error == result.error:
+            return result
+        return result.model_copy(update={"error": normalized_error})
+
+    @staticmethod
+    def _mark_llm_skipped(payload: Dict[str, object]) -> None:
+        card = payload.get("card")
+        if not isinstance(card, dict):
+            return
+        header = card.get("header")
+        if not isinstance(header, dict):
+            return
+        title = header.get("title")
+        if not isinstance(title, dict):
+            return
+        content = title.get("content")
+        if not isinstance(content, str):
+            return
+        title["content"] = _truncate_utf8(
+            "LLM skipped｜{}".format(content), 240
+        )
 
     def _load_fixed_rules(self) -> Tuple[FixedRules, str]:
         if self.fixed_rules_loader is not None:
@@ -259,7 +370,10 @@ class MonitorRunner:
         fixed_rules_text: str,
         requirement: Requirement,
         report: MonitorRunReport,
+        dry_run: bool,
     ) -> RequirementRisk:
+        if dry_run:
+            return risk
         if (
             self.llm is None
             or project_config is None
@@ -308,12 +422,14 @@ class MonitorRunner:
     ) -> Tuple[List[_PendingNotification], Dict[str, RequirementRisk]]:
         pending: List[_PendingNotification] = []
         groups = self._project_groups(report.requirement_risks)
-        send_daily = (
-            trigger == "manual"
-            or state.last_scheduled_date != report.started_at.date()
-        )
-        if send_daily:
-            for project, risks in groups.items():
+        for project, risks in groups.items():
+            if (
+                trigger != "manual"
+                and scheduled_daily_key(report.started_at, project)
+                in state.scheduled_daily_results
+            ):
+                continue
+            if trigger in {"manual", "scheduled"}:
                 project_report = report.model_copy(
                     update={
                         "requirement_risks": risks,
@@ -452,7 +568,7 @@ class MonitorRunner:
             expected_format="可计算的需求、节点、阻塞项和项目配置",
             fix_suggestion="检查关联记录与项目配置后重试",
             skip_scope="requirement",
-            message=str(error) or error.__class__.__name__,
+            message="risk_evaluation_error",
         )
 
     @staticmethod
@@ -568,3 +684,14 @@ def severe_fingerprint(risk: RequirementRisk) -> str:
 
 def _datetime_text(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value is not None else None
+
+
+def scheduled_daily_key(value: datetime, project: str) -> str:
+    return "{}|{}".format(value.date().isoformat(), project)
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")

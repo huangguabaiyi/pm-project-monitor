@@ -19,7 +19,7 @@ from requirement_monitor.models import (
     ValidationIssue,
 )
 from requirement_monitor.runner import MonitorRunner
-from requirement_monitor.state import MonitorState
+from requirement_monitor.state import MonitorState, StatePersistenceError
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -153,21 +153,33 @@ class FakeRepository:
         self.requirement_writes = []
         self.node_writes = []
         self.notification_batches = []
+        self.load_error = None
+        self.requirement_write_error = None
+        self.node_write_error = None
+        self.notification_error = None
 
     def load_snapshot(self):
         self.events.append("snapshot")
+        if self.load_error is not None:
+            raise self.load_error
         return self.snapshot, list(self.issues)
 
     def write_requirement_risks(self, risks):
         self.events.append("write_requirements")
+        if self.requirement_write_error is not None:
+            raise self.requirement_write_error
         self.requirement_writes.append(list(risks))
 
     def write_node_risks(self, risks):
         self.events.append("write_nodes")
+        if self.node_write_error is not None:
+            raise self.node_write_error
         self.node_writes.append(list(risks))
 
     def append_notification_records(self, records):
         self.events.append("notification_records")
+        if self.notification_error is not None:
+            raise self.notification_error
         self.notification_batches.append(list(records))
 
 
@@ -218,13 +230,19 @@ class FakeStateStore:
         self.events = events
         self.state = state or MonitorState()
         self.saved = []
+        self.load_error = None
+        self.save_error = None
 
     def load(self):
         self.events.append("state_load")
+        if self.load_error is not None:
+            raise self.load_error
         return self.state.model_copy(deep=True)
 
     def save(self, state):
         self.events.append("state_save")
+        if self.save_error is not None:
+            raise self.save_error
         self.state = state.model_copy(deep=True)
         self.saved.append(self.state)
 
@@ -245,9 +263,12 @@ class FakeDependencies:
         self.state_store = FakeStateStore(self.events)
         self.level = level
         self.evaluator_calls = []
+        self.rules_error = None
 
     def load_rules(self):
         self.events.append("rules")
+        if self.rules_error is not None:
+            raise self.rules_error
         return make_rules(), "服务端周二周四上线，17:30 截止"
 
     def evaluate(self, requirement, nodes, blockers, fixed_rules, now, project_config):
@@ -378,6 +399,66 @@ def test_scheduled_run_does_not_repeat_daily_cards_on_same_local_date():
     assert second.sent_cards == 0
     assert len(dependencies.webhook.payloads) == 1
     assert dependencies.state_store.state.last_scheduled_date == NOW.date()
+    scheduled = dependencies.state_store.state.scheduled_daily_results[
+        "2026-07-25|米家"
+    ]
+    assert scheduled.result == "success"
+
+
+def test_failed_scheduled_project_is_not_automatically_retried_same_day():
+    dependencies = FakeDependencies()
+    dependencies.webhook.results = [
+        SendResult(
+            success=False,
+            attempts=4,
+            format_used="card",
+            error="service_error",
+        )
+    ]
+
+    first = dependencies.runner().run(trigger="scheduled")
+    second = dependencies.runner().run(trigger="scheduled")
+
+    assert first.failed_sends == 1
+    assert second.sent_cards == 0
+    assert second.failed_sends == 0
+    assert len(dependencies.webhook.payloads) == 1
+    scheduled = dependencies.state_store.state.scheduled_daily_results[
+        "2026-07-25|米家"
+    ]
+    assert scheduled.result == "failed"
+    assert scheduled.error_code == "service_error"
+
+
+def test_scheduled_deduplication_is_per_date_and_project():
+    dependencies = FakeDependencies()
+
+    first = dependencies.runner().run(trigger="scheduled")
+    second_requirement = make_requirement("REQ-002", project="IoT平台")
+    dependencies.repository.snapshot.requirements.append(second_requirement)
+    dependencies.repository.snapshot.nodes.append(make_node("REQ-002"))
+    dependencies.repository.snapshot.project_configs.append(make_config("IoT平台"))
+    second = dependencies.runner().run(trigger="scheduled")
+
+    assert first.sent_cards == 1
+    assert second.sent_cards == 1
+    assert len(dependencies.webhook.payloads) == 2
+    assert "IoT平台" in str(dependencies.webhook.payloads[1])
+    assert set(dependencies.state_store.state.scheduled_daily_results) == {
+        "2026-07-25|米家",
+        "2026-07-25|IoT平台",
+    }
+
+
+def test_manual_run_can_resend_after_scheduled_attempt():
+    dependencies = FakeDependencies()
+
+    scheduled = dependencies.runner().run(trigger="scheduled")
+    manual = dependencies.runner().run(trigger="manual")
+
+    assert scheduled.sent_cards == 1
+    assert manual.sent_cards == 1
+    assert len(dependencies.webhook.payloads) == 2
 
 
 def test_severe_fingerprint_is_deduplicated_until_resolution_or_change():
@@ -433,6 +514,7 @@ def test_changed_severe_fingerprint_sends_again():
 
 def test_dry_run_returns_payloads_without_side_effects():
     dependencies = FakeDependencies(level=RiskLevel.SEVERE, issues=[error_issue()])
+    dependencies.repository.snapshot.requirements[0].name = "超长需求" * 200
 
     report = dependencies.runner().run(trigger="manual", dry_run=True)
 
@@ -445,6 +527,11 @@ def test_dry_run_returns_payloads_without_side_effects():
     assert dependencies.state_store.saved == []
     assert "write_requirements" not in dependencies.events
     assert "state_load" in dependencies.events
+    assert not any(event.startswith("llm:") for event in dependencies.events)
+    assert report.llm_attempted is False
+    assert report.llm_skipped is True
+    assert report.requirement_risks[0].llm_enrichment is None
+    assert all("LLM skipped" in str(payload) for payload in report.payloads)
 
 
 def test_state_only_tracks_successful_severe_sends_after_notification_write():
@@ -479,10 +566,52 @@ def test_authentication_failure_stops_table_work_and_returns_exception_payload()
 
     assert report.processed_requirements == 0
     assert report.sent_cards == 1
-    assert report.errors == ["Feishu authentication failed: not logged in"]
+    assert report.errors == ["AUTH_ERROR"]
     assert "监控异常" in str(dependencies.webhook.payloads[0])
     assert dependencies.repository.requirement_writes == []
     assert dependencies.state_store.saved == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"logged_in": True},
+        {"authenticated": True},
+        {"status": "success"},
+        {"status": "authenticated"},
+    ],
+)
+def test_authentication_requires_an_explicit_known_success(status):
+    dependencies = FakeDependencies()
+    dependencies.feishu.status = status
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.processed_requirements == 1
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {},
+        {"status": "unknown"},
+        {"status": "ready"},
+        {"logged_in": False},
+        {"authenticated": False},
+        {"logged_in": "true"},
+        {"data": {"logged_in": True}},
+    ],
+)
+def test_empty_unknown_or_failed_auth_status_stops_run(status):
+    dependencies = FakeDependencies()
+    dependencies.feishu.status = status
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.errors == ["AUTH_ERROR"]
+    assert report.sent_cards == 1
+    assert dependencies.events == ["auth", "send"]
+    assert "AUTH_ERROR" in str(dependencies.webhook.payloads[0])
 
 
 def test_default_runner_clock_is_timezone_aware():
@@ -504,16 +633,71 @@ def test_default_runner_clock_is_timezone_aware():
     assert report.started_at.utcoffset() is not None
 
 
-def test_state_is_not_saved_when_notification_record_write_fails():
+def test_notification_record_failure_is_normalized_and_state_is_not_saved():
     dependencies = FakeDependencies()
+    dependencies.repository.notification_error = RuntimeError(
+        "bitable write failed sk-secret"
+    )
 
-    def fail_notifications(records):
-        dependencies.events.append("notification_records")
-        raise RuntimeError("bitable write failed")
-
-    dependencies.repository.append_notification_records = fail_notifications
-
-    with pytest.raises(RuntimeError, match="bitable write failed"):
-        dependencies.runner().run(trigger="manual")
+    report = dependencies.runner().run(trigger="manual")
 
     assert dependencies.state_store.saved == []
+    assert report.errors == ["NOTIFICATION_WRITE_ERROR"]
+    assert "sk-secret" not in str(report)
+    assert len(dependencies.webhook.payloads) == 2
+    assert "NOTIFICATION_WRITE_ERROR" in str(dependencies.webhook.payloads[-1])
+
+
+@pytest.mark.parametrize(
+    ("phase", "error_code"),
+    [
+        ("rules", "FIXED_RULES_ERROR"),
+        ("snapshot", "SNAPSHOT_ERROR"),
+        ("state", "STATE_ERROR"),
+        ("requirement_write", "SYSTEM_WRITE_ERROR"),
+        ("node_write", "SYSTEM_WRITE_ERROR"),
+    ],
+)
+def test_run_level_failure_stops_daily_and_sends_one_sanitized_system_error(
+    phase, error_code
+):
+    webhook_token = "https://open.feishu.cn/open-apis/bot/v2/hook/webhook-secret"
+    api_key = "sk-super-secret-api-key"
+    dependencies = FakeDependencies()
+    failure = RuntimeError("{} {}".format(webhook_token, api_key))
+    if phase == "rules":
+        dependencies.rules_error = failure
+    elif phase == "snapshot":
+        dependencies.repository.load_error = failure
+    elif phase == "state":
+        dependencies.state_store.load_error = failure
+    elif phase == "requirement_write":
+        dependencies.repository.requirement_write_error = failure
+    else:
+        dependencies.repository.node_write_error = failure
+
+    report = dependencies.runner().run(trigger="manual")
+
+    rendered = "{} {}".format(report, dependencies.webhook.payloads)
+    assert report.errors == [error_code]
+    assert report.sent_cards == 1
+    assert len(dependencies.webhook.payloads) == 1
+    assert error_code in rendered
+    assert webhook_token not in rendered
+    assert api_key not in rendered
+    assert dependencies.repository.notification_batches == []
+    assert dependencies.state_store.saved == []
+
+
+def test_state_save_failure_is_normalized_and_does_not_escape_secret():
+    dependencies = FakeDependencies()
+    dependencies.state_store.save_error = StatePersistenceError(
+        "STATE_WRITE_FAILED sk-secret"
+    )
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.errors == ["STATE_WRITE_ERROR"]
+    assert "sk-secret" not in str(report)
+    assert len(dependencies.webhook.payloads) == 2
+    assert "STATE_WRITE_ERROR" in str(dependencies.webhook.payloads[-1])
