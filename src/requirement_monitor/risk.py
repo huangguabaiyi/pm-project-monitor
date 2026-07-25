@@ -157,12 +157,14 @@ def evaluate_requirement(
         raise ValueError("now must be timezone-aware")
 
     effective = resolve_effective_rules(fixed_rules, project_config, base_configs)
+    configured_stage_names = _configured_stage_names(effective)
     relevant_nodes = [
         node
         for node in nodes
         if node.requirement_id == requirement.requirement_id
         and node.name not in effective.disabled_stages
-        and _configured_stage_name(node) not in effective.disabled_stages
+        and _configured_stage_name(node, configured_stage_names)
+        not in effective.disabled_stages
         and _test_role_enabled(node, effective)
     ]
     relevant_blockers = [
@@ -538,9 +540,10 @@ def _build_events(
     pv1_order = rules.process_order.get("PV 测试第一轮", _PV1_ORDER)
     pv2_order = rules.process_order.get("PV 测试第二轮", _PV1_ORDER + 1)
     regression_order = rules.process_order.get("线上回归", _REGRESSION_ORDER)
+    configured_stage_names = _configured_stage_names(rules)
 
     for node in nodes:
-        configured_stage = _configured_stage_name(node)
+        configured_stage = _configured_stage_name(node, configured_stage_names)
         if (
             rules.has_stage_configuration
             and configured_stage in rules.disabled_stages
@@ -555,6 +558,7 @@ def _build_events(
             rules.regression_days,
             rules.duration_mode,
             rules.process_order,
+            configured_stage,
         )
         events.append(_Event(order=order, duration=duration, label=label, node=node))
 
@@ -618,6 +622,7 @@ def _node_stage(
     regression_days: int,
     duration_mode: DayMode,
     process_order: Mapping[str, int],
+    configured_stage: Optional[str] = None,
 ) -> Tuple[_PhaseRank, str, int]:
     normalized = "".join(node.name.upper().split())
     round_stage = _test_round_stage(node, normalized)
@@ -631,11 +636,14 @@ def _node_stage(
                 if round_number == 2
                 else _extra_round_duration(node, duration_mode)
             )
-            stage_name = "AT 测试第{}轮".format(
-                "一" if round_number == 1 else "二"
+            stage_name = configured_stage or _round_stage_name(family, round_number)
+            fallback_order = (
+                _AT1_ORDER
+                if round_number == 1
+                else process_order.get("AT 测试第二轮", _AT1_ORDER + 1)
             )
             return (
-                process_order.get(stage_name, _AT1_ORDER + round_number - 1),
+                process_order.get(stage_name, fallback_order),
                 round_number,
             ), f"AT{round_number}", duration
         duration = (
@@ -645,11 +653,14 @@ def _node_stage(
             if round_number == 2
             else _extra_round_duration(node, duration_mode)
         )
-        stage_name = "PV 测试第{}轮".format(
-            "一" if round_number == 1 else "二"
+        stage_name = configured_stage or _round_stage_name(family, round_number)
+        fallback_order = (
+            _PV1_ORDER
+            if round_number == 1
+            else process_order.get("PV 测试第二轮", _PV1_ORDER + 1)
         )
         return (
-            process_order.get(stage_name, _PV1_ORDER + round_number - 1),
+            process_order.get(stage_name, fallback_order),
             round_number,
         ), f"PV{round_number}", duration
     if "线上回归" in node.name:
@@ -669,14 +680,27 @@ def _node_stage(
 def _test_round_stage(
     node: DeliveryNode, normalized_name: str
 ) -> Optional[Tuple[str, int]]:
-    numeric_match = re.search(r"(AT|PV)(\d+)", normalized_name)
+    return _round_stage_from_name(node.name, normalized_name)
+
+
+def _round_stage_from_name(
+    name: str, normalized_name: Optional[str] = None
+) -> Optional[Tuple[str, int]]:
+    normalized = normalized_name or "".join(name.upper().split())
+    numeric_match = re.search(
+        r"(AT|PV)(?:测试)?第(\d+)轮", normalized
+    )
+    if numeric_match is None:
+        numeric_match = re.search(r"(AT|PV)(\d+)(?:轮)?", normalized)
     if numeric_match is not None:
         return numeric_match.group(1), int(numeric_match.group(2))
 
     for family in ("AT", "PV"):
-        if family not in normalized_name:
+        if family not in normalized:
             continue
-        chinese_match = re.search(r"第([一二三四五六七八九十]+)轮", node.name)
+        chinese_match = re.search(
+            r"第([一二三四五六七八九十]+)轮", normalized
+        )
         if chinese_match is not None:
             round_number = _chinese_round_number(chinese_match.group(1))
             if round_number is not None:
@@ -730,15 +754,30 @@ def _matching_process_name(node: DeliveryNode) -> str:
     return node.name
 
 
-def _configured_stage_name(node: DeliveryNode) -> str:
+def _round_stage_name(family: str, round_number: int) -> str:
+    chinese_rounds = {1: "一", 2: "二"}
+    value = chinese_rounds.get(round_number, str(round_number))
+    return f"{family} 测试第{value}轮"
+
+
+def _configured_stage_names(rules: EffectiveRules) -> Tuple[str, ...]:
+    return tuple(rules.process_order) + tuple(sorted(rules.disabled_stages))
+
+
+def _configured_stage_name(
+    node: DeliveryNode, configured_names: Iterable[str] = ()
+) -> str:
     normalized = "".join(node.name.upper().split())
     round_stage = _test_round_stage(node, normalized)
     if round_stage is not None:
-        family, round_number = round_stage
-        if family == "AT" and round_number in (1, 2):
-            return "AT 测试第{}轮".format("一" if round_number == 1 else "二")
-        if family == "PV" and round_number in (1, 2):
-            return "PV 测试第{}轮".format("一" if round_number == 1 else "二")
+        names = tuple(configured_names)
+        for name in names:
+            if "".join(name.upper().split()) == normalized:
+                return name
+        for name in names:
+            if _round_stage_from_name(name) == round_stage:
+                return name
+        return _round_stage_name(*round_stage)
     return _matching_process_name(node)
 
 

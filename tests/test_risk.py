@@ -303,6 +303,85 @@ def test_each_test_round_and_custom_stage_use_their_own_configured_order(rules):
     ]
 
 
+def test_extra_at_round_uses_its_real_configured_stage_order(rules):
+    configs = [
+        base_config("环节", "AT 测试第一轮", 10),
+        base_config("环节", "定制验收", 20),
+        base_config("环节", "AT 测试第二轮", 30),
+        base_config("环节", "定制发布评审", 40),
+        base_config("环节", "AT 测试第3轮", 50),
+    ]
+    effective = resolve_effective_rules(rules, None, configs)
+    nodes = [
+        make_node("AT 测试第三轮", work_type="测试"),
+        make_node("定制发布评审", work_type="公共环节"),
+        make_node("AT 测试第二轮", work_type="测试"),
+        make_node("定制验收", work_type="公共环节"),
+        make_node("AT 测试第一轮", work_type="测试"),
+    ]
+
+    events = risk_module._build_events("客户端", nodes, effective)
+
+    assert [event.label for event in events if event.node is not None] == [
+        "AT1",
+        "定制验收",
+        "AT2",
+        "定制发布评审",
+        "AT3",
+    ]
+
+
+def test_extra_pv_round_uses_its_real_configured_stage_order(rules):
+    configs = [
+        base_config("环节", "PV 测试第一轮", 10),
+        base_config("环节", "定制验收", 20),
+        base_config("环节", "PV 测试第二轮", 30),
+        base_config("环节", "定制发布评审", 40),
+        base_config("环节", "PV 测试第三轮", 50),
+    ]
+    effective = resolve_effective_rules(rules, None, configs)
+    nodes = [
+        make_node("PV 测试第3轮", work_type="测试"),
+        make_node("定制发布评审", work_type="公共环节"),
+        make_node("PV 测试第二轮", work_type="测试"),
+        make_node("定制验收", work_type="公共环节"),
+        make_node("PV 测试第一轮", work_type="测试"),
+    ]
+
+    events = risk_module._build_events("客户端", nodes, effective)
+
+    assert [event.label for event in events if event.node is not None] == [
+        "PV1",
+        "定制验收",
+        "PV2",
+        "定制发布评审",
+        "PV3",
+    ]
+
+
+def test_disabled_extra_test_round_config_excludes_matching_node(rules):
+    configs = [
+        base_config("环节", "AT 测试第一轮", 10),
+        base_config("环节", "AT 测试第3轮", 20, enabled=False),
+        base_config("环节", "PV 测试第一轮", 30),
+        base_config("环节", "PV 测试第三轮", 40, enabled=False),
+    ]
+    effective = resolve_effective_rules(rules, None, configs)
+    nodes = [
+        make_node("AT 测试第一轮", work_type="测试"),
+        make_node("AT 测试第三轮", work_type="测试"),
+        make_node("PV 测试第一轮", work_type="测试"),
+        make_node("PV 测试第3轮", work_type="测试"),
+    ]
+
+    events = risk_module._build_events("客户端", nodes, effective)
+
+    assert [event.label for event in events if event.node is not None] == [
+        "AT1",
+        "PV1",
+    ]
+
+
 def test_disabled_domain_test_role_excludes_only_test_nodes(rules):
     configs = [
         base_config("测试角色", "客户端测试", 10, enabled=False),

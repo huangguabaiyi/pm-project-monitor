@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 from typing import Annotated, Any, Dict, Iterable, List, Literal, Optional, Tuple
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import (
@@ -39,19 +39,47 @@ _LEVELS = {
     "严重": RiskLevel.SEVERE,
 }
 
-_EMAIL_PATTERN = re.compile(
-    r"(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9.-])",
-    re.I,
-)
-_PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
-_IDENTITY_PATTERN = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
-_OPEN_ID_PATTERN = re.compile(r"\bou[-_][A-Za-z0-9_-]+\b")
 _URL_PATTERN = re.compile(r"https?://[^\s，。；;]+")
-_ROLE_NAME_PATTERN = re.compile(
-    r"((?:负责人|联系人)\s*[:：]?\s*)[\u4e00-\u9fff]{2,4}"
+_DATE_PATTERN = re.compile(
+    r"(?<!\d)(\d{4})[年./-](\d{1,2})[月./-](\d{1,2})日?(?!\d)"
 )
-_BY_NAME_PATTERN = re.compile(
-    r"(由\s*)[\u4e00-\u9fff]{2,4}(?=\s*(?:负责|处理|跟进|对接|确认))"
+_SHORT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日(?!\d)")
+_DAY_COUNT_PATTERN = re.compile(
+    r"(?<![\dA-Za-z])\d+(?:\.\d+)?\s*(?:个)?(?:工作日|自然日|天)(?![\dA-Za-z])"
+)
+_PERCENT_PATTERN = re.compile(r"(?<![\dA-Za-z])\d+(?:\.\d+)?\s*[%％]")
+_SAFE_BUSINESS_KEYWORDS = (
+    "进行中",
+    "未开始",
+    "未完成",
+    "已完成",
+    "开发",
+    "测试",
+    "联调",
+    "接口",
+    "阻塞",
+    "延期",
+    "等待",
+    "修复",
+    "提测",
+    "回归",
+    "合板",
+    "上线",
+    "排期",
+    "资源",
+    "依赖",
+    "完成",
+    "进行",
+    "风险",
+    "缓冲",
+    "逾期",
+    "超期",
+    "暂停",
+    "取消",
+    "关闭",
+)
+_RESIDUE_PATTERN = re.compile(
+    r"[\s，。；;、：:,.!?！？（）()\[\]【】<>《》“”‘’/\\|_-]+"
 )
 
 
@@ -180,7 +208,6 @@ class LLMClient:
     def _anonymous_risk(
         risk: RequirementRisk, project_description: Any = ""
     ) -> Dict[str, Any]:
-        sensitive_values = LLMClient._sensitive_values(risk)
         project_context = risk.project_notes
         requirement_context = risk.requirement_notes
         if (
@@ -207,14 +234,14 @@ class LLMClient:
             "affected_domain_refs": [
                 _stable_ref("domain", domain) for domain in risk.affected_domains
             ],
-            "reasons": _sanitize_texts(risk.reasons, sensitive_values),
-            "actions": _sanitize_texts(risk.actions, sensitive_values),
+            "reasons": _safe_signal_summaries(risk.reasons, "风险原因"),
+            "actions": _safe_signal_summaries(risk.actions, "建议动作"),
             "context": {
-                "project_notes": _sanitize_text(
-                    project_context, sensitive_values
+                "project_notes": _safe_signal_summary(
+                    project_context, "项目补充"
                 ),
-                "requirement_notes": _sanitize_text(
-                    requirement_context, sensitive_values
+                "requirement_notes": _safe_signal_summary(
+                    requirement_context, "需求补充"
                 ),
             },
             "nodes": [
@@ -235,11 +262,11 @@ class LLMClient:
                         else None
                     ),
                     "buffer_days": node.buffer_days,
-                    "reasons": _sanitize_texts(
-                        node.reasons, sensitive_values
+                    "reasons": _safe_signal_summaries(
+                        node.reasons, "节点风险"
                     ),
-                    "progress": _sanitize_text(
-                        node.progress_note, sensitive_values
+                    "progress": _safe_signal_summary(
+                        node.progress_note, "节点进展"
                     ),
                 }
                 for node in risk.node_risks
@@ -254,41 +281,17 @@ class LLMClient:
                         if blocker.actual_resolution_at
                         else None
                     ),
-                    "status": blocker.status,
+                    "status": _safe_signal_summary(
+                        blocker.status, "阻塞状态"
+                    ),
                     "affects_merge": blocker.affects_merge,
-                    "resolution_context": _sanitize_text(
-                        blocker.resolution_note, sensitive_values
+                    "resolution_context": _safe_signal_summary(
+                        blocker.resolution_note, "阻塞说明"
                     ),
                 }
                 for blocker in risk.blockers
             ],
         }
-
-    @staticmethod
-    def _sensitive_values(risk: RequirementRisk) -> List[str]:
-        values = [
-            risk.requirement_name,
-            risk.project,
-            risk.project_owner_id,
-            risk.project_owner_name,
-        ]
-        for person in risk.sensitive_people:
-            values.extend((person.open_id, person.name))
-        for node in risk.node_risks:
-            values.extend(
-                (node.node_name, node.owner_id, node.owner_name)
-            )
-        for blocker in risk.blockers:
-            values.extend(
-                (blocker.title, blocker.owner_id, blocker.owner_name)
-            )
-        return list(
-            dict.fromkeys(
-                value.strip()
-                for value in values
-                if isinstance(value, str) and value.strip()
-            )
-        )
 
     @staticmethod
     def _parse_response(
@@ -358,42 +361,84 @@ def _stable_ref(prefix: str, *values: str) -> str:
     return "{}_{}".format(prefix, hashlib.sha256(encoded).hexdigest()[:16])
 
 
-def _sanitize_texts(
-    values: Iterable[str], sensitive_values: Iterable[str]
-) -> List[str]:
+def _safe_signal_summaries(values: Iterable[str], label: str) -> List[str]:
     return [
-        sanitized
-        for sanitized in (
-            _sanitize_text(value, sensitive_values) for value in values
+        summary
+        for summary in (
+            _safe_signal_summary(value, label) for value in values
         )
-        if sanitized
+        if summary
     ]
 
 
-def _sanitize_text(value: Any, sensitive_values: Iterable[str]) -> str:
+def _safe_signal_summary(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
-    sanitized = value
-    for sensitive in sorted(set(sensitive_values), key=len, reverse=True):
-        sanitized = sanitized.replace(sensitive, "[REDACTED]")
-    sanitized = _EMAIL_PATTERN.sub("[REDACTED]", sanitized)
-    sanitized = _PHONE_PATTERN.sub("[REDACTED]", sanitized)
-    sanitized = _IDENTITY_PATTERN.sub("[REDACTED]", sanitized)
-    sanitized = _OPEN_ID_PATTERN.sub("[REDACTED]", sanitized)
-    sanitized = _URL_PATTERN.sub(_sanitize_url, sanitized)
-    sanitized = _ROLE_NAME_PATTERN.sub(r"\1[REDACTED]", sanitized)
-    sanitized = _BY_NAME_PATTERN.sub(r"\1[REDACTED]", sanitized)
-    return sanitized.strip()
-
-
-def _sanitize_url(match: re.Match) -> str:
-    value = match.group(0)
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return "[REDACTED]"
-    query = "[REDACTED]" if parsed.query else ""
-    fragment = "[REDACTED]" if parsed.fragment else ""
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, query, fragment)
+    sanitized = _URL_PATTERN.sub("[URL]", value)
+    signals: List[Tuple[int, int, str]] = []
+    signals.extend(
+        (match.start(), match.end(), "[URL]")
+        for match in re.finditer(re.escape("[URL]"), sanitized)
     )
+    signals.extend(
+        (
+            match.start(),
+            match.end(),
+            "{:04d}-{:02d}-{:02d}".format(
+                int(match.group(1)), int(match.group(2)), int(match.group(3))
+            ),
+        )
+        for match in _DATE_PATTERN.finditer(sanitized)
+    )
+    signals.extend(
+        (
+            match.start(),
+            match.end(),
+            "{:02d}-{:02d}".format(
+                int(match.group(1)), int(match.group(2))
+            ),
+        )
+        for match in _SHORT_DATE_PATTERN.finditer(sanitized)
+    )
+    signals.extend(
+        (match.start(), match.end(), re.sub(r"\s+", "", match.group(0)))
+        for match in _DAY_COUNT_PATTERN.finditer(sanitized)
+    )
+    signals.extend(
+        (
+            match.start(),
+            match.end(),
+            re.sub(r"\s+", "", match.group(0)).replace("％", "%"),
+        )
+        for match in _PERCENT_PATTERN.finditer(sanitized)
+    )
+    for keyword in _SAFE_BUSINESS_KEYWORDS:
+        signals.extend(
+            (match.start(), match.end(), keyword)
+            for match in re.finditer(re.escape(keyword), sanitized)
+        )
+
+    selected: List[Tuple[int, int, str]] = []
+    last_end = -1
+    for start, end, token in sorted(
+        signals, key=lambda item: (item[0], -(item[1] - item[0]))
+    ):
+        if start < last_end:
+            continue
+        selected.append((start, end, token))
+        last_end = end
+
+    residue_parts: List[str] = []
+    cursor = 0
+    for start, end, _ in selected:
+        residue_parts.append(sanitized[cursor:start])
+        cursor = end
+    residue_parts.append(sanitized[cursor:])
+    residue = _RESIDUE_PATTERN.sub("", "".join(residue_parts))
+
+    tokens = list(dict.fromkeys(token for _, _, token in selected))
+    if residue:
+        tokens.append("[REDACTED]")
+    if not tokens:
+        tokens.append("[REDACTED]")
+    return f"{label}：{'；'.join(tokens)}"
