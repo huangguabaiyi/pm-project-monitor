@@ -625,6 +625,7 @@ def test_restart_rewrites_runtime_snapshot_with_current_environment(
         ["restart", "--config", str(config_path)],
         plist_path=plist_path,
         status_fn=lambda: False,
+        disabled_status_fn=lambda: True,
         bootout_fn=lambda: restart_calls.append("bootout"),
         disable_fn=lambda: restart_calls.append("disable"),
         enable_fn=lambda: restart_calls.append("enable"),
@@ -638,6 +639,165 @@ def test_restart_rewrites_runtime_snapshot_with_current_environment(
     assert restart_exit == 0
     assert runtime_data["webhook_url"] == replacement_url
     assert restart_calls == ["bootout", "disable", "enable", "bootstrap"]
+
+
+def test_restart_failure_restores_loaded_service_and_old_files(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    state = {"loaded": True, "disabled": False}
+    plist_path = tmp_path / "monitor.plist"
+    old_plist = "old plist"
+    plist_path.write_text(old_plist, encoding="utf-8")
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_path.parent.mkdir()
+    old_runtime = b'{"old":"runtime"}'
+    runtime_path.write_bytes(old_runtime)
+    calls = []
+
+    def bootout_agent():
+        calls.append("bootout")
+        state["loaded"] = False
+
+    def loaded_status():
+        calls.append("loaded-status")
+        return state["loaded"]
+
+    def disabled_status():
+        calls.append("disabled-status")
+        return state["disabled"]
+
+    def disable_agent():
+        calls.append("disable")
+        state["disabled"] = True
+
+    def enable_agent():
+        calls.append("enable")
+        state["disabled"] = False
+
+    def bootstrap_agent(path):
+        content = Path(path).read_text(encoding="utf-8")
+        calls.append(("bootstrap", content))
+        if content != old_plist:
+            state["loaded"] = True
+            raise LaunchdError("new bootstrap failed", stderr="new failure")
+        state["loaded"] = True
+
+    exit_code = cli.main(
+        ["restart", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=loaded_status,
+        disabled_status_fn=disabled_status,
+        bootout_fn=bootout_agent,
+        disable_fn=disable_agent,
+        enable_fn=enable_agent,
+        bootstrap_fn=bootstrap_agent,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert plist_path.read_text(encoding="utf-8") == old_plist
+    assert runtime_path.read_bytes() == old_runtime
+    assert state == {"loaded": True, "disabled": False}
+    assert calls[:3] == ["loaded-status", "disabled-status", "bootout"]
+    assert calls[-3:] == ["bootout", "enable", ("bootstrap", old_plist)]
+    assert "runtime-webhook-secret" not in captured.out + captured.err
+
+
+def test_restart_failure_keeps_previously_stopped_disabled_service_stopped(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    state = {"loaded": False, "disabled": True}
+    plist_path = tmp_path / "monitor.plist"
+    old_plist = "old stopped plist"
+    plist_path.write_text(old_plist, encoding="utf-8")
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_path.parent.mkdir()
+    old_runtime = b'{"old":"stopped-runtime"}'
+    runtime_path.write_bytes(old_runtime)
+    bootstrapped_contents = []
+
+    def bootstrap_agent(path):
+        content = Path(path).read_text(encoding="utf-8")
+        bootstrapped_contents.append(content)
+        if content == old_plist:
+            state["loaded"] = True
+            return
+        state["loaded"] = True
+        raise LaunchdError("new bootstrap failed", stderr="new failure")
+
+    exit_code = cli.main(
+        ["restart", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: state["loaded"],
+        disabled_status_fn=lambda: state["disabled"],
+        bootout_fn=lambda: state.update(loaded=False),
+        disable_fn=lambda: state.update(disabled=True),
+        enable_fn=lambda: state.update(disabled=False),
+        bootstrap_fn=bootstrap_agent,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert plist_path.read_text(encoding="utf-8") == old_plist
+    assert runtime_path.read_bytes() == old_runtime
+    assert state == {"loaded": False, "disabled": True}
+    assert old_plist not in bootstrapped_contents
+
+
+def test_restart_reports_original_and_restore_failures_without_secrets(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", "runtime-llm-secret")
+    plist_path = tmp_path / "monitor.plist"
+    old_plist = "old plist"
+    plist_path.write_text(old_plist, encoding="utf-8")
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_path.parent.mkdir()
+    runtime_path.write_text('{"old":"runtime"}', encoding="utf-8")
+
+    def bootstrap_agent(path):
+        content = Path(path).read_text(encoding="utf-8")
+        if content == old_plist:
+            raise LaunchdError(
+                "rollback bootstrap failed",
+                stderr="rollback failure runtime-llm-secret",
+            )
+        raise LaunchdError(
+            "new bootstrap failed",
+            stderr="new failure runtime-webhook-secret",
+        )
+
+    exit_code = cli.main(
+        ["restart", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: True,
+        disabled_status_fn=lambda: False,
+        bootout_fn=lambda: None,
+        disable_fn=lambda: None,
+        enable_fn=lambda: None,
+        bootstrap_fn=bootstrap_agent,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert "restart error" in rendered
+    assert "rollback error" in rendered
+    assert "new failure" in rendered
+    assert "rollback failure" in rendered
+    assert "runtime-webhook-secret" not in rendered
+    assert "runtime-llm-secret" not in rendered
 
 
 def test_stop_retains_runtime_snapshot(tmp_path):

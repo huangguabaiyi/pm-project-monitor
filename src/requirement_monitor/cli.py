@@ -19,6 +19,7 @@ from requirement_monitor.launchd import (
     disable,
     enable,
     in_scheduled_window,
+    is_disabled as launchd_is_disabled,
     render_plist,
     status as launchd_status,
     write_plist,
@@ -380,11 +381,82 @@ def _stop(
     *,
     bootout_fn: Optional[Callable[[], Any]],
     disable_fn: Optional[Callable[[], Any]],
+    announce: bool = True,
 ) -> int:
     (bootout_fn or bootout)()
     (disable_fn or disable)()
-    print("stopped")
+    if announce:
+        print("stopped")
     return EXIT_OK
+
+
+def _restart(
+    settings: Any,
+    config_path: Path,
+    *,
+    plist_path: Optional[Path],
+    write_plist_fn: Optional[Callable[[Path, str], Any]],
+    enable_fn: Optional[Callable[[], Any]],
+    bootstrap_fn: Optional[Callable[[Path], Any]],
+    bootout_fn: Optional[Callable[[], Any]],
+    disable_fn: Optional[Callable[[], Any]],
+    system_timezone_fn: Optional[Callable[[], Any]],
+    status_fn: Optional[Callable[[], bool]],
+    disabled_status_fn: Optional[Callable[[], bool]],
+) -> int:
+    target = Path(plist_path or default_plist_path()).expanduser()
+    state_dir, _, _ = _settings_paths(settings, config_path)
+    runtime_config_path = state_dir / RUNTIME_CONFIG_FILENAME
+    previous_plist = _snapshot_plist(target)
+    previous_runtime_config = _snapshot_file(runtime_config_path)
+    previous_loaded = bool((status_fn or launchd_status)())
+    previous_disabled = bool(
+        (disabled_status_fn or launchd_is_disabled)()
+    )
+    sensitive_values = _sensitive_values(
+        settings,
+        previous_runtime_config,
+    )
+    try:
+        _stop(
+            bootout_fn=bootout_fn,
+            disable_fn=disable_fn,
+            announce=False,
+        )
+        return _start(
+            settings,
+            config_path,
+            plist_path=target,
+            write_plist_fn=write_plist_fn,
+            enable_fn=enable_fn,
+            bootstrap_fn=bootstrap_fn,
+            bootout_fn=bootout_fn,
+            disable_fn=disable_fn,
+            system_timezone_fn=system_timezone_fn,
+            status_fn=lambda: False,
+        )
+    except Exception as restart_error:
+        try:
+            _restore_restart_transaction(
+                target,
+                previous_plist,
+                runtime_config_path,
+                previous_runtime_config,
+                previous_loaded=previous_loaded,
+                previous_disabled=previous_disabled,
+                write_plist_fn=write_plist_fn or write_plist,
+                bootout_fn=bootout_fn or bootout,
+                enable_fn=enable_fn or enable,
+                bootstrap_fn=bootstrap_fn or bootstrap,
+                disable_fn=disable_fn or disable,
+            )
+        except Exception as rollback_error:
+            raise _merge_restart_errors(
+                restart_error,
+                rollback_error,
+                sensitive_values,
+            ) from rollback_error
+        raise _restart_failure(restart_error, sensitive_values) from restart_error
 
 
 def _snapshot_plist(path: Path):
@@ -397,6 +469,80 @@ def _snapshot_file(path: Path):
         return path.read_bytes(), stat_result.st_mode & 0o777
     except FileNotFoundError:
         return None
+
+
+def _restore_restart_transaction(
+    plist_path: Path,
+    plist_snapshot,
+    runtime_config_path: Path,
+    runtime_config_snapshot,
+    *,
+    previous_loaded: bool,
+    previous_disabled: bool,
+    write_plist_fn,
+    bootout_fn,
+    enable_fn,
+    bootstrap_fn,
+    disable_fn,
+) -> None:
+    restore_errors = []
+    try:
+        bootout_fn()
+    except Exception as error:
+        restore_errors.append(("launchd unload", error))
+    try:
+        _restore_private_file_strict(
+            runtime_config_path,
+            runtime_config_snapshot,
+        )
+    except Exception as error:
+        restore_errors.append(("runtime config", error))
+    try:
+        _restore_plist_strict(plist_path, plist_snapshot, write_plist_fn)
+    except Exception as error:
+        restore_errors.append(("plist", error))
+
+    if not restore_errors:
+        try:
+            if previous_loaded:
+                enable_fn()
+                bootstrap_fn(plist_path)
+            elif previous_disabled:
+                disable_fn()
+            else:
+                enable_fn()
+        except Exception as error:
+            restore_errors.append(("launchd state", error))
+
+    if restore_errors:
+        details = "\n".join(
+            "{} restore failed: {}".format(label, _error_detail(error))
+            for label, error in restore_errors
+        )
+        raise LaunchdError("restart rollback failed", stderr=details)
+
+
+def _restore_plist_strict(path: Path, snapshot, write_plist_fn) -> None:
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    content, _ = snapshot
+    text = content.decode("utf-8")
+    try:
+        write_plist_fn(path, text)
+    except Exception:
+        if write_plist_fn is write_plist:
+            raise
+        write_plist(path, text)
+    os.chmod(path, 0o600)
+
+
+def _restore_private_file_strict(path: Path, snapshot) -> None:
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    content, _ = snapshot
+    _write_private_bytes(path, content)
 
 
 def _rollback_start(
@@ -485,11 +631,7 @@ def _write_runtime_config(path: Path, payload: Any) -> Path:
 
 def _restore_private_file(path: Path, snapshot) -> None:
     try:
-        if snapshot is None:
-            path.unlink(missing_ok=True)
-            return
-        content, _ = snapshot
-        _write_private_bytes(path, content)
+        _restore_private_file_strict(path, snapshot)
     except OSError:
         pass
 
@@ -535,6 +677,73 @@ def _merge_launchd_errors(first: LaunchdError, retry: LaunchdError):
     )
 
 
+def _restart_failure(error: Exception, sensitive_values) -> LaunchdError:
+    return LaunchdError(
+        "restart failed; previous state restored",
+        stderr=_redact_sensitive_text(
+            "restart error: {}".format(_error_detail(error)),
+            sensitive_values,
+        ),
+    )
+
+
+def _merge_restart_errors(
+    restart_error: Exception,
+    rollback_error: Exception,
+    sensitive_values,
+) -> LaunchdError:
+    details = "restart error: {}\nrollback error: {}".format(
+        _error_detail(restart_error),
+        _error_detail(rollback_error),
+    )
+    return LaunchdError(
+        "restart failed and rollback failed",
+        stderr=_redact_sensitive_text(details, sensitive_values),
+    )
+
+
+def _error_detail(error: Exception) -> str:
+    details = [str(error)]
+    stderr = str(getattr(error, "stderr", "") or "")
+    if stderr:
+        details.append(stderr)
+    return ": ".join(detail for detail in details if detail)
+
+
+def _sensitive_values(settings: Any, runtime_snapshot) -> Sequence[str]:
+    values = []
+    webhook_url = _secret_value(settings.webhook_url)
+    values.extend((webhook_url, webhook_url.rsplit("/", 1)[-1]))
+    api_key = getattr(settings.llm, "api_key", None)
+    if api_key is not None:
+        values.append(_secret_value(api_key))
+    if runtime_snapshot is not None:
+        content, _ = runtime_snapshot
+        try:
+            previous = json.loads(content.decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError):
+            previous = None
+        if isinstance(previous, dict):
+            previous_webhook = previous.get("webhook_url")
+            if isinstance(previous_webhook, str):
+                values.extend(
+                    (previous_webhook, previous_webhook.rsplit("/", 1)[-1])
+                )
+            previous_llm = previous.get("llm")
+            if isinstance(previous_llm, dict):
+                previous_api_key = previous_llm.get("api_key")
+                if isinstance(previous_api_key, str):
+                    values.append(previous_api_key)
+    return tuple(value for value in values if value)
+
+
+def _redact_sensitive_text(text: str, sensitive_values: Sequence[str]) -> str:
+    redacted = text
+    for value in sorted(set(sensitive_values), key=len, reverse=True):
+        redacted = redacted.replace(value, "[REDACTED]")
+    return redacted
+
+
 def _print_launchd_error(error: LaunchdError) -> None:
     print(f"Launchd error: {error}", file=sys.stderr)
     if error.stderr:
@@ -555,6 +764,7 @@ def main(
     bootout_fn: Optional[Callable[[], Any]] = None,
     disable_fn: Optional[Callable[[], Any]] = None,
     status_fn: Optional[Callable[[], bool]] = None,
+    disabled_status_fn: Optional[Callable[[], bool]] = None,
     system_timezone_fn: Optional[Callable[[], Any]] = None,
 ) -> int:
     args = build_parser().parse_args(argv)
@@ -612,8 +822,7 @@ def main(
                 status_fn=status_fn,
             )
         if args.command == "restart":
-            _stop(bootout_fn=bootout_fn, disable_fn=disable_fn)
-            return _start(
+            return _restart(
                 settings,
                 config_path,
                 plist_path=plist_path,
@@ -624,6 +833,7 @@ def main(
                 disable_fn=disable_fn,
                 system_timezone_fn=system_timezone_fn,
                 status_fn=status_fn,
+                disabled_status_fn=disabled_status_fn,
             )
         if args.command == "status":
             return _status(settings, config_path, status_fn=status_fn)

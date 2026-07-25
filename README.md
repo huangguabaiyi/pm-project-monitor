@@ -179,6 +179,8 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 
 Task12 已处理夏令时到系统时区的调度转换。修改 Webhook、LLM key、机器人关键词、表格地址、规则路径、状态/日志目录、时区、发送时间、虚拟环境路径或配置路径后，必须在新环境变量已生效的终端执行 `restart`，以重写 runtime snapshot 并重新加载 LaunchAgent；发生系统时区或夏令时切换后也建议重启服务，以确保 plist 中的下一组触发时间已刷新。
 
+`restart` 是完整事务：停止旧服务前会保存原 loaded/disabled 状态以及旧 plist、runtime snapshot。新配置写入或 LaunchAgent 加载任一步失败时，程序会恢复旧文件；原服务此前已加载时会重新 enable 并 bootstrap 旧 plist，此前 stopped/disabled 时不会意外加载。若恢复本身也失败，命令会同时报告新启动错误和恢复错误，但不会回显 Webhook 或 LLM 密钥。
+
 ## LLM 可选降级
 
 LLM 只用于补充风险理由，基础规则和基础通知不依赖 LLM。未设置 LLM 环境变量、LLM token 过期、额度不足、超时、限流、空响应或格式错误时，系统自动降级到无 LLM 模式：继续计算基础风险、继续发送基础卡片，并在日志和通知记录中记录降级原因。关闭 LLM 不应阻断日报。

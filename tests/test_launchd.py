@@ -12,6 +12,7 @@ from requirement_monitor.launchd import (
     bootstrap,
     disable,
     enable,
+    is_disabled,
     in_scheduled_window,
     render_plist,
     scheduled_intervals_in_system_timezone,
@@ -130,6 +131,36 @@ def test_launchctl_status_distinguishes_missing_service_from_execution_error():
         assert error.stderr == "Operation not permitted"
     else:
         raise AssertionError("launchctl execution errors must not look stopped")
+
+
+def test_launchctl_disabled_status_reads_current_label_state():
+    commands = []
+
+    def disabled(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                'disabled services = {\n'
+                '    "com.mi.requirement-monitor" => true\n'
+                '}'
+            ),
+            stderr="",
+        )
+
+    enabled = lambda command, **kwargs: SimpleNamespace(
+        returncode=0,
+        stdout=(
+            'disabled services = {\n'
+            '    "com.mi.requirement-monitor" => false\n'
+            '}'
+        ),
+        stderr="",
+    )
+
+    assert is_disabled(uid=501, command_runner=disabled) is True
+    assert is_disabled(uid=501, command_runner=enabled) is False
+    assert commands == [["launchctl", "print-disabled", "gui/501"]]
 
 
 def test_launchctl_oserror_preserves_detail():

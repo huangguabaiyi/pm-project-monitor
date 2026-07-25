@@ -10,6 +10,7 @@ mapping is refreshed.
 
 import os
 import plistlib
+import re
 import subprocess
 import tempfile
 from datetime import (
@@ -375,8 +376,29 @@ def status(
     return True
 
 
+def is_disabled(
+    *,
+    uid: Optional[int] = None,
+    label: str = LAUNCH_AGENT_LABEL,
+    command_runner: Optional[Callable[..., Any]] = None,
+) -> bool:
+    user_id = os.getuid() if uid is None else uid
+    result = _run_launchctl(
+        ["print-disabled", f"gui/{user_id}"],
+        command_runner=command_runner,
+    )
+    output = str(getattr(result, "stdout", "") or "")
+    match = re.search(
+        r'"?{}"?\s*=>\s*(true|false)'.format(re.escape(label)),
+        output,
+        flags=re.IGNORECASE,
+    )
+    return bool(match and match.group(1).lower() == "true")
+
+
 launchctl_bootstrap = bootstrap
 launchctl_bootout = bootout
 launchctl_status = status
+launchctl_is_disabled = is_disabled
 launchctl_enable = enable
 launchctl_disable = disable
