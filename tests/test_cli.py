@@ -43,6 +43,7 @@ def test_build_parser_exposes_public_commands():
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args(["unknown"])
     assert exc_info.value.code == 2
+    assert "scheduled-run" not in parser.format_help()
 
 
 @pytest.mark.parametrize(
@@ -189,6 +190,29 @@ def test_scheduled_run_runs_inside_local_window(tmp_path):
     assert calls == [("scheduled", False)]
 
 
+def test_scheduled_run_rejects_naive_clock_without_running(tmp_path, capsys):
+    calls = []
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=Path(".state"),
+        log_dir=Path("logs"),
+        fixed_rules_path=Path("固定业务规则"),
+    )
+
+    exit_code = cli.main(
+        ["scheduled-run", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda loaded, config_path: calls.append("runner"),
+        now_fn=lambda: datetime(2026, 7, 24, 20, 2),
+    )
+
+    assert exit_code == 2
+    assert calls == []
+    assert "clock" in capsys.readouterr().err.lower()
+
+
 @pytest.mark.parametrize(
     ("report", "expected"),
     [
@@ -219,9 +243,24 @@ def test_start_writes_private_plist_and_bootstraps(tmp_path):
         load_settings_fn=lambda path: settings,
         plist_path=plist_path,
         write_plist_fn=lambda path, content: Path(path).write_text(content),
+        enable_fn=lambda: calls.append("enable"),
         bootstrap_fn=lambda path: calls.append(Path(path)),
     )
 
     assert exit_code == 0
-    assert calls == [plist_path]
+    assert calls == ["enable", plist_path]
     assert "scheduled-run" in plist_path.read_text()
+    assert "Asia/Shanghai" in plist_path.read_text()
+
+
+def test_stop_boots_out_then_persistently_disables_agent():
+    calls = []
+
+    exit_code = cli.main(
+        ["stop"],
+        bootout_fn=lambda: calls.append("bootout"),
+        disable_fn=lambda: calls.append("disable"),
+    )
+
+    assert exit_code == 0
+    assert calls == ["bootout", "disable"]

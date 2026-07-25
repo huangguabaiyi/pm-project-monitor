@@ -13,6 +13,8 @@ from requirement_monitor.launchd import (
     bootstrap,
     bootout,
     default_plist_path,
+    disable,
+    enable,
     in_scheduled_window,
     render_plist,
     status as launchd_status,
@@ -33,7 +35,11 @@ def _add_config_argument(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="requirement-monitor")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{start,stop,restart,status,logs,run-once,version,init-table}",
+    )
 
     for command in ("start", "stop", "restart", "status", "logs"):
         command_parser = subparsers.add_parser(command)
@@ -43,8 +49,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_argument(run_once_parser)
     run_once_parser.add_argument("--dry-run", action="store_true")
 
-    scheduled_parser = subparsers.add_parser("scheduled-run")
+    scheduled_parser = subparsers.add_parser(
+        "scheduled-run", help=argparse.SUPPRESS
+    )
     _add_config_argument(scheduled_parser)
+    subparsers._choices_actions = [
+        action
+        for action in subparsers._choices_actions
+        if action.dest != "scheduled-run"
+    ]
 
     subparsers.add_parser("version")
 
@@ -253,18 +266,29 @@ def _start(
     *,
     plist_path: Optional[Path],
     write_plist_fn: Optional[Callable[[Path, str], Any]],
+    enable_fn: Optional[Callable[[], Any]],
     bootstrap_fn: Optional[Callable[[Path], Any]],
+    bootout_fn: Optional[Callable[[], Any]],
 ) -> int:
     target = Path(plist_path or default_plist_path()).expanduser()
+    (enable_fn or enable)()
     content = render_plist(
         python_path=sys.executable,
         config_path=config_path,
         hour=settings.send_hour,
         minute=settings.send_minute,
+        timezone=settings.timezone,
         working_directory=config_path.parent,
     )
     (write_plist_fn or write_plist)(target, content)
-    (bootstrap_fn or bootstrap)(target)
+    try:
+        (bootstrap_fn or bootstrap)(target)
+    except Exception as first_error:
+        try:
+            (bootout_fn or bootout)()
+            (bootstrap_fn or bootstrap)(target)
+        except Exception:
+            raise first_error
     print(f"started: {target}")
     return EXIT_OK
 
@@ -272,8 +296,10 @@ def _start(
 def _stop(
     *,
     bootout_fn: Optional[Callable[[], Any]],
+    disable_fn: Optional[Callable[[], Any]],
 ) -> int:
     (bootout_fn or bootout)()
+    (disable_fn or disable)()
     print("stopped")
     return EXIT_OK
 
@@ -287,8 +313,10 @@ def main(
     now_fn: Optional[Callable[[], datetime]] = None,
     plist_path: Optional[Path] = None,
     write_plist_fn: Optional[Callable[[Path, str], Any]] = None,
+    enable_fn: Optional[Callable[[], Any]] = None,
     bootstrap_fn: Optional[Callable[[Path], Any]] = None,
     bootout_fn: Optional[Callable[[], Any]] = None,
+    disable_fn: Optional[Callable[[], Any]] = None,
     status_fn: Optional[Callable[[], bool]] = None,
 ) -> int:
     args = build_parser().parse_args(argv)
@@ -299,7 +327,7 @@ def main(
 
     try:
         if args.command == "stop":
-            return _stop(bootout_fn=bootout_fn)
+            return _stop(bootout_fn=bootout_fn, disable_fn=disable_fn)
 
         config_path = _resolve_config_path(args.config)
         settings = _load_settings(config_path, load_settings_fn)
@@ -334,16 +362,20 @@ def main(
                 config_path,
                 plist_path=plist_path,
                 write_plist_fn=write_plist_fn,
+                enable_fn=enable_fn,
                 bootstrap_fn=bootstrap_fn,
+                bootout_fn=bootout_fn,
             )
         if args.command == "restart":
-            _stop(bootout_fn=bootout_fn)
+            _stop(bootout_fn=bootout_fn, disable_fn=disable_fn)
             return _start(
                 settings,
                 config_path,
                 plist_path=plist_path,
                 write_plist_fn=write_plist_fn,
+                enable_fn=enable_fn,
                 bootstrap_fn=bootstrap_fn,
+                bootout_fn=bootout_fn,
             )
         if args.command == "status":
             return _status(settings, config_path, status_fn=status_fn)
@@ -365,6 +397,12 @@ def main(
             current_time = now_fn() if now_fn else datetime.now(
                 ZoneInfo(settings.timezone)
             )
+            if (
+                current_time.tzinfo is None
+                or current_time.utcoffset() is None
+            ):
+                print("Clock configuration error.", file=sys.stderr)
+                return EXIT_CONFIG
             current_time = current_time.astimezone(ZoneInfo(settings.timezone))
             if not in_scheduled_window(
                 current_time, settings.send_hour, settings.send_minute
