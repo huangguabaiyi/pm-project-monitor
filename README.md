@@ -53,7 +53,7 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 - `state_dir` / `log_dir`：本地状态和日志目录。
 - `llm.enabled`：是否启用可选 LLM 补充判断，默认关闭。
 
-Webhook URL、LLM API key 以及其他 token/API key **只从环境变量读取**，不要写入 `config.local.json`、代码、测试、日志或多维表格：
+Webhook URL、LLM API key 以及其他 token/API key 不属于业务配置。推荐并优先从环境变量读取，不要把真实值写入仓库、测试、日志或多维表格：
 
 ```bash
 export REQUIREMENT_MONITOR_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
@@ -64,7 +64,7 @@ export REQUIREMENT_MONITOR_LLM_BASE_URL='https://api.example.com/v1'
 export REQUIREMENT_MONITOR_LLM_MODEL='model-name'
 ```
 
-若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
+为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。新配置应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table` 是唯一不要求 Webhook 的命令；`run-once`、`start`、`status`、`scheduled-run` 和 `logs` 仍按默认配置要求可用 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
 
 ## 固定业务规则
 
@@ -88,9 +88,19 @@ export REQUIREMENT_MONITOR_LLM_MODEL='model-name'
 5. `基础配置表`
 6. `通知记录表`
 
-初始化前先确认 `feishu auth status` 和配置路径，然后只读预览：
+复制 `config.example.json` 后，不设置任何 Webhook secret 也可以完成 schema 初始化。初始化前先确认 `feishu auth status` 和配置路径，然后只读预览：
 
 ```bash
+.venv/bin/requirement-monitor init-table --dry-run
+```
+
+完整的三步复核流程如下；三条命令都只依赖已认证的飞书 CLI 和 `bitable_url`：
+
+```bash
+cp config.example.json config.local.json
+export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
+.venv/bin/requirement-monitor init-table --dry-run
+.venv/bin/requirement-monitor init-table --apply
 .venv/bin/requirement-monitor init-table --dry-run
 ```
 

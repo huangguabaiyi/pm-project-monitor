@@ -63,50 +63,63 @@ class WebhookSender:
     def close(self) -> None:
         if self._closed:
             return
-        self._client.close()
-        self._closed = True
+        try:
+            self._client.close()
+        except Exception:
+            pass
+        finally:
+            self._closed = True
 
     def send(self, payload: Mapping[str, Any]) -> SendResult:
-        if self._closed:
-            raise RuntimeError("WebhookSender is closed")
-        format_used = self._format_used(payload)
-        serialized_payload, validation_error = self._validated_payload(payload)
-        if validation_error is not None:
+        format_used = "card"
+        try:
+            if self._closed:
+                raise RuntimeError("WebhookSender is closed")
+            format_used = self._format_used(payload)
+            serialized_payload, validation_error = self._validated_payload(payload)
+            if validation_error is not None:
+                return SendResult(
+                    success=False,
+                    attempts=0,
+                    format_used=format_used,
+                    error=validation_error,
+                )
+
+            result = self._deliver(
+                serialized_payload,
+                format_used=format_used,
+                retry=True,
+            )
+            if result.error != "card_format_rejected":
+                return result
+
+            fallback_payload = self._plain_text_fallback(payload)
+            fallback_body, fallback_error = self._validated_payload(fallback_payload)
+            if fallback_error is not None:
+                return SendResult(
+                    success=False,
+                    attempts=result.attempts,
+                    format_used="text",
+                    status_code=result.status_code,
+                    feishu_code=result.feishu_code,
+                    error=fallback_error,
+                )
+
+            fallback_result = self._deliver(
+                fallback_body,
+                format_used="text",
+                retry=False,
+            )
+            return fallback_result.model_copy(
+                update={"attempts": result.attempts + fallback_result.attempts}
+            )
+        except Exception:
             return SendResult(
                 success=False,
                 attempts=0,
                 format_used=format_used,
-                error=validation_error,
+                error="webhook_error",
             )
-
-        result = self._deliver(
-            serialized_payload,
-            format_used=format_used,
-            retry=True,
-        )
-        if result.error != "card_format_rejected":
-            return result
-
-        fallback_payload = self._plain_text_fallback(payload)
-        fallback_body, fallback_error = self._validated_payload(fallback_payload)
-        if fallback_error is not None:
-            return SendResult(
-                success=False,
-                attempts=result.attempts,
-                format_used="text",
-                status_code=result.status_code,
-                feishu_code=result.feishu_code,
-                error=fallback_error,
-            )
-
-        fallback_result = self._deliver(
-            fallback_body,
-            format_used="text",
-            retry=False,
-        )
-        return fallback_result.model_copy(
-            update={"attempts": result.attempts + fallback_result.attempts}
-        )
 
     def _deliver(
         self,
@@ -147,14 +160,78 @@ class WebhookSender:
                     format_used=format_used,
                     error=last_error,
                 )
-
-            status_code = response.status_code
-            feishu_code, feishu_message = self._feishu_response(response)
-
-            if status_code == 429 or 500 <= status_code < 600:
-                last_error = "http_{}".format(status_code)
+            except Exception:
+                last_error = "network_error"
                 if self._retry(attempts, max_attempts):
                     continue
+                return SendResult(
+                    success=False,
+                    attempts=attempts,
+                    format_used=format_used,
+                    error=last_error,
+                )
+
+            try:
+                status_code = response.status_code
+                feishu_code, feishu_message = self._feishu_response(response)
+
+                if status_code == 429 or 500 <= status_code < 600:
+                    last_error = "http_{}".format(status_code)
+                    if self._retry(attempts, max_attempts):
+                        continue
+                    return SendResult(
+                        success=False,
+                        attempts=attempts,
+                        format_used=format_used,
+                        status_code=status_code,
+                        feishu_code=feishu_code,
+                        error=last_error,
+                    )
+
+                if (
+                    format_used == "card"
+                    and self._is_card_format_rejection(
+                        status_code, feishu_code, feishu_message
+                    )
+                ):
+                    return SendResult(
+                        success=False,
+                        attempts=attempts,
+                        format_used=format_used,
+                        status_code=status_code,
+                        feishu_code=feishu_code,
+                        error="card_format_rejected",
+                    )
+
+                if not 200 <= status_code < 300:
+                    return SendResult(
+                        success=False,
+                        attempts=attempts,
+                        format_used=format_used,
+                        status_code=status_code,
+                        feishu_code=feishu_code,
+                        error="http_{}".format(status_code),
+                    )
+
+                if feishu_code is None:
+                    return SendResult(
+                        success=False,
+                        attempts=attempts,
+                        format_used=format_used,
+                        status_code=status_code,
+                        error="invalid_response",
+                    )
+
+                if feishu_code == 0:
+                    return SendResult(
+                        success=True,
+                        attempts=attempts,
+                        format_used=format_used,
+                        status_code=status_code,
+                        feishu_code=feishu_code,
+                    )
+
+                last_error = "feishu_error_{}".format(feishu_code)
                 return SendResult(
                     success=False,
                     attempts=attempts,
@@ -163,59 +240,13 @@ class WebhookSender:
                     feishu_code=feishu_code,
                     error=last_error,
                 )
-
-            if (
-                format_used == "card"
-                and self._is_card_format_rejection(
-                    status_code, feishu_code, feishu_message
-                )
-            ):
+            except Exception:
                 return SendResult(
                     success=False,
                     attempts=attempts,
                     format_used=format_used,
-                    status_code=status_code,
-                    feishu_code=feishu_code,
-                    error="card_format_rejected",
+                    error="network_error",
                 )
-
-            if not 200 <= status_code < 300:
-                return SendResult(
-                    success=False,
-                    attempts=attempts,
-                    format_used=format_used,
-                    status_code=status_code,
-                    feishu_code=feishu_code,
-                    error="http_{}".format(status_code),
-                )
-
-            if feishu_code is None:
-                return SendResult(
-                    success=False,
-                    attempts=attempts,
-                    format_used=format_used,
-                    status_code=status_code,
-                    error="invalid_response",
-                )
-
-            if feishu_code == 0:
-                return SendResult(
-                    success=True,
-                    attempts=attempts,
-                    format_used=format_used,
-                    status_code=status_code,
-                    feishu_code=feishu_code,
-                )
-
-            last_error = "feishu_error_{}".format(feishu_code)
-            return SendResult(
-                success=False,
-                attempts=attempts,
-                format_used=format_used,
-                status_code=status_code,
-                feishu_code=feishu_code,
-                error=last_error,
-            )
 
         return SendResult(
             success=False,

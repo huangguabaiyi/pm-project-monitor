@@ -54,7 +54,7 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     bitable_url: NonEmptyStr
-    webhook_url: SecretStr
+    webhook_url: Optional[SecretStr] = None
     fixed_rules_path: Path
     timezone: NonEmptyStr = "Asia/Shanghai"
     send_hour: int = Field(default=20, ge=0, le=23)
@@ -75,6 +75,8 @@ class Settings(BaseModel):
     @field_validator("webhook_url", mode="before")
     @classmethod
     def validate_webhook_url(cls, value):
+        if value is None:
+            return None
         if isinstance(value, SecretStr):
             raw_value = value.get_secret_value()
         elif isinstance(value, str):
@@ -96,13 +98,17 @@ class Settings(BaseModel):
         return value
 
 
-def load_settings(path: Optional[Path] = None) -> Settings:
+def load_settings(
+    path: Optional[Path] = None, *, require_webhook: bool = True
+) -> Settings:
     config_path = _resolve_config_path(path)
     config_data = _read_config(config_path)
     _apply_environment_overrides(config_data)
 
     webhook_url = config_data.get("webhook_url")
-    if not isinstance(webhook_url, str) or not webhook_url.strip():
+    if require_webhook and (
+        not isinstance(webhook_url, str) or not webhook_url.strip()
+    ):
         raise ConfigError(
             "Webhook URL is missing; set webhook_url in the configuration file "
             "or REQUIREMENT_MONITOR_WEBHOOK_URL."

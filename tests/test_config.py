@@ -92,6 +92,17 @@ def test_missing_webhook_has_clear_configuration_error(tmp_path, monkeypatch):
         load_settings(config_path)
 
 
+def test_schema_configuration_can_skip_webhook_requirement(tmp_path, monkeypatch):
+    clear_environment(monkeypatch)
+    config_path = tmp_path / "config.json"
+    write_config(config_path)
+
+    settings = load_settings(config_path, require_webhook=False)
+
+    assert settings.bitable_url == "https://mi.feishu.cn/wiki/base"
+    assert settings.webhook_url is None
+
+
 def test_blank_webhook_has_clear_configuration_error(tmp_path, monkeypatch):
     clear_environment(monkeypatch)
     config_path = tmp_path / "config.json"

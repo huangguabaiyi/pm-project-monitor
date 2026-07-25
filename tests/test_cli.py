@@ -1,3 +1,4 @@
+import json
 import stat
 from datetime import datetime
 from pathlib import Path
@@ -104,6 +105,67 @@ def test_init_table_dry_run_prints_operations_without_applying(capsys):
     output = capsys.readouterr().out
     assert "rename_table" in output
     assert 'seed_records {"record_count": 35' in output
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected_apply"),
+    (("--dry-run", False), ("--apply", True)),
+)
+def test_init_table_accepts_secret_free_config_example(
+    monkeypatch, flag, expected_apply
+):
+    monkeypatch.delenv("REQUIREMENT_MONITOR_WEBHOOK_URL", raising=False)
+    config_path = Path(__file__).parents[1] / "config.example.json"
+    calls = []
+
+    def fake_initializer(bitable_url, *, apply):
+        calls.append((bitable_url, apply))
+        return []
+
+    exit_code = cli.main(
+        ["init-table", flag, "--config", str(config_path)],
+        initialize_schema_fn=fake_initializer,
+    )
+
+    assert exit_code == 0
+    expected_url = (
+        "https://mi.feishu.cn/wiki/TA6nwzFi0i4fdOkIamzcxj34nRd?"
+        "fromScene=spaceOverview&table=tblQlOtlW0xmcKBE&view=vewCeVIyDY"
+    )
+    assert calls == [(expected_url, expected_apply)]
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    (
+        ["start"],
+        ["status"],
+        ["scheduled-run"],
+        ["run-once", "--dry-run"],
+    ),
+)
+def test_operational_commands_still_require_webhook(
+    tmp_path, monkeypatch, command_args
+):
+    monkeypatch.delenv("REQUIREMENT_MONITOR_WEBHOOK_URL", raising=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "bitable_url": "https://mi.feishu.cn/wiki/base",
+                "fixed_rules_path": "固定业务规则",
+                "state_dir": ".state",
+                "log_dir": "logs",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = cli.main(
+        [*command_args, "--config", str(config_path)]
+    )
+
+    assert exit_code == cli.EXIT_CONFIG
 
 
 def test_run_once_dry_run_renders_payload_without_sending(capsys, tmp_path):

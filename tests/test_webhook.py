@@ -513,18 +513,51 @@ def test_close_closes_injected_client(webhook_url):
     assert client.is_closed is True
 
 
-def test_unexpected_client_error_propagates(webhook_url, card_payload):
+def test_unexpected_client_error_is_fixed_without_exposing_secrets(
+    webhook_url, card_payload
+):
+    api_key = "complete-api-key-that-must-not-leak"
+
     class ExplodingClient:
         def post(self, *args, **kwargs):
-            raise RuntimeError("programming error")
+            raise RuntimeError(
+                "failed at {} with api_key={}".format(webhook_url, api_key)
+            )
 
         def close(self):
             return None
 
-    sender = WebhookSender(webhook_url, client=ExplodingClient())
+    sender = WebhookSender(
+        webhook_url,
+        client=ExplodingClient(),
+        sleep=lambda seconds: None,
+    )
 
-    with pytest.raises(RuntimeError, match="programming error"):
-        sender.send(card_payload)
+    result = sender.send(card_payload)
+
+    assert result.success is False
+    assert result.error == "network_error"
+    assert webhook_url not in repr(result)
+    assert api_key not in repr(result)
+
+
+def test_response_error_text_is_fixed_without_exposing_secrets(
+    httpx_mock, webhook_url, card_payload
+):
+    api_key = "response-api-key-that-must-not-leak"
+    httpx_mock.add_response(
+        json={
+            "code": 230099,
+            "msg": "{} api_key={}".format(webhook_url, api_key),
+        }
+    )
+
+    result = WebhookSender(webhook_url).send(card_payload)
+
+    assert result.success is False
+    assert result.error == "feishu_error_230099"
+    assert webhook_url not in repr(result)
+    assert api_key not in repr(result)
 
 
 def test_invalid_json_response_is_sanitized_failure(webhook_url, card_payload):
@@ -564,7 +597,7 @@ def test_json_value_error_is_sanitized_failure(webhook_url, card_payload):
     assert result.error == "invalid_response"
 
 
-def test_memory_error_from_response_json_propagates(webhook_url, card_payload):
+def test_memory_error_from_response_json_is_fixed(webhook_url, card_payload):
     class MemoryResponse:
         status_code = 200
 
@@ -580,11 +613,13 @@ def test_memory_error_from_response_json_propagates(webhook_url, card_payload):
 
     sender = WebhookSender(webhook_url, client=StaticClient())
 
-    with pytest.raises(MemoryError):
-        sender.send(card_payload)
+    result = sender.send(card_payload)
+
+    assert result.success is False
+    assert result.error == "network_error"
 
 
-def test_unexpected_json_error_propagates(webhook_url, card_payload):
+def test_unexpected_json_error_is_fixed(webhook_url, card_payload):
     class ExplodingResponse:
         status_code = 200
 
@@ -600,8 +635,10 @@ def test_unexpected_json_error_propagates(webhook_url, card_payload):
 
     sender = WebhookSender(webhook_url, client=StaticClient())
 
-    with pytest.raises(RuntimeError, match="unexpected decoder error"):
-        sender.send(card_payload)
+    result = sender.send(card_payload)
+
+    assert result.success is False
+    assert result.error == "network_error"
 
 
 def test_fallback_truncates_by_final_serialized_json_bytes():

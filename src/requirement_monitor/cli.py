@@ -98,11 +98,13 @@ def _resolve_config_path(path: Optional[Path]) -> Path:
 def _load_settings(
     config_path: Path,
     load_settings_fn: Optional[Callable[[Optional[Path]], Any]],
+    *,
+    require_webhook: bool = True,
 ) -> Any:
     if load_settings_fn is None:
         from requirement_monitor.config import load_settings
 
-        load_settings_fn = load_settings
+        return load_settings(config_path, require_webhook=require_webhook)
     return load_settings_fn(config_path)
 
 
@@ -457,7 +459,11 @@ def main(
             return _stop(bootout_fn=bootout_fn, disable_fn=disable_fn)
 
         config_path = _resolve_config_path(args.config)
-        settings = _load_settings(config_path, load_settings_fn)
+        settings = _load_settings(
+            config_path,
+            load_settings_fn,
+            require_webhook=args.command != "init-table",
+        )
 
         if args.command == "init-table":
             if initialize_schema_fn is None:
