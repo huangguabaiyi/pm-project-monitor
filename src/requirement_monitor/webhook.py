@@ -86,6 +86,24 @@ class WebhookSender:
                 prepared_payload
             )
             if validation_error is not None:
+                if (
+                    validation_error == "payload_too_large"
+                    and format_used == "card"
+                    and self._validated_payload(payload)[1] is None
+                ):
+                    fallback_payload = self._with_bot_keyword(
+                        self._plain_text_fallback(prepared_payload)
+                    )
+                    fallback_body, fallback_error = self._validated_payload(
+                        fallback_payload
+                    )
+                    if fallback_error is None:
+                        return self._deliver(
+                            fallback_body,
+                            format_used="text",
+                            retry=False,
+                        )
+                    validation_error = fallback_error
                 return SendResult(
                     success=False,
                     attempts=0,
@@ -148,9 +166,7 @@ class WebhookSender:
             content = prepared.get("content")
             if isinstance(content, dict) and isinstance(content.get("text"), str):
                 text = content["text"]
-                content["text"] = self._truncate_text_payload(
-                    "{} {}".format(keyword, text).rstrip()
-                )
+                content["text"] = "{} {}".format(keyword, text).rstrip()
             return prepared
 
         if prepared.get("msg_type") != "interactive":

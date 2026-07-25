@@ -1,8 +1,10 @@
 import argparse
+import fcntl
 import json
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -32,6 +34,11 @@ EXIT_FEISHU = 3
 EXIT_WEBHOOK = 4
 EXIT_UNEXPECTED = 5
 RUNTIME_CONFIG_FILENAME = "runtime-config.json"
+LIFECYCLE_LOCK_FILENAME = "lifecycle.lock"
+
+
+class LifecycleLockedError(RuntimeError):
+    pass
 
 
 class _RootParser(argparse.ArgumentParser):
@@ -309,7 +316,23 @@ def _start(
     disable_fn: Optional[Callable[[], Any]],
     system_timezone_fn: Optional[Callable[[], Any]],
     status_fn: Optional[Callable[[], bool]],
+    lifecycle_lock_held: bool = False,
 ) -> int:
+    if not lifecycle_lock_held:
+        with _lifecycle_lock(_lifecycle_lock_path(settings, config_path)):
+            return _start(
+                settings,
+                config_path,
+                plist_path=plist_path,
+                write_plist_fn=write_plist_fn,
+                enable_fn=enable_fn,
+                bootstrap_fn=bootstrap_fn,
+                bootout_fn=bootout_fn,
+                disable_fn=disable_fn,
+                system_timezone_fn=system_timezone_fn,
+                status_fn=status_fn,
+                lifecycle_lock_held=True,
+            )
     target = Path(plist_path or default_plist_path()).expanduser()
     previous_plist = _snapshot_plist(target)
     state_dir, log_dir, fixed_rules_path = _settings_paths(settings, config_path)
@@ -403,7 +426,24 @@ def _restart(
     system_timezone_fn: Optional[Callable[[], Any]],
     status_fn: Optional[Callable[[], bool]],
     disabled_status_fn: Optional[Callable[[], bool]],
+    lifecycle_lock_held: bool = False,
 ) -> int:
+    if not lifecycle_lock_held:
+        with _lifecycle_lock(_lifecycle_lock_path(settings, config_path)):
+            return _restart(
+                settings,
+                config_path,
+                plist_path=plist_path,
+                write_plist_fn=write_plist_fn,
+                enable_fn=enable_fn,
+                bootstrap_fn=bootstrap_fn,
+                bootout_fn=bootout_fn,
+                disable_fn=disable_fn,
+                system_timezone_fn=system_timezone_fn,
+                status_fn=status_fn,
+                disabled_status_fn=disabled_status_fn,
+                lifecycle_lock_held=True,
+            )
     target = Path(plist_path or default_plist_path()).expanduser()
     state_dir, _, _ = _settings_paths(settings, config_path)
     runtime_config_path = state_dir / RUNTIME_CONFIG_FILENAME
@@ -434,6 +474,7 @@ def _restart(
             disable_fn=disable_fn,
             system_timezone_fn=system_timezone_fn,
             status_fn=lambda: False,
+            lifecycle_lock_held=True,
         )
     except Exception as restart_error:
         try:
@@ -507,6 +548,8 @@ def _restore_restart_transaction(
             if previous_loaded:
                 enable_fn()
                 bootstrap_fn(plist_path)
+                if previous_disabled:
+                    disable_fn()
             elif previous_disabled:
                 disable_fn()
             else:
@@ -524,7 +567,7 @@ def _restore_restart_transaction(
 
 def _restore_plist_strict(path: Path, snapshot, write_plist_fn) -> None:
     if snapshot is None:
-        path.unlink(missing_ok=True)
+        _unlink_and_fsync(path)
         return
     content, _ = snapshot
     text = content.decode("utf-8")
@@ -539,7 +582,7 @@ def _restore_plist_strict(path: Path, snapshot, write_plist_fn) -> None:
 
 def _restore_private_file_strict(path: Path, snapshot) -> None:
     if snapshot is None:
-        path.unlink(missing_ok=True)
+        _unlink_and_fsync(path)
         return
     content, _ = snapshot
     _write_private_bytes(path, content)
@@ -559,19 +602,7 @@ def _rollback_start(
 ):
     _restore_private_file(runtime_config_path, runtime_config_snapshot)
     try:
-        if snapshot is None:
-            path.unlink(missing_ok=True)
-        else:
-            content, mode = snapshot
-            text = content.decode("utf-8")
-            try:
-                write_plist_fn(path, text)
-            except Exception:
-                if write_plist_fn is not write_plist:
-                    write_plist(path, text)
-                else:
-                    raise
-            os.chmod(path, 0o600)
+        _restore_plist_strict(path, snapshot, write_plist_fn)
     except (OSError, UnicodeError):
         pass
     if state_changed and previous_loaded:
@@ -610,7 +641,9 @@ def _runtime_config_payload(
             "enabled": llm.enabled,
             "base_url": llm.base_url,
             "api_key": (
-                _secret_value(llm.api_key) if llm.api_key is not None else None
+                _secret_value(llm.api_key)
+                if llm.enabled and llm.api_key is not None
+                else None
             ),
             "model": llm.model,
             "timeout_seconds": llm.timeout_seconds,
@@ -640,7 +673,6 @@ def _write_private_bytes(path: Path, content: bytes) -> None:
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
-    directory_descriptor = None
     try:
         descriptor, temporary_path = tempfile.mkstemp(
             prefix=".{}-".format(target.name),
@@ -654,16 +686,58 @@ def _write_private_bytes(path: Path, content: bytes) -> None:
         os.replace(temporary_path, target)
         temporary_path = None
         os.chmod(target, 0o600)
-        directory_descriptor = os.open(str(target.parent), os.O_RDONLY)
-        os.fsync(directory_descriptor)
+        _fsync_directory(target.parent)
     finally:
-        if directory_descriptor is not None:
-            os.close(directory_descriptor)
         if temporary_path is not None:
             try:
                 os.unlink(temporary_path)
             except OSError:
                 pass
+
+
+def _lifecycle_lock_path(settings: Any, config_path: Path) -> Path:
+    state_dir = _absolute_setting_path(settings.state_dir, config_path)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / LIFECYCLE_LOCK_FILENAME
+
+
+@contextmanager
+def _lifecycle_lock(path: Path):
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(target, os.O_RDWR | os.O_CREAT, 0o600)
+    os.fchmod(descriptor, 0o600)
+    locked = False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except BlockingIOError as error:
+            raise LifecycleLockedError("lifecycle operation is locked") from error
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _unlink_and_fsync(path: Path) -> None:
+    target = Path(path)
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(target.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _merge_launchd_errors(first: LaunchdError, retry: LaunchdError):
@@ -876,6 +950,9 @@ def main(
         return EXIT_CONFIG
     except LaunchdError as error:
         _print_launchd_error(error)
+        return EXIT_UNEXPECTED
+    except LifecycleLockedError:
+        print("Lifecycle operation locked.", file=sys.stderr)
         return EXIT_UNEXPECTED
     except ConfigError:
         print("Configuration error.", file=sys.stderr)

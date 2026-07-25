@@ -342,25 +342,76 @@ def test_keyword_is_present_once_in_card_and_plain_text_fallback(
     assert requests[1]["content"]["text"].count("需求机器人") == 1
 
 
-def test_keyword_prefix_survives_text_truncation(httpx_mock, webhook_url):
+def _largest_payload_before_keyword(payload):
+    lower = 0
+    upper = MAX_PAYLOAD_BYTES
+    while lower < upper:
+        midpoint = (lower + upper + 1) // 2
+        payload["value"]("密" * midpoint)
+        serialized = WebhookSender._serialize_payload(payload["payload"])
+        if len(serialized) <= MAX_PAYLOAD_BYTES:
+            lower = midpoint
+        else:
+            upper = midpoint - 1
+    payload["value"]("密" * lower)
+    assert len(WebhookSender._serialize_payload(payload["payload"])) <= MAX_PAYLOAD_BYTES
+    return payload["payload"]
+
+
+def test_keyword_pushes_interactive_card_to_plain_text_fallback(
+    httpx_mock, webhook_url, card_payload
+):
+    keyword = "需求机器人"
+    payload = _largest_payload_before_keyword(
+        {
+            "payload": card_payload,
+            "value": lambda value: card_payload["card"]["elements"][0][
+                "text"
+            ].update(content=value),
+        },
+    )
     httpx_mock.add_response(json={"code": 0})
-    payload = {
-        "msg_type": "text",
-        "content": {"text": "密" * MAX_PAYLOAD_BYTES},
-    }
 
     result = WebhookSender(
         webhook_url,
         sleep=lambda seconds: None,
-        bot_keyword="需求机器人",
+        bot_keyword=keyword,
     ).send(payload)
 
     request = httpx_mock.get_request()
     sent = json.loads(request.content)
     assert result.success is True
+    assert result.attempts == 1
+    assert result.format_used == "text"
+    assert sent["msg_type"] == "text"
     assert len(request.content) <= MAX_PAYLOAD_BYTES
-    assert sent["content"]["text"].startswith("需求机器人 ")
-    assert sent["content"]["text"].count("需求机器人") == 1
+    assert sent["content"]["text"].startswith(keyword)
+    assert sent["content"]["text"].count(keyword) == 1
+
+
+def test_keyword_pushes_text_payload_over_limit_without_sending(
+    httpx_mock, webhook_url
+):
+    keyword = "需求机器人"
+    text_payload = {"msg_type": "text", "content": {"text": ""}}
+    payload = _largest_payload_before_keyword(
+        {
+            "payload": text_payload,
+            "value": lambda value: text_payload["content"].update(text=value),
+        },
+    )
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword=keyword,
+    ).send(payload)
+
+    assert result.success is False
+    assert result.attempts == 0
+    assert result.format_used == "text"
+    assert result.error == "payload_too_large"
+    assert httpx_mock.get_requests() == []
 
 
 def test_keyword_is_injected_into_system_error_card_without_secret_leak(

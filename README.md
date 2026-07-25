@@ -177,6 +177,8 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 
 后台模式必须通过 `start` 或 `restart` 生成配置，不能手工让 LaunchAgent 直接指向仓库中的源配置。macOS LaunchAgent 不继承执行 `start` 时的 shell 环境，因此 `start` 会先解析源配置和当前环境变量，再将完整运行设置写入 `state_dir/runtime-config.json`；该文件使用原子写入、`0600` 权限，包含 Webhook、可选 LLM key 和机器人关键词，plist 的 `scheduled-run --config` 只指向这份私密快照。源配置不需要、也不应保存 Webhook 或 LLM key。`stop` 会卸载并禁用任务，但保留 runtime snapshot；它位于本地状态目录，不得提交或共享。
 
+`start` 和 `restart` 使用 `state_dir/lifecycle.lock` 的非阻塞跨进程文件锁串行化整个生命周期事务；并发命令会明确返回 locked 错误，不会互相覆盖 runtime snapshot 或 plist。锁文件权限为 `0600`，异常退出也会释放锁。只有 `llm.enabled=true` 时 runtime snapshot 才保存 LLM API key；关闭 LLM 时即使环境中仍有旧 key，也会强制写入 `null`。
+
 Task12 已处理夏令时到系统时区的调度转换。修改 Webhook、LLM key、机器人关键词、表格地址、规则路径、状态/日志目录、时区、发送时间、虚拟环境路径或配置路径后，必须在新环境变量已生效的终端执行 `restart`，以重写 runtime snapshot 并重新加载 LaunchAgent；发生系统时区或夏令时切换后也建议重启服务，以确保 plist 中的下一组触发时间已刷新。
 
 `restart` 是完整事务：停止旧服务前会保存原 loaded/disabled 状态以及旧 plist、runtime snapshot。新配置写入或 LaunchAgent 加载任一步失败时，程序会恢复旧文件；原服务此前已加载时会重新 enable 并 bootstrap 旧 plist，此前 stopped/disabled 时不会意外加载。若恢复本身也失败，命令会同时报告新启动错误和恢复错误，但不会回显 Webhook 或 LLM 密钥。

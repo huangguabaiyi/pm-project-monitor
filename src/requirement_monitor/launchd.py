@@ -225,7 +225,12 @@ def render_plist(
     return plistlib.dumps(dict(payload), fmt=plistlib.FMT_XML).decode("utf-8")
 
 
-def write_plist(path: Path, content: str) -> Path:
+def write_plist(
+    path: Path,
+    content: str,
+    *,
+    fsync_directory_fn: Optional[Callable[[Path], Any]] = None,
+) -> Path:
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
@@ -242,6 +247,7 @@ def write_plist(path: Path, content: str) -> Path:
         os.replace(temporary_path, target)
         temporary_path = None
         os.chmod(target, 0o600)
+        (fsync_directory_fn or _fsync_directory)(target.parent)
     finally:
         if temporary_path is not None:
             try:
@@ -249,6 +255,14 @@ def write_plist(path: Path, content: str) -> Path:
             except OSError:
                 pass
     return target
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def default_plist_path() -> Path:

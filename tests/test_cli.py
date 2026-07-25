@@ -1,6 +1,9 @@
 import json
 import plistlib
 import stat
+import subprocess
+import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +18,15 @@ from requirement_monitor.launchd import LaunchdError
 WEBHOOK_URL = (
     "https://open.feishu.cn/open-apis/bot/v2/hook/runtime-webhook-secret"
 )
+
+
+@pytest.fixture(autouse=True)
+def forbid_unstubbed_launchctl_status(monkeypatch):
+    def fail():
+        raise AssertionError("launchctl status must be explicitly stubbed")
+
+    monkeypatch.setattr(cli, "launchd_status", fail)
+    monkeypatch.setattr(cli, "launchd_is_disabled", fail)
 
 
 def write_operational_config(path: Path) -> None:
@@ -440,6 +452,7 @@ def test_start_writes_private_plist_and_bootstraps(tmp_path):
         ["start", "--config", str(tmp_path / "config.json")],
         load_settings_fn=lambda path: settings,
         plist_path=plist_path,
+        status_fn=lambda: False,
         write_plist_fn=lambda path, content: Path(path).write_text(content),
         enable_fn=lambda: calls.append("enable"),
         bootstrap_fn=lambda path: calls.append(Path(path)),
@@ -641,6 +654,55 @@ def test_restart_rewrites_runtime_snapshot_with_current_environment(
     assert restart_calls == ["bootout", "disable", "enable", "bootstrap"]
 
 
+@pytest.mark.parametrize(
+    ("previous_loaded", "previous_disabled"),
+    ((False, False), (False, True), (True, False), (True, True)),
+)
+def test_restart_failure_restores_all_loaded_disabled_combinations(
+    tmp_path,
+    monkeypatch,
+    previous_loaded,
+    previous_disabled,
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    state = {
+        "loaded": previous_loaded,
+        "disabled": previous_disabled,
+    }
+    plist_path = tmp_path / "monitor.plist"
+    plist_path.write_text("old plist", encoding="utf-8")
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_path.parent.mkdir()
+    runtime_path.write_text('{"old":"runtime"}', encoding="utf-8")
+
+    def bootstrap_agent(path):
+        if Path(path).read_text(encoding="utf-8") == "old plist":
+            state["loaded"] = True
+            return
+        state["loaded"] = True
+        raise LaunchdError("new bootstrap failed", stderr="new failure")
+
+    exit_code = cli.main(
+        ["restart", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: state["loaded"],
+        disabled_status_fn=lambda: state["disabled"],
+        bootout_fn=lambda: state.update(loaded=False),
+        disable_fn=lambda: state.update(disabled=True),
+        enable_fn=lambda: state.update(disabled=False),
+        bootstrap_fn=bootstrap_agent,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert state == {
+        "loaded": previous_loaded,
+        "disabled": previous_disabled,
+    }
+
+
 def test_restart_failure_restores_loaded_service_and_old_files(
     tmp_path, monkeypatch, capsys
 ):
@@ -815,6 +877,171 @@ def test_stop_retains_runtime_snapshot(tmp_path):
     assert runtime_path.read_text(encoding="utf-8") == "private runtime config"
 
 
+def test_start_uses_nonblocking_lifecycle_lock_across_threads(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    plist_path = tmp_path / "monitor.plist"
+    entered = threading.Event()
+    release = threading.Event()
+    first_result = []
+
+    def blocking_bootstrap(path):
+        entered.set()
+        assert release.wait(timeout=5)
+
+    def run_first():
+        first_result.append(
+            cli.main(
+                ["start", "--config", str(config_path)],
+                plist_path=plist_path,
+                status_fn=lambda: False,
+                enable_fn=lambda: None,
+                bootstrap_fn=blocking_bootstrap,
+                system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+            )
+        )
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert entered.wait(timeout=5)
+    second_exit = cli.main(
+        ["start", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: (_ for _ in ()).throw(
+            AssertionError("locked command must not query launchctl")
+        ),
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+    release.set()
+    thread.join(timeout=5)
+
+    captured = capsys.readouterr()
+    lock_path = tmp_path / ".state" / "lifecycle.lock"
+    assert first_result == [0]
+    assert second_exit == cli.EXIT_UNEXPECTED
+    assert "locked" in (captured.out + captured.err).lower()
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_start_lifecycle_lock_blocks_another_process(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    lock_path = tmp_path / ".state" / "lifecycle.lock"
+    lock_path.parent.mkdir()
+    script = (
+        "import fcntl, os, sys; "
+        "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); "
+        "fcntl.flock(fd, fcntl.LOCK_EX); "
+        "print('locked', flush=True); sys.stdin.read(1)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout.readline().strip() == "locked"
+        exit_code = cli.main(
+            ["start", "--config", str(config_path)],
+            plist_path=tmp_path / "monitor.plist",
+            status_fn=lambda: (_ for _ in ()).throw(
+                AssertionError("locked command must not query launchctl")
+            ),
+            enable_fn=lambda: None,
+            bootstrap_fn=lambda path: None,
+            system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+        )
+    finally:
+        process.stdin.write("x")
+        process.stdin.flush()
+        process.wait(timeout=5)
+
+    assert exit_code == cli.EXIT_UNEXPECTED
+
+
+def test_lifecycle_lock_is_released_after_start_exception(tmp_path):
+    settings = start_settings(state_dir=tmp_path / ".state")
+    config_path = tmp_path / "config.json"
+    plist_path = tmp_path / "monitor.plist"
+    first = cli.main(
+        ["start", "--config", str(config_path)],
+        load_settings_fn=lambda path: settings,
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: (_ for _ in ()).throw(
+            LaunchdError("failed", stderr="safe")
+        ),
+        bootout_fn=lambda: None,
+        disable_fn=lambda: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+    second = cli.main(
+        ["start", "--config", str(config_path)],
+        load_settings_fn=lambda path: settings,
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert first == cli.EXIT_UNEXPECTED
+    assert second == 0
+
+
+def test_disabled_llm_does_not_persist_environment_api_key(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["llm"]["enabled"] = False
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", "stale-llm-key")
+
+    exit_code = cli.main(
+        ["start", "--config", str(config_path)],
+        plist_path=tmp_path / "monitor.plist",
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    content = runtime_path.read_text(encoding="utf-8")
+    assert exit_code == 0
+    assert json.loads(content)["llm"]["api_key"] is None
+    assert "stale-llm-key" not in content
+
+
+def test_cli_fsyncs_parent_after_runtime_and_plist_deletion(
+    tmp_path, monkeypatch
+):
+    runtime_path = tmp_path / "state" / "runtime.json"
+    plist_path = tmp_path / "agents" / "monitor.plist"
+    runtime_path.parent.mkdir()
+    plist_path.parent.mkdir()
+    runtime_path.write_text("runtime", encoding="utf-8")
+    plist_path.write_text("plist", encoding="utf-8")
+    synced = []
+    monkeypatch.setattr(cli, "_fsync_directory", synced.append)
+
+    cli._restore_private_file_strict(runtime_path, None)
+    cli._restore_plist_strict(plist_path, None, cli.write_plist)
+
+    assert synced == [runtime_path.parent, plist_path.parent]
+
+
 def test_start_failure_removes_new_runtime_snapshot_without_leaking_secrets(
     tmp_path, monkeypatch, capsys
 ):
@@ -904,6 +1131,7 @@ def test_start_write_failure_restores_plist_and_disables_agent(tmp_path):
         ["start", "--config", str(tmp_path / "config.json")],
         load_settings_fn=lambda path: settings,
         plist_path=plist_path,
+        status_fn=lambda: False,
         enable_fn=lambda: calls.append("enable"),
         write_plist_fn=failing_write,
         disable_fn=lambda: calls.append("disable"),
@@ -1010,6 +1238,7 @@ def test_start_bootstrap_retry_failure_cleans_up_and_preserves_stderr(tmp_path, 
         ["start", "--config", str(tmp_path / "config.json")],
         load_settings_fn=lambda path: settings,
         plist_path=plist_path,
+        status_fn=lambda: False,
         enable_fn=lambda: calls.append("enable"),
         write_plist_fn=lambda path, content: Path(path).write_text(content),
         bootstrap_fn=failing_bootstrap,

@@ -184,6 +184,15 @@ def test_write_plist_uses_private_permissions(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_write_plist_fsyncs_parent_directory_after_replace(tmp_path):
+    path = tmp_path / "LaunchAgents" / "monitor.plist"
+    synced = []
+
+    write_plist(path, "plist content", fsync_directory_fn=synced.append)
+
+    assert synced == [path.parent]
+
+
 def test_launchctl_disable_enable_and_idempotent_bootout_use_gui_label():
     commands = []
 
