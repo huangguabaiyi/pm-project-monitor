@@ -363,3 +363,32 @@ def test_corrupt_recovery_journal_remains_fail_closed_until_reset(tmp_path):
 
     store.reset_recovery_state()
     assert store.load() == MonitorState()
+
+
+def test_marker_write_failure_keeps_corrupt_recovery_evidence_in_place(
+    tmp_path,
+):
+    path = tmp_path / "monitor.json"
+    recovery_path = path.with_name("monitor.json.recovery")
+    marker_path = path.with_name("monitor.json.recovery.corrupt")
+    recovery_path.write_text("{broken recovery", encoding="utf-8")
+    store = StateStore(path, now=lambda: NOW)
+    original_atomic_write = store._atomic_write
+
+    def fail_marker_write(target_path, payload, error_code):
+        if target_path == marker_path:
+            raise StatePersistenceError(error_code)
+        return original_atomic_write(target_path, payload, error_code)
+
+    store._atomic_write = fail_marker_write
+
+    for _ in range(2):
+        with pytest.raises(
+            StatePersistenceError,
+            match="STATE_RECOVERY_MARKER_WRITE_FAILED",
+        ):
+            store.load()
+        assert recovery_path.read_text(encoding="utf-8") == "{broken recovery"
+        assert not marker_path.exists()
+
+    assert list(tmp_path.glob("monitor.json.recovery.corrupt-*.bak")) == []

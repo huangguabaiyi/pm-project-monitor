@@ -319,26 +319,30 @@ class MonitorRunner:
 
         active_fingerprints = set()
         active_requirements: Dict[str, str] = {}
+        mapped_fingerprints = set(state.active_fingerprint_requirements)
+        legacy_unmapped_fingerprints = (
+            state.active_fingerprints - mapped_fingerprints
+        )
+        evaluation_complete = report.invalid_records == 0
         for fingerprint, risk in severe_by_fingerprint.items():
             if (
                 fingerprint in state.active_fingerprints
                 or fingerprint in successful_severe
             ):
                 active_fingerprints.add(fingerprint)
-                active_requirements[fingerprint] = risk.requirement_id
+                if (
+                    fingerprint not in legacy_unmapped_fingerprints
+                    or evaluation_complete
+                ):
+                    active_requirements[fingerprint] = risk.requirement_id
         for fingerprint, requirement_id in (
             state.active_fingerprint_requirements.items()
         ):
             if requirement_id in failed_requirement_ids:
                 active_fingerprints.add(fingerprint)
                 active_requirements[fingerprint] = requirement_id
-        if failed_requirement_ids:
-            mapped_fingerprints = set(
-                state.active_fingerprint_requirements
-            )
-            active_fingerprints.update(
-                state.active_fingerprints - mapped_fingerprints
-            )
+        if not evaluation_complete:
+            active_fingerprints.update(legacy_unmapped_fingerprints)
         finished_at = self._current_time()
         report.finished_at = finished_at
         successful_run = report.failed_sends == 0 and not report.errors

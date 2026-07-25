@@ -294,7 +294,7 @@ class StateStore:
         try:
             journal = _RecoveryJournal.model_validate_json(contents)
         except (UnicodeError, ValidationError):
-            backup = self._backup_corrupt_file(self.recovery_path)
+            backup = self._corrupt_backup_path(self.recovery_path)
             self._atomic_write(
                 self.recovery_corruption_marker,
                 {
@@ -303,6 +303,7 @@ class StateStore:
                 },
                 "STATE_RECOVERY_MARKER_WRITE_FAILED",
             )
+            self._backup_corrupt_file(self.recovery_path, backup)
             raise StateCorruptionError(
                 "STATE_RECOVERY_CORRUPT_BLOCKED"
             ) from None
@@ -450,7 +451,7 @@ class StateStore:
     def _backup_corrupt_state(self) -> Path:
         return self._backup_corrupt_file(self.path)
 
-    def _backup_corrupt_file(self, file_path: Path) -> Path:
+    def _corrupt_backup_path(self, file_path: Path) -> Path:
         timestamp = self._now().strftime("%Y%m%dT%H%M%S%z")
         base_name = "{}.corrupt-{}.bak".format(file_path.name, timestamp)
         backup = file_path.with_name(base_name)
@@ -460,6 +461,14 @@ class StateStore:
                 "{}.{}.bak".format(base_name[:-4], suffix)
             )
             suffix += 1
+        return backup
+
+    def _backup_corrupt_file(
+        self,
+        file_path: Path,
+        backup: Optional[Path] = None,
+    ) -> Path:
+        backup = backup or self._corrupt_backup_path(file_path)
         try:
             os.replace(file_path, backup)
             os.chmod(backup, 0o600)

@@ -906,3 +906,54 @@ def test_legacy_unmapped_fingerprint_survives_failure_and_migrates_on_recovery()
     assert dependencies.state_store.state.active_fingerprint_requirements == {
         legacy_fingerprint: "REQ-001"
     }
+
+
+def test_legacy_unmapped_fingerprint_survives_invalid_requirement_then_migrates():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    requirement = dependencies.repository.snapshot.requirements[0]
+    legacy_fingerprint = severe_fingerprint(
+        make_risk(requirement, RiskLevel.SEVERE)
+    )
+    dependencies.state_store.state = MonitorState(
+        active_fingerprints={legacy_fingerprint}
+    )
+    dependencies.repository.snapshot.requirements = []
+    dependencies.repository.issues = [
+        ValidationIssue(
+            table_name="需求主表",
+            record_id=requirement.record_id,
+            requirement_id=requirement.requirement_id,
+            field_name="需求名称",
+            expected_format="非空文本",
+            fix_suggestion="补全需求名称后重试",
+            skip_scope="requirement",
+            message="需求记录校验失败",
+        )
+    ]
+    runner = dependencies.runner()
+
+    invalid = runner.run(trigger="manual")
+    dependencies.repository.snapshot.requirements = [requirement]
+    dependencies.repository.issues = []
+    recovered = runner.run(trigger="manual")
+
+    assert invalid.invalid_records == 1
+    assert legacy_fingerprint in dependencies.state_store.saved[0].active_fingerprints
+    assert dependencies.state_store.saved[0].active_fingerprint_requirements == {}
+    assert recovered.severe_cards == 0
+    assert dependencies.state_store.state.active_fingerprint_requirements == {
+        legacy_fingerprint: "REQ-001"
+    }
+
+
+def test_complete_evaluation_clears_obsolete_legacy_unmapped_fingerprint():
+    dependencies = FakeDependencies(level=RiskLevel.NORMAL)
+    dependencies.state_store.state = MonitorState(
+        active_fingerprints={"legacy-obsolete"}
+    )
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.invalid_records == 0
+    assert dependencies.state_store.state.active_fingerprints == set()
+    assert dependencies.state_store.state.active_fingerprint_requirements == {}
