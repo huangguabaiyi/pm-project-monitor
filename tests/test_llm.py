@@ -306,6 +306,53 @@ def test_llm_request_uses_anonymous_refs_and_sanitized_business_context(
     assert enrichment.effective_level == RiskLevel.SEVERE
 
 
+def test_llm_request_rejects_disguised_numeric_pii_and_invalid_metrics(
+    httpx_mock, llm_settings
+):
+    httpx_mock.add_response(json=response_content())
+    risk = make_risk().model_copy(
+        update={
+            "project_notes": (
+                "测试窗口包含13800138000天、13900139000%、"
+                "110105194912310021个工作日、7654321天、"
+                "/private/13800138000天、/private/123天；"
+                "安全信号为7天、30个工作日、85%、100%、2026-07-30；"
+                "异常信号为101%和999天"
+            )
+        }
+    )
+
+    LLMClient(llm_settings).enrich(risk, "固定规则", "")
+
+    body = httpx_mock.get_request().content.decode("utf-8")
+    user_input = json.loads(json.loads(body)["messages"][1]["content"])
+    serialized = json.dumps(user_input, ensure_ascii=False)
+    for forbidden in (
+        "13800138000",
+        "13800138000天",
+        "13900139000",
+        "13900139000%",
+        "110105194912310021",
+        "110105194912310021个工作日",
+        "7654321",
+        "7654321天",
+        "/private/13800138000天",
+        "/private/123天",
+        "101%",
+        "999天",
+    ):
+        assert forbidden not in serialized
+    for allowed in (
+        "7天",
+        "30个工作日",
+        "85%",
+        "100%",
+        "2026-07-30",
+    ):
+        assert allowed in serialized
+    assert "[REDACTED]" in serialized
+
+
 @pytest.mark.parametrize(
     ("chinese_level", "expected"),
     (

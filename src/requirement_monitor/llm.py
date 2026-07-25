@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from datetime import date
 from typing import Annotated, Any, Dict, Iterable, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -45,9 +46,15 @@ _DATE_PATTERN = re.compile(
 )
 _SHORT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日(?!\d)")
 _DAY_COUNT_PATTERN = re.compile(
-    r"(?<![\dA-Za-z])\d+(?:\.\d+)?\s*(?:个)?(?:工作日|自然日|天)(?![\dA-Za-z])"
+    r"(?<![\dA-Za-z])(\d{1,3})\s*(个)?(工作日|自然日|天)(?![\dA-Za-z])"
 )
-_PERCENT_PATTERN = re.compile(r"(?<![\dA-Za-z])\d+(?:\.\d+)?\s*[%％]")
+_PERCENT_PATTERN = re.compile(
+    r"(?<![\dA-Za-z])(\d{1,3})(?:\.(\d))?\s*[%％](?![\dA-Za-z])"
+)
+_PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_IDENTITY_PATTERN = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
+_LONG_DIGIT_PATTERN = re.compile(r"(?<!\d)\d{7,}(?!\d)")
+_NUMERIC_PATH_PATTERN = re.compile(r"(?<=/)\d+")
 _SAFE_BUSINESS_KEYWORDS = (
     "进行中",
     "未开始",
@@ -375,6 +382,11 @@ def _safe_signal_summary(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
     sanitized = _URL_PATTERN.sub("[URL]", value)
+    sanitized = _DATE_PATTERN.sub(_normalize_full_date, sanitized)
+    sanitized = _NUMERIC_PATH_PATTERN.sub("[REDACTED]", sanitized)
+    sanitized = _PHONE_PATTERN.sub("[REDACTED]", sanitized)
+    sanitized = _IDENTITY_PATTERN.sub("[REDACTED]", sanitized)
+    sanitized = _LONG_DIGIT_PATTERN.sub("[REDACTED]", sanitized)
     signals: List[Tuple[int, int, str]] = []
     signals.extend(
         (match.start(), match.end(), "[URL]")
@@ -390,28 +402,22 @@ def _safe_signal_summary(value: Any, label: str) -> str:
         )
         for match in _DATE_PATTERN.finditer(sanitized)
     )
-    signals.extend(
-        (
-            match.start(),
-            match.end(),
-            "{:02d}-{:02d}".format(
-                int(match.group(1)), int(match.group(2))
-            ),
-        )
-        for match in _SHORT_DATE_PATTERN.finditer(sanitized)
-    )
-    signals.extend(
-        (match.start(), match.end(), re.sub(r"\s+", "", match.group(0)))
-        for match in _DAY_COUNT_PATTERN.finditer(sanitized)
-    )
-    signals.extend(
-        (
-            match.start(),
-            match.end(),
-            re.sub(r"\s+", "", match.group(0)).replace("％", "%"),
-        )
-        for match in _PERCENT_PATTERN.finditer(sanitized)
-    )
+    for match in _SHORT_DATE_PATTERN.finditer(sanitized):
+        token = _normalize_short_date(match)
+        if token is not None:
+            signals.append((match.start(), match.end(), token))
+    for match in _DAY_COUNT_PATTERN.finditer(sanitized):
+        count = int(match.group(1))
+        if count <= 365:
+            unit = "{}{}".format(match.group(2) or "", match.group(3))
+            signals.append((match.start(), match.end(), f"{count}{unit}"))
+    for match in _PERCENT_PATTERN.finditer(sanitized):
+        whole = int(match.group(1))
+        decimal = match.group(2)
+        percentage = whole + (int(decimal) / 10 if decimal else 0)
+        if percentage <= 100:
+            token = f"{whole}.{decimal}%" if decimal else f"{whole}%"
+            signals.append((match.start(), match.end(), token))
     for keyword in _SAFE_BUSINESS_KEYWORDS:
         signals.extend(
             (match.start(), match.end(), keyword)
@@ -442,3 +448,22 @@ def _safe_signal_summary(value: Any, label: str) -> str:
     if not tokens:
         tokens.append("[REDACTED]")
     return f"{label}：{'；'.join(tokens)}"
+
+
+def _normalize_full_date(match: re.Match) -> str:
+    try:
+        return date(
+            int(match.group(1)), int(match.group(2)), int(match.group(3))
+        ).isoformat()
+    except ValueError:
+        return "[REDACTED]"
+
+
+def _normalize_short_date(match: re.Match) -> Optional[str]:
+    month = int(match.group(1))
+    day = int(match.group(2))
+    try:
+        date(2000, month, day)
+    except ValueError:
+        return None
+    return f"{month:02d}-{day:02d}"
