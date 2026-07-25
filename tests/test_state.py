@@ -1,5 +1,9 @@
 import json
+import multiprocessing
 import stat
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -18,6 +22,27 @@ from requirement_monitor.state import (
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 7, 25, 9, 30, tzinfo=SHANGHAI)
+
+
+def _hold_state_run_lock(path, ready, release, result_queue):
+    store = StateStore(Path(path))
+    try:
+        with store.run_lock():
+            ready.set()
+            result_queue.put("acquired")
+            release.wait(5)
+    except Exception as error:
+        ready.set()
+        result_queue.put(str(error))
+
+
+def _try_state_run_lock(path, result_queue):
+    store = StateStore(Path(path))
+    try:
+        with store.run_lock():
+            result_queue.put("acquired")
+    except Exception as error:
+        result_queue.put(str(error))
 
 
 def test_missing_state_loads_safe_defaults(tmp_path):
@@ -227,3 +252,114 @@ def test_recovery_journal_replays_scheduled_attempt_and_severe_confirmation(
     assert store.load() == recovered
     journal_path = path.with_name("monitor.json.recovery")
     assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
+
+
+def test_recovery_appends_from_two_threads_do_not_lose_events(tmp_path):
+    path = tmp_path / "monitor.json"
+    stores = [StateStore(path), StateStore(path)]
+    start = threading.Barrier(2)
+    original_loaders = [store._load_recovery_journal for store in stores]
+
+    for store, original_loader in zip(stores, original_loaders):
+        def delayed_loader(loader=original_loader):
+            journal = loader()
+            time.sleep(0.05)
+            return journal
+
+        store._load_recovery_journal = delayed_loader
+
+    def append(index):
+        start.wait()
+        stores[index].record_scheduled_attempt(
+            "2026-07-25|项目{}".format(index),
+            ScheduledDailyResult(
+                scheduled_date=NOW.date(),
+                project="项目{}".format(index),
+                attempted_at=NOW,
+                result="attempted",
+            ),
+        )
+
+    threads = [threading.Thread(target=append, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    recovered = StateStore(path).load()
+    assert not any(thread.is_alive() for thread in threads)
+    assert set(recovered.scheduled_daily_results) == {
+        "2026-07-25|项目0",
+        "2026-07-25|项目1",
+    }
+
+
+def test_run_lock_rejects_second_process_and_has_private_permissions(tmp_path):
+    path = tmp_path / "monitor.json"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder_results = context.Queue()
+    contender_results = context.Queue()
+    holder = context.Process(
+        target=_hold_state_run_lock,
+        args=(str(path), ready, release, holder_results),
+    )
+    contender = context.Process(
+        target=_try_state_run_lock,
+        args=(str(path), contender_results),
+    )
+    try:
+        holder.start()
+        assert ready.wait(5)
+        assert holder_results.get(timeout=5) == "acquired"
+        contender.start()
+        assert contender_results.get(timeout=5) == "RUN_LOCKED"
+    finally:
+        release.set()
+        if holder.pid is not None:
+            holder.join(timeout=5)
+        if contender.pid is not None:
+            contender.join(timeout=5)
+        if holder.is_alive():
+            holder.terminate()
+        if contender.is_alive():
+            contender.terminate()
+
+    lock_path = path.with_name("monitor.json.run.lock")
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_run_lock_releases_after_body_error_without_masking(tmp_path):
+    store = StateStore(tmp_path / "monitor.json")
+
+    with pytest.raises(RuntimeError, match="run failed"):
+        with store.run_lock():
+            raise RuntimeError("run failed")
+
+    with store.run_lock():
+        pass
+
+
+def test_corrupt_recovery_journal_remains_fail_closed_until_reset(tmp_path):
+    path = tmp_path / "monitor.json"
+    recovery_path = path.with_name("monitor.json.recovery")
+    recovery_path.write_text("{broken recovery", encoding="utf-8")
+    store = StateStore(path, now=lambda: NOW)
+
+    with pytest.raises(StateCorruptionError, match="STATE_RECOVERY_CORRUPT"):
+        store.load()
+    with pytest.raises(StateCorruptionError, match="STATE_RECOVERY_CORRUPT"):
+        store.load()
+
+    marker = path.with_name("monitor.json.recovery.corrupt")
+    backups = list(
+        tmp_path.glob("monitor.json.recovery.corrupt-20260725T093000+0800.bak")
+    )
+    assert marker.exists()
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{broken recovery"
+
+    store.reset_recovery_state()
+    assert store.load() == MonitorState()

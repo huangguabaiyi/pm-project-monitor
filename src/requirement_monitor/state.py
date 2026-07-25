@@ -1,7 +1,10 @@
+import fcntl
 import json
 import os
 import re
 import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Set, Union
@@ -22,6 +25,24 @@ class StateCorruptionError(RuntimeError):
 
 class StatePersistenceError(RuntimeError):
     """Raised with a fixed code when state I/O cannot complete safely."""
+
+
+class RunLockUnavailable(RuntimeError):
+    """Raised when another monitor run owns the process lock."""
+
+
+_THREAD_LOCKS: Dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _THREAD_LOCKS[key] = lock
+        return lock
 
 
 _SAFE_SEND_ERROR_CODES = {
@@ -140,11 +161,26 @@ class StateStore:
         self.recovery_path = self.path.with_name(
             "{}.recovery".format(self.path.name)
         )
+        self.run_lock_path = self.path.with_name(
+            "{}.run.lock".format(self.path.name)
+        )
+        self.recovery_lock_path = self.path.with_name(
+            "{}.recovery.lock".format(self.path.name)
+        )
+        self.recovery_corruption_marker = self.path.with_name(
+            "{}.recovery.corrupt".format(self.path.name)
+        )
         self._now = now or datetime.now
+
+    @contextmanager
+    def run_lock(self):
+        with self._file_lock(self.run_lock_path, blocking=False):
+            yield
 
     def load(self) -> MonitorState:
         state = self._load_main_state()
-        journal = self._load_recovery_journal()
+        with self._file_lock(self.recovery_lock_path, blocking=True):
+            journal = self._load_recovery_journal()
         scheduled_daily_results = dict(state.scheduled_daily_results)
         active_fingerprints = set(state.active_fingerprints)
         active_requirements = dict(state.active_fingerprint_requirements)
@@ -201,21 +237,22 @@ class StateStore:
     def record_scheduled_attempt(
         self, key: str, result: ScheduledDailyResult
     ) -> int:
-        journal = self._load_recovery_journal()
-        sequence = journal.next_sequence
-        event = _ScheduledAttemptEvent(
-            sequence=sequence,
-            key=key,
-            result=result,
-        )
-        self._write_recovery_journal(
-            journal.model_copy(
-                update={
-                    "next_sequence": sequence + 1,
-                    "events": journal.events + [event],
-                }
+        with self._file_lock(self.recovery_lock_path, blocking=True):
+            journal = self._load_recovery_journal()
+            sequence = journal.next_sequence
+            event = _ScheduledAttemptEvent(
+                sequence=sequence,
+                key=key,
+                result=result,
             )
-        )
+            self._write_recovery_journal(
+                journal.model_copy(
+                    update={
+                        "next_sequence": sequence + 1,
+                        "events": journal.events + [event],
+                    }
+                )
+            )
         return sequence
 
     def record_severe_confirmation(
@@ -224,25 +261,30 @@ class StateStore:
         requirement_id: str,
         confirmed_at: datetime,
     ) -> int:
-        journal = self._load_recovery_journal()
-        sequence = journal.next_sequence
-        event = _SevereConfirmationEvent(
-            sequence=sequence,
-            fingerprint=fingerprint,
-            requirement_id=requirement_id,
-            confirmed_at=confirmed_at,
-        )
-        self._write_recovery_journal(
-            journal.model_copy(
-                update={
-                    "next_sequence": sequence + 1,
-                    "events": journal.events + [event],
-                }
+        with self._file_lock(self.recovery_lock_path, blocking=True):
+            journal = self._load_recovery_journal()
+            sequence = journal.next_sequence
+            event = _SevereConfirmationEvent(
+                sequence=sequence,
+                fingerprint=fingerprint,
+                requirement_id=requirement_id,
+                confirmed_at=confirmed_at,
             )
-        )
+            self._write_recovery_journal(
+                journal.model_copy(
+                    update={
+                        "next_sequence": sequence + 1,
+                        "events": journal.events + [event],
+                    }
+                )
+            )
         return sequence
 
     def _load_recovery_journal(self) -> _RecoveryJournal:
+        if self.recovery_corruption_marker.exists():
+            raise StateCorruptionError(
+                "STATE_RECOVERY_CORRUPT_BLOCKED"
+            ) from None
         if not self.recovery_path.exists():
             return _RecoveryJournal()
         try:
@@ -252,9 +294,17 @@ class StateStore:
         try:
             journal = _RecoveryJournal.model_validate_json(contents)
         except (UnicodeError, ValidationError):
-            self._backup_corrupt_file(self.recovery_path)
+            backup = self._backup_corrupt_file(self.recovery_path)
+            self._atomic_write(
+                self.recovery_corruption_marker,
+                {
+                    "error_code": "STATE_RECOVERY_CORRUPT_BLOCKED",
+                    "backup_name": backup.name,
+                },
+                "STATE_RECOVERY_MARKER_WRITE_FAILED",
+            )
             raise StateCorruptionError(
-                "STATE_RECOVERY_CORRUPT_BACKED_UP"
+                "STATE_RECOVERY_CORRUPT_BLOCKED"
             ) from None
         try:
             os.chmod(self.recovery_path, 0o600)
@@ -273,19 +323,80 @@ class StateStore:
         )
 
     def _prune_recovery_journal(self, recovery_cursor: int) -> None:
-        if not self.recovery_path.exists():
-            return
-        journal = self._load_recovery_journal()
-        remaining = [
-            event
-            for event in journal.events
-            if event.sequence > recovery_cursor
-        ]
-        if len(remaining) == len(journal.events):
-            return
-        self._write_recovery_journal(
-            journal.model_copy(update={"events": remaining})
-        )
+        with self._file_lock(self.recovery_lock_path, blocking=True):
+            if not self.recovery_path.exists():
+                return
+            journal = self._load_recovery_journal()
+            remaining = [
+                event
+                for event in journal.events
+                if event.sequence > recovery_cursor
+            ]
+            if len(remaining) == len(journal.events):
+                return
+            self._write_recovery_journal(
+                journal.model_copy(update={"events": remaining})
+            )
+
+    def reset_recovery_state(self) -> None:
+        with self._file_lock(self.recovery_lock_path, blocking=True):
+            for target in (
+                self.recovery_path,
+                self.recovery_corruption_marker,
+            ):
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    raise StatePersistenceError(
+                        "STATE_RECOVERY_RESET_FAILED"
+                    ) from None
+
+    @contextmanager
+    def _file_lock(self, lock_path: Path, *, blocking: bool):
+        thread_lock = _thread_lock(lock_path)
+        acquired = thread_lock.acquire(blocking=blocking)
+        if not acquired:
+            raise RunLockUnavailable("RUN_LOCKED")
+        file_descriptor: Optional[int] = None
+        file_locked = False
+        try:
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                file_descriptor = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_RDWR,
+                    0o600,
+                )
+                os.chmod(lock_path, 0o600)
+                operation = fcntl.LOCK_EX
+                if not blocking:
+                    operation |= fcntl.LOCK_NB
+                try:
+                    fcntl.flock(file_descriptor, operation)
+                except BlockingIOError:
+                    raise RunLockUnavailable("RUN_LOCKED") from None
+                file_locked = True
+            except RunLockUnavailable:
+                raise
+            except MemoryError:
+                raise
+            except Exception:
+                raise StatePersistenceError("STATE_LOCK_ERROR") from None
+            yield
+        finally:
+            if file_descriptor is not None:
+                if file_locked:
+                    try:
+                        fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+            thread_lock.release()
 
     def _atomic_write(
         self,

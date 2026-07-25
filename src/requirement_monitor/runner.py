@@ -31,7 +31,9 @@ from requirement_monitor.risk import evaluate_requirement
 from requirement_monitor.state import (
     MonitorState,
     RecentSend,
+    RunLockUnavailable,
     ScheduledDailyResult,
+    StatePersistenceError,
     StateStore,
     normalize_send_error_code,
 )
@@ -89,6 +91,37 @@ class MonitorRunner:
 
     def run(self, trigger: str, dry_run: bool = False) -> MonitorRunReport:
         started_at = self._current_time()
+        try:
+            with self.state_store.run_lock():
+                return self._run_locked(trigger, dry_run, started_at)
+        except RunLockUnavailable:
+            return MonitorRunReport(
+                trigger=trigger,
+                started_at=started_at,
+                finished_at=self._current_time(),
+                dry_run=dry_run,
+                llm_skipped=dry_run,
+                errors=["RUN_LOCKED"],
+            )
+        except MemoryError:
+            raise
+        except StatePersistenceError:
+            report = MonitorRunReport(
+                trigger=trigger,
+                started_at=started_at,
+                dry_run=dry_run,
+                llm_skipped=dry_run,
+            )
+            return self._finish_runtime_failure(
+                report, "STATE_LOCK_ERROR", dry_run
+            )
+
+    def _run_locked(
+        self,
+        trigger: str,
+        dry_run: bool,
+        started_at: datetime,
+    ) -> MonitorRunReport:
         report = MonitorRunReport(
             trigger=trigger,
             started_at=started_at,
@@ -299,6 +332,13 @@ class MonitorRunner:
             if requirement_id in failed_requirement_ids:
                 active_fingerprints.add(fingerprint)
                 active_requirements[fingerprint] = requirement_id
+        if failed_requirement_ids:
+            mapped_fingerprints = set(
+                state.active_fingerprint_requirements
+            )
+            active_fingerprints.update(
+                state.active_fingerprints - mapped_fingerprints
+            )
         finished_at = self._current_time()
         report.finished_at = finished_at
         successful_run = report.failed_sends == 0 and not report.errors

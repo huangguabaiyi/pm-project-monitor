@@ -3,6 +3,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import threading
+from contextlib import contextmanager
 
 from requirement_monitor.models import (
     DataSnapshot,
@@ -18,8 +20,12 @@ from requirement_monitor.models import (
     SendResult,
     ValidationIssue,
 )
-from requirement_monitor.runner import MonitorRunner
-from requirement_monitor.state import MonitorState, StatePersistenceError
+from requirement_monitor.runner import MonitorRunner, severe_fingerprint
+from requirement_monitor.state import (
+    MonitorState,
+    RunLockUnavailable,
+    StatePersistenceError,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -235,6 +241,16 @@ class FakeStateStore:
         self.recovery_scheduled = {}
         self.recovery_severe = {}
         self.recovery_sequence = 0
+        self.run_mutex = threading.Lock()
+
+    @contextmanager
+    def run_lock(self):
+        if not self.run_mutex.acquire(blocking=False):
+            raise RunLockUnavailable("RUN_LOCKED")
+        try:
+            yield
+        finally:
+            self.run_mutex.release()
 
     def load(self):
         self.events.append("state_load")
@@ -825,3 +841,68 @@ def test_runner_normalizes_utc_clock_to_configured_timezone_before_date_keys():
     assert "2026-07-25|米家" in (
         dependencies.state_store.state.scheduled_daily_results
     )
+
+
+def test_overlapping_runner_is_rejected_while_first_run_holds_lock():
+    dependencies = FakeDependencies()
+    entered = threading.Event()
+    release = threading.Event()
+    call_count = [0]
+
+    def blocking_auth():
+        call_count[0] += 1
+        if call_count[0] == 1:
+            entered.set()
+            release.wait(5)
+        return {"authenticated": True}
+
+    dependencies.feishu.auth_status = blocking_auth
+    runner = dependencies.runner()
+    first_report = []
+    first_thread = threading.Thread(
+        target=lambda: first_report.append(runner.run(trigger="manual"))
+    )
+    first_thread.start()
+    assert entered.wait(5)
+
+    second = runner.run(trigger="scheduled")
+    release.set()
+    first_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert first_report[0].processed_requirements == 1
+    assert second.errors == ["RUN_LOCKED"]
+    assert second.sent_cards == 0
+
+
+def test_legacy_unmapped_fingerprint_survives_failure_and_migrates_on_recovery():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    requirement = dependencies.repository.snapshot.requirements[0]
+    legacy_fingerprint = severe_fingerprint(
+        make_risk(requirement, RiskLevel.SEVERE)
+    )
+    dependencies.state_store.state = MonitorState(
+        active_fingerprints={legacy_fingerprint}
+    )
+    call_count = [0]
+
+    def failing_then_recovered(
+        requirement, nodes, blockers, fixed_rules, now, project_config
+    ):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise RuntimeError("temporary calculation failure")
+        return make_risk(requirement, RiskLevel.SEVERE)
+
+    runner = dependencies.runner()
+    runner.risk_evaluator = failing_then_recovered
+
+    failed = runner.run(trigger="manual")
+    recovered = runner.run(trigger="manual")
+
+    assert failed.invalid_records == 1
+    assert legacy_fingerprint in dependencies.state_store.saved[0].active_fingerprints
+    assert recovered.severe_cards == 0
+    assert dependencies.state_store.state.active_fingerprint_requirements == {
+        legacy_fingerprint: "REQ-001"
+    }
