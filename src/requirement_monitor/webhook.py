@@ -12,7 +12,6 @@ from .models import SendResult
 MAX_PAYLOAD_BYTES = 20 * 1024
 _RETRY_DELAYS = (10, 30, 120)
 _CARD_FORMAT_HTTP_STATUSES = {400, 413, 422}
-_RETRYABLE_FEISHU_CODES = {99991402, 11020, 11021}
 
 
 class WebhookSender:
@@ -177,10 +176,6 @@ class WebhookSender:
                 )
 
             last_error = "feishu_error_{}".format(feishu_code)
-            if self._is_retryable_feishu_code(feishu_code) and self._retry(
-                attempts, max_attempts
-            ):
-                continue
             return SendResult(
                 success=False,
                 attempts=attempts,
@@ -305,14 +300,6 @@ class WebhookSender:
             if isinstance(value, int) and not isinstance(value, bool):
                 return value
         return None
-
-    @staticmethod
-    def _is_retryable_feishu_code(code: int) -> bool:
-        return (
-            code in _RETRYABLE_FEISHU_CODES
-            or 500 <= code < 600
-            or 50000 <= code < 60000
-        )
 
     @staticmethod
     def _is_secure_webhook_url(webhook_url: object) -> bool:

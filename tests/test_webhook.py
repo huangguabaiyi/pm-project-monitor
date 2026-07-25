@@ -89,18 +89,31 @@ def test_sender_retries_timeout_without_exposing_request(
     assert webhook_url not in repr(result)
 
 
-def test_retryable_feishu_code_retries_then_succeeds(
+def test_nonzero_feishu_code_never_retries(
     httpx_mock, webhook_url, card_payload
 ):
     sleeps = []
-    httpx_mock.add_response(json={"code": 99991402, "msg": "rate limited"})
-    httpx_mock.add_response(json={"code": 0})
+    httpx_mock.add_response(
+        json={
+            "code": 99991402,
+            "msg": "rate limited for {} at {}".format(
+                WEBHOOK_TOKEN, webhook_url
+            ),
+        }
+    )
 
     result = WebhookSender(webhook_url, sleep=sleeps.append).send(card_payload)
 
-    assert result.success is True
-    assert result.attempts == 2
-    assert sleeps == [10]
+    assert result.success is False
+    assert result.attempts == 1
+    assert result.status_code == 200
+    assert result.feishu_code == 99991402
+    assert result.format_used == "card"
+    assert result.error == "feishu_error_99991402"
+    assert sleeps == []
+    assert len(httpx_mock.get_requests()) == 1
+    assert WEBHOOK_TOKEN not in repr(result)
+    assert webhook_url not in repr(result)
 
 
 def test_nonzero_feishu_code_is_an_immediate_failure(
