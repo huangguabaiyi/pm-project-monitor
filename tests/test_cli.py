@@ -1,4 +1,5 @@
 import json
+import plistlib
 import stat
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,59 @@ import pytest
 
 from requirement_monitor import cli
 from requirement_monitor.launchd import LaunchdError
+
+
+WEBHOOK_URL = (
+    "https://open.feishu.cn/open-apis/bot/v2/hook/runtime-webhook-secret"
+)
+
+
+def write_operational_config(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "bitable_url": "https://mi.feishu.cn/wiki/base",
+                "fixed_rules_path": "固定业务规则",
+                "timezone": "Asia/Shanghai",
+                "send_hour": 20,
+                "send_minute": 0,
+                "state_dir": ".state",
+                "log_dir": "logs",
+                "llm": {
+                    "enabled": True,
+                    "base_url": "https://llm.example/v1",
+                    "model": "test-model",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def start_settings(
+    *,
+    state_dir: Path = Path(".state"),
+    log_dir: Path = Path("logs"),
+    fixed_rules_path: Path = Path("固定业务规则"),
+):
+    return SimpleNamespace(
+        bitable_url="https://mi.feishu.cn/wiki/base",
+        webhook_url=WEBHOOK_URL,
+        bot_keyword=None,
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=state_dir,
+        log_dir=log_dir,
+        fixed_rules_path=fixed_rules_path,
+        llm=SimpleNamespace(
+            enabled=False,
+            base_url=None,
+            api_key=None,
+            model=None,
+            timeout_seconds=20,
+        ),
+    )
 
 
 def test_version_command(capsys):
@@ -379,14 +433,7 @@ def test_status_missing_service_is_stopped_but_launchctl_error_is_five(
 
 def test_start_writes_private_plist_and_bootstraps(tmp_path):
     calls = []
-    settings = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        send_hour=20,
-        send_minute=0,
-        state_dir=Path(".state"),
-        log_dir=Path("logs"),
-        fixed_rules_path=Path("固定业务规则"),
-    )
+    settings = start_settings()
     plist_path = tmp_path / "monitor.plist"
 
     exit_code = cli.main(
@@ -404,12 +451,281 @@ def test_start_writes_private_plist_and_bootstraps(tmp_path):
     assert "Asia/Shanghai" in plist_path.read_text()
 
 
+def test_start_snapshots_environment_secrets_for_launchagent_scheduled_run(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    llm_api_key = "runtime-llm-secret"
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", llm_api_key)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_BOT_KEYWORD", "需求机器人")
+    plist_path = tmp_path / "monitor.plist"
+
+    exit_code = cli.main(
+        ["start", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_data = json.loads(runtime_path.read_text(encoding="utf-8"))
+    plist = plistlib.loads(plist_path.read_bytes())
+    assert exit_code == 0
+    assert stat.S_IMODE(runtime_path.stat().st_mode) == 0o600
+    assert runtime_data["webhook_url"] == WEBHOOK_URL
+    assert runtime_data["bot_keyword"] == "需求机器人"
+    assert runtime_data["llm"]["api_key"] == llm_api_key
+    assert runtime_data["fixed_rules_path"] == str(
+        (tmp_path / "固定业务规则").resolve()
+    )
+    assert runtime_data["state_dir"] == str((tmp_path / ".state").resolve())
+    assert runtime_data["log_dir"] == str((tmp_path / "logs").resolve())
+    assert plist["ProgramArguments"][-1] == str(runtime_path)
+    assert b"runtime-webhook-secret" not in plist_path.read_bytes()
+    assert llm_api_key.encode("utf-8") not in plist_path.read_bytes()
+
+    monkeypatch.delenv("REQUIREMENT_MONITOR_WEBHOOK_URL")
+    monkeypatch.delenv("REQUIREMENT_MONITOR_LLM_API_KEY")
+    monkeypatch.delenv("REQUIREMENT_MONITOR_BOT_KEYWORD")
+    loaded = {}
+
+    class FakeRunner:
+        webhook = None
+
+        def run(self, *, trigger, dry_run=False):
+            return SimpleNamespace(
+                finished_at="2026-07-27T20:02:00+08:00",
+                trigger=trigger,
+                payloads=[],
+                errors=[],
+                failed_sends=0,
+                sent_cards=1,
+                llm_degraded=False,
+                llm_failure_reasons=[],
+            )
+
+    def runner_factory(settings, loaded_config_path):
+        loaded["webhook_url"] = settings.webhook_url.get_secret_value()
+        loaded["bot_keyword"] = settings.bot_keyword
+        loaded["llm_api_key"] = settings.llm.api_key.get_secret_value()
+        loaded["config_path"] = loaded_config_path
+        return FakeRunner()
+
+    scheduled_exit = cli.main(
+        ["scheduled-run", "--config", str(runtime_path)],
+        runner_factory_fn=runner_factory,
+        now_fn=lambda: datetime(
+            2026, 7, 27, 20, 2, tzinfo=ZoneInfo("Asia/Shanghai")
+        ),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert scheduled_exit == 0
+    assert loaded == {
+        "webhook_url": WEBHOOK_URL,
+        "bot_keyword": "需求机器人",
+        "llm_api_key": llm_api_key,
+        "config_path": runtime_path,
+    }
+    assert "runtime-webhook-secret" not in rendered
+    assert llm_api_key not in rendered
+
+
+def test_runtime_config_commands_do_not_echo_secrets(tmp_path, capsys):
+    runtime_path = tmp_path / "runtime-config.json"
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "bitable_url": "https://mi.feishu.cn/wiki/base",
+                "webhook_url": WEBHOOK_URL,
+                "bot_keyword": "需求机器人",
+                "fixed_rules_path": str(tmp_path / "固定业务规则"),
+                "timezone": "Asia/Shanghai",
+                "send_hour": 20,
+                "send_minute": 0,
+                "state_dir": str(tmp_path / ".state"),
+                "log_dir": str(tmp_path / "logs"),
+                "llm": {
+                    "enabled": True,
+                    "base_url": "https://llm.example/v1",
+                    "api_key": "runtime-llm-secret",
+                    "model": "test-model",
+                    "timeout_seconds": 20,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeRunner:
+        webhook = None
+
+        def run(self, *, trigger, dry_run=False):
+            return SimpleNamespace(
+                finished_at="2026-07-25T12:00:00+08:00",
+                trigger=trigger,
+                payloads=[{"msg_type": "text", "content": {"text": "preview"}}],
+                errors=[],
+                failed_sends=0,
+                sent_cards=0,
+                llm_degraded=False,
+                llm_failure_reasons=[],
+            )
+
+    assert (
+        cli.main(
+            ["status", "--config", str(runtime_path)],
+            status_fn=lambda: False,
+        )
+        == 0
+    )
+    assert cli.main(["logs", "--config", str(runtime_path)]) == 0
+    assert (
+        cli.main(
+            ["run-once", "--dry-run", "--config", str(runtime_path)],
+            runner_factory_fn=lambda settings, path: FakeRunner(),
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert "runtime-webhook-secret" not in rendered
+    assert "runtime-llm-secret" not in rendered
+
+
+def test_restart_rewrites_runtime_snapshot_with_current_environment(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    plist_path = tmp_path / "monitor.plist"
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+
+    first_exit = cli.main(
+        ["start", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    replacement_url = (
+        "https://open.feishu.cn/open-apis/bot/v2/hook/replacement-secret"
+    )
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", replacement_url)
+    restart_calls = []
+    restart_exit = cli.main(
+        ["restart", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        bootout_fn=lambda: restart_calls.append("bootout"),
+        disable_fn=lambda: restart_calls.append("disable"),
+        enable_fn=lambda: restart_calls.append("enable"),
+        bootstrap_fn=lambda path: restart_calls.append("bootstrap"),
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_data = json.loads(runtime_path.read_text(encoding="utf-8"))
+    assert first_exit == 0
+    assert restart_exit == 0
+    assert runtime_data["webhook_url"] == replacement_url
+    assert restart_calls == ["bootout", "disable", "enable", "bootstrap"]
+
+
+def test_stop_retains_runtime_snapshot(tmp_path):
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_path.parent.mkdir()
+    runtime_path.write_text("private runtime config", encoding="utf-8")
+
+    exit_code = cli.main(
+        ["stop"],
+        bootout_fn=lambda: None,
+        disable_fn=lambda: None,
+    )
+
+    assert exit_code == 0
+    assert runtime_path.read_text(encoding="utf-8") == "private runtime config"
+
+
+def test_start_failure_removes_new_runtime_snapshot_without_leaking_secrets(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", "new-llm-secret")
+    plist_path = tmp_path / "monitor.plist"
+
+    exit_code = cli.main(
+        ["start", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        write_plist_fn=lambda path, content: (_ for _ in ()).throw(
+            OSError("plist write failed")
+        ),
+        bootstrap_fn=lambda path: None,
+        disable_fn=lambda: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert not (tmp_path / ".state" / "runtime-config.json").exists()
+    assert "runtime-webhook-secret" not in rendered
+    assert "new-llm-secret" not in rendered
+
+
+def test_start_failure_restores_previous_runtime_snapshot(
+    tmp_path, monkeypatch, capsys
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", "new-llm-secret")
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_path.parent.mkdir()
+    previous_content = b'{"webhook_url":"old-secret"}'
+    runtime_path.write_bytes(previous_content)
+    runtime_path.chmod(0o600)
+    plist_path = tmp_path / "monitor.plist"
+    plist_path.write_text("old plist", encoding="utf-8")
+
+    def failing_bootstrap(path):
+        raise LaunchdError("bootstrap failed", stderr="safe failure")
+
+    exit_code = cli.main(
+        ["start", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=failing_bootstrap,
+        bootout_fn=lambda: None,
+        disable_fn=lambda: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert runtime_path.read_bytes() == previous_content
+    assert stat.S_IMODE(runtime_path.stat().st_mode) == 0o600
+    assert "runtime-webhook-secret" not in rendered
+    assert "new-llm-secret" not in rendered
+
+
 def test_start_write_failure_restores_plist_and_disables_agent(tmp_path):
     calls = []
-    settings = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        send_hour=20,
-        send_minute=0,
+    settings = start_settings(
         state_dir=tmp_path / ".state",
         log_dir=tmp_path / "logs",
         fixed_rules_path=tmp_path / "固定业务规则",
@@ -443,10 +759,7 @@ def test_start_uses_default_status_query_for_loaded_rollback(
     tmp_path, monkeypatch
 ):
     calls = []
-    settings = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        send_hour=20,
-        send_minute=0,
+    settings = start_settings(
         state_dir=tmp_path / ".state",
         log_dir=tmp_path / "logs",
         fixed_rules_path=tmp_path / "固定业务规则",
@@ -474,10 +787,7 @@ def test_start_uses_default_status_query_for_loaded_rollback(
 
 
 def test_start_rollback_reuses_atomic_private_plist_writer(tmp_path, monkeypatch):
-    settings = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        send_hour=20,
-        send_minute=0,
+    settings = start_settings(
         state_dir=tmp_path / ".state",
         log_dir=tmp_path / "logs",
         fixed_rules_path=tmp_path / "固定业务规则",
@@ -521,10 +831,7 @@ def test_start_rollback_reuses_atomic_private_plist_writer(tmp_path, monkeypatch
 
 def test_start_bootstrap_retry_failure_cleans_up_and_preserves_stderr(tmp_path, capsys):
     calls = []
-    settings = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        send_hour=20,
-        send_minute=0,
+    settings = start_settings(
         state_dir=tmp_path / ".state",
         log_dir=tmp_path / "logs",
         fixed_rules_path=tmp_path / "固定业务规则",
@@ -561,10 +868,7 @@ def test_start_bootstrap_retry_failure_cleans_up_and_preserves_stderr(tmp_path, 
 
 def test_start_failure_restores_previously_loaded_service(tmp_path):
     calls = []
-    settings = SimpleNamespace(
-        timezone="Asia/Shanghai",
-        send_hour=20,
-        send_minute=0,
+    settings = start_settings(
         state_dir=tmp_path / ".state",
         log_dir=tmp_path / "logs",
         fixed_rules_path=tmp_path / "固定业务规则",

@@ -20,7 +20,10 @@ def test_live_webhook_connectivity():
         "msg_type": "text",
         "content": {"text": "【测试】需求进展机器人连通性验证"},
     }
-    with WebhookSender(webhook_url) as sender:
+    with WebhookSender(
+        webhook_url,
+        bot_keyword=os.getenv("REQUIREMENT_MONITOR_BOT_KEYWORD"),
+    ) as sender:
         result = sender.send(payload)
 
     assert result.success is True

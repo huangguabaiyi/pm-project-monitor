@@ -53,6 +53,61 @@ def test_sender_posts_valid_interactive_card(
     assert json.loads(httpx_mock.get_request().content) == card_payload
 
 
+def test_sender_injects_keyword_once_into_interactive_card(
+    httpx_mock, webhook_url, card_payload
+):
+    httpx_mock.add_response(json={"code": 0})
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword="需求机器人",
+    ).send(card_payload)
+
+    sent = json.loads(httpx_mock.get_request().content)
+    assert result.success is True
+    assert sent["card"]["header"]["title"]["content"].startswith(
+        "需求机器人"
+    )
+    assert json.dumps(sent, ensure_ascii=False).count("需求机器人") == 1
+    assert json.dumps(card_payload, ensure_ascii=False).count("需求机器人") == 0
+
+
+def test_sender_injects_keyword_once_into_text_payload(httpx_mock, webhook_url):
+    httpx_mock.add_response(json={"code": 0})
+    payload = {"msg_type": "text", "content": {"text": "每日提醒"}}
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword="需求机器人",
+    ).send(payload)
+
+    sent = json.loads(httpx_mock.get_request().content)
+    assert result.success is True
+    assert sent["content"]["text"] == "需求机器人 每日提醒"
+    assert sent["content"]["text"].count("需求机器人") == 1
+
+
+def test_sender_does_not_duplicate_existing_visible_keyword(
+    httpx_mock, webhook_url, card_payload
+):
+    card_payload["card"]["elements"][0]["text"]["content"] = (
+        "需求机器人 第一条需求"
+    )
+    httpx_mock.add_response(json={"code": 0})
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword="需求机器人",
+    ).send(card_payload)
+
+    sent = json.loads(httpx_mock.get_request().content)
+    assert result.success is True
+    assert json.dumps(sent, ensure_ascii=False).count("需求机器人") == 1
+
+
 def test_sender_retries_only_transient_http_failures(
     httpx_mock, webhook_url, card_payload
 ):
@@ -262,6 +317,89 @@ def test_http_400_invalid_card_degrades_once_to_plain_text(
     fallback = json.loads(requests[1].content)
     assert "需求提醒" in fallback["content"]["text"]
     assert "第一条需求" in fallback["content"]["text"]
+
+
+def test_keyword_is_present_once_in_card_and_plain_text_fallback(
+    httpx_mock, webhook_url, card_payload
+):
+    httpx_mock.add_response(
+        status_code=400,
+        json={"code": 190001, "msg": "invalid card"},
+    )
+    httpx_mock.add_response(json={"code": 0})
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword="需求机器人",
+    ).send(card_payload)
+
+    requests = [json.loads(request.content) for request in httpx_mock.get_requests()]
+    assert result.success is True
+    assert result.format_used == "text"
+    assert len(requests) == 2
+    assert json.dumps(requests[0], ensure_ascii=False).count("需求机器人") == 1
+    assert requests[1]["content"]["text"].count("需求机器人") == 1
+
+
+def test_keyword_prefix_survives_text_truncation(httpx_mock, webhook_url):
+    httpx_mock.add_response(json={"code": 0})
+    payload = {
+        "msg_type": "text",
+        "content": {"text": "密" * MAX_PAYLOAD_BYTES},
+    }
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword="需求机器人",
+    ).send(payload)
+
+    request = httpx_mock.get_request()
+    sent = json.loads(request.content)
+    assert result.success is True
+    assert len(request.content) <= MAX_PAYLOAD_BYTES
+    assert sent["content"]["text"].startswith("需求机器人 ")
+    assert sent["content"]["text"].count("需求机器人") == 1
+
+
+def test_keyword_is_injected_into_system_error_card_without_secret_leak(
+    httpx_mock, webhook_url
+):
+    httpx_mock.add_response(
+        json={
+            "code": 19024,
+            "msg": "required keyword not found at {}".format(webhook_url),
+        }
+    )
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "template": "red",
+                "title": {"tag": "plain_text", "content": "需求进展监控异常"},
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": "错误码：AUTH_ERROR"},
+                }
+            ],
+        },
+    }
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword="需求机器人",
+    ).send(payload)
+
+    sent = json.loads(httpx_mock.get_request().content)
+    assert result.success is False
+    assert result.feishu_code == 19024
+    assert json.dumps(sent, ensure_ascii=False).count("需求机器人") == 1
+    assert WEBHOOK_TOKEN not in repr(result)
+    assert webhook_url not in repr(result)
 
 
 def test_http_400_card_schema_message_degrades_to_plain_text(

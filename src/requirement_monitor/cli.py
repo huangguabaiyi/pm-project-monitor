@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -29,6 +30,7 @@ EXIT_CONFIG = 2
 EXIT_FEISHU = 3
 EXIT_WEBHOOK = 4
 EXIT_UNEXPECTED = 5
+RUNTIME_CONFIG_FILENAME = "runtime-config.json"
 
 
 class _RootParser(argparse.ArgumentParser):
@@ -144,7 +146,10 @@ def _build_runner(settings: Any, config_path: Path):
     return MonitorRunner(
         feishu=feishu,
         repository=BitableRepository(settings.bitable_url, client=feishu),
-        webhook=WebhookSender(_secret_value(settings.webhook_url)),
+        webhook=WebhookSender(
+            _secret_value(settings.webhook_url),
+            bot_keyword=getattr(settings, "bot_keyword", None),
+        ),
         state_store=StateStore(state_dir / "monitor.json"),
         fixed_rules_path=fixed_rules_path,
         llm=LLMClient(settings.llm),
@@ -306,17 +311,30 @@ def _start(
 ) -> int:
     target = Path(plist_path or default_plist_path()).expanduser()
     previous_plist = _snapshot_plist(target)
+    state_dir, log_dir, fixed_rules_path = _settings_paths(settings, config_path)
+    runtime_config_path = state_dir / RUNTIME_CONFIG_FILENAME
+    previous_runtime_config = _snapshot_file(runtime_config_path)
     previous_loaded = None
     try:
         previous_loaded = bool((status_fn or launchd_status)())
     except LaunchdError:
         previous_loaded = None
-    state_changed = True
+    state_changed = False
     try:
+        _write_runtime_config(
+            runtime_config_path,
+            _runtime_config_payload(
+                settings,
+                state_dir=state_dir,
+                log_dir=log_dir,
+                fixed_rules_path=fixed_rules_path,
+            ),
+        )
+        state_changed = True
         (enable_fn or enable)()
         content = render_plist(
             python_path=sys.executable,
-            config_path=config_path,
+            config_path=runtime_config_path,
             hour=settings.send_hour,
             minute=settings.send_minute,
             timezone=settings.timezone,
@@ -344,6 +362,8 @@ def _start(
         _rollback_start(
             target,
             previous_plist,
+            runtime_config_path,
+            previous_runtime_config,
             disable_fn or disable,
             state_changed,
             previous_loaded,
@@ -368,6 +388,10 @@ def _stop(
 
 
 def _snapshot_plist(path: Path):
+    return _snapshot_file(path)
+
+
+def _snapshot_file(path: Path):
     try:
         stat_result = path.stat()
         return path.read_bytes(), stat_result.st_mode & 0o777
@@ -378,6 +402,8 @@ def _snapshot_plist(path: Path):
 def _rollback_start(
     path: Path,
     snapshot,
+    runtime_config_path: Path,
+    runtime_config_snapshot,
     disable_fn,
     state_changed: bool,
     previous_loaded: Optional[bool],
@@ -385,6 +411,7 @@ def _rollback_start(
     bootstrap_fn,
     write_plist_fn,
 ):
+    _restore_private_file(runtime_config_path, runtime_config_snapshot)
     try:
         if snapshot is None:
             path.unlink(missing_ok=True)
@@ -413,6 +440,88 @@ def _rollback_start(
             disable_fn()
         except Exception:
             pass
+
+
+def _runtime_config_payload(
+    settings: Any,
+    *,
+    state_dir: Path,
+    log_dir: Path,
+    fixed_rules_path: Path,
+):
+    llm = settings.llm
+    return {
+        "bitable_url": settings.bitable_url,
+        "webhook_url": _secret_value(settings.webhook_url),
+        "bot_keyword": getattr(settings, "bot_keyword", None),
+        "fixed_rules_path": str(fixed_rules_path),
+        "timezone": settings.timezone,
+        "send_hour": settings.send_hour,
+        "send_minute": settings.send_minute,
+        "state_dir": str(state_dir),
+        "log_dir": str(log_dir),
+        "llm": {
+            "enabled": llm.enabled,
+            "base_url": llm.base_url,
+            "api_key": (
+                _secret_value(llm.api_key) if llm.api_key is not None else None
+            ),
+            "model": llm.model,
+            "timeout_seconds": llm.timeout_seconds,
+        },
+    }
+
+
+def _write_runtime_config(path: Path, payload: Any) -> Path:
+    content = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8")
+    _write_private_bytes(path, content)
+    return path
+
+
+def _restore_private_file(path: Path, snapshot) -> None:
+    try:
+        if snapshot is None:
+            path.unlink(missing_ok=True)
+            return
+        content, _ = snapshot
+        _write_private_bytes(path, content)
+    except OSError:
+        pass
+
+
+def _write_private_bytes(path: Path, content: bytes) -> None:
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    directory_descriptor = None
+    try:
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".{}-".format(target.name),
+            dir=str(target.parent),
+        )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+        os.chmod(target, 0o600)
+        directory_descriptor = os.open(str(target.parent), os.O_RDONLY)
+        os.fsync(directory_descriptor)
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 
 def _merge_launchd_errors(first: LaunchdError, retry: LaunchdError):

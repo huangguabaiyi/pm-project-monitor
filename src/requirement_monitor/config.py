@@ -57,6 +57,7 @@ class Settings(BaseModel):
 
     bitable_url: NonEmptyStr
     webhook_url: Optional[SecretStr] = None
+    bot_keyword: Optional[NonEmptyStr] = None
     fixed_rules_path: Path
     timezone: NonEmptyStr = "Asia/Shanghai"
     send_hour: int = Field(default=20, ge=0, le=23)
@@ -163,6 +164,10 @@ def _apply_environment_overrides(config_data: Dict[str, Any]) -> None:
     webhook_url = os.getenv("REQUIREMENT_MONITOR_WEBHOOK_URL")
     if webhook_url:
         config_data["webhook_url"] = webhook_url
+
+    bot_keyword = os.getenv("REQUIREMENT_MONITOR_BOT_KEYWORD")
+    if bot_keyword:
+        config_data["bot_keyword"] = bot_keyword
 
     llm_overrides = {
         "api_key": os.getenv("REQUIREMENT_MONITOR_LLM_API_KEY"),

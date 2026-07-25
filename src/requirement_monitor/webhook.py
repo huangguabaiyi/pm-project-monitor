@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import time
@@ -33,6 +34,7 @@ class WebhookSender:
         timeout_seconds: float = 10.0,
         client: Optional[httpx.Client] = None,
         allow_loopback_http: bool = False,
+        bot_keyword: Optional[str] = None,
     ) -> None:
         if not self._is_allowed_webhook_url(
             webhook_url, allow_loopback_http=allow_loopback_http
@@ -49,6 +51,10 @@ class WebhookSender:
         self._sleep = sleep
         self._timeout_seconds = normalized_timeout
         self._client = client if client is not None else httpx.Client()
+        normalized_keyword = (
+            bot_keyword.strip() if isinstance(bot_keyword, str) else ""
+        )
+        self._bot_keyword = normalized_keyword or None
         self._closed = False
 
     def __enter__(self):
@@ -74,9 +80,10 @@ class WebhookSender:
         try:
             if self._closed:
                 raise RuntimeError("WebhookSender is closed")
-            format_used = self._format_used(payload)
+            prepared_payload = self._with_bot_keyword(payload)
+            format_used = self._format_used(prepared_payload)
             serialized_payload, validation_error = self._validated_payload(
-                payload
+                prepared_payload
             )
             if validation_error is not None:
                 return SendResult(
@@ -94,7 +101,9 @@ class WebhookSender:
             if result.error != "card_format_rejected":
                 return result
 
-            fallback_payload = self._plain_text_fallback(payload)
+            fallback_payload = self._with_bot_keyword(
+                self._plain_text_fallback(prepared_payload)
+            )
             fallback_body, fallback_error = self._validated_payload(
                 fallback_payload
             )
@@ -125,6 +134,60 @@ class WebhookSender:
                 format_used=format_used,
                 error="client_error",
             )
+
+    def _with_bot_keyword(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        keyword = self._bot_keyword
+        if keyword is None or not isinstance(payload, Mapping):
+            return payload
+
+        prepared = copy.deepcopy(dict(payload))
+        if self._keyword_is_visible(prepared, keyword):
+            return prepared
+
+        if prepared.get("msg_type") == "text":
+            content = prepared.get("content")
+            if isinstance(content, dict) and isinstance(content.get("text"), str):
+                text = content["text"]
+                content["text"] = self._truncate_text_payload(
+                    "{} {}".format(keyword, text).rstrip()
+                )
+            return prepared
+
+        if prepared.get("msg_type") != "interactive":
+            return prepared
+        card = prepared.get("card")
+        if not isinstance(card, dict):
+            return prepared
+        header = card.get("header")
+        if not isinstance(header, dict):
+            return prepared
+        title = header.get("title")
+        if isinstance(title, dict) and isinstance(title.get("content"), str):
+            title["content"] = "{} {}".format(
+                keyword, title["content"]
+            ).rstrip()
+            return prepared
+        header["title"] = {"tag": "plain_text", "content": keyword}
+        return prepared
+
+    @staticmethod
+    def _keyword_is_visible(payload: Mapping[str, Any], keyword: str) -> bool:
+        if payload.get("msg_type") == "text":
+            content = payload.get("content")
+            return (
+                isinstance(content, Mapping)
+                and isinstance(content.get("text"), str)
+                and keyword in content["text"]
+            )
+        if payload.get("msg_type") != "interactive":
+            return False
+        card = payload.get("card")
+        if not isinstance(card, Mapping):
+            return False
+        lines = []
+        WebhookSender._collect_text(card.get("header"), lines)
+        WebhookSender._collect_text(card.get("elements"), lines)
+        return keyword in "\n".join(lines)
 
     def _deliver(
         self,

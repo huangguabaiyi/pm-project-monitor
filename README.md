@@ -47,6 +47,7 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 配置至少应确认以下字段：
 
 - `bitable_url`：目标飞书多维表格或知识库表格 URL。
+- `bot_keyword`：可选的飞书自定义机器人安全关键词；未启用关键词校验时保持 `null`。
 - `fixed_rules_path`：固定业务规则文件，默认是项目根目录的 `固定业务规则`。
 - `timezone`：默认 `Asia/Shanghai`。
 - `send_hour` / `send_minute`：默认工作日 `20:00`。
@@ -58,13 +59,18 @@ Webhook URL、LLM API key 以及其他 token/API key 不属于业务配置。推
 ```bash
 export REQUIREMENT_MONITOR_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
 
+# 机器人启用了“关键词”安全设置时，必须与飞书后台配置完全一致：
+export REQUIREMENT_MONITOR_BOT_KEYWORD='需求机器人'
+
 # 只有启用 LLM 时才设置：
 export REQUIREMENT_MONITOR_LLM_API_KEY='...'
 export REQUIREMENT_MONITOR_LLM_BASE_URL='https://api.example.com/v1'
 export REQUIREMENT_MONITOR_LLM_MODEL='model-name'
 ```
 
-为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。新配置应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table` 的 schema 初始化不要求 Webhook；`stop` 和 `version` 也不加载 Webhook 配置。`run-once`、`start`、`status`、`scheduled-run` 和 `logs` 仍按默认配置要求可用 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
+为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。`bot_keyword` 也可写入本地配置，并由 `REQUIREMENT_MONITOR_BOT_KEYWORD` 覆盖。新配置的 Webhook 和 LLM key 应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table` 的 schema 初始化不要求 Webhook；`stop` 和 `version` 也不加载 Webhook 配置。`run-once`、`start`、`status`、`scheduled-run` 和 `logs` 仍按默认配置要求可用 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
+
+飞书 Webhook 返回 HTTP `200` 但业务码 `19024` 时，表示机器人启用了关键词安全校验，而消息中没有找到必需关键词。设置 `bot_keyword` 或 `REQUIREMENT_MONITOR_BOT_KEYWORD` 后，发送器会在文本、互动卡片、降级文本和系统异常卡片中保证该关键词可见，并避免重复注入；未配置关键词的机器人保持原 payload 不变。
 
 ## 固定业务规则
 
@@ -169,7 +175,9 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 
 默认调度为 `Asia/Shanghai` 每个工作日 `20:00`。周六、周日不自动发送；如果 Mac 在 `20:00` 关机或休眠，恢复后也不补发错过的日报。调度进程只接受计划时间后五分钟内的触发，避免休眠恢复导致误补跑。
 
-Task12 已处理夏令时到系统时区的调度转换。修改时区、发送时间、虚拟环境路径或配置路径后，必须执行 `restart` 重新生成并加载 LaunchAgent；发生系统时区或夏令时切换后也建议重启服务，以确保 plist 中的下一组触发时间已刷新。
+后台模式必须通过 `start` 或 `restart` 生成配置，不能手工让 LaunchAgent 直接指向仓库中的源配置。macOS LaunchAgent 不继承执行 `start` 时的 shell 环境，因此 `start` 会先解析源配置和当前环境变量，再将完整运行设置写入 `state_dir/runtime-config.json`；该文件使用原子写入、`0600` 权限，包含 Webhook、可选 LLM key 和机器人关键词，plist 的 `scheduled-run --config` 只指向这份私密快照。源配置不需要、也不应保存 Webhook 或 LLM key。`stop` 会卸载并禁用任务，但保留 runtime snapshot；它位于本地状态目录，不得提交或共享。
+
+Task12 已处理夏令时到系统时区的调度转换。修改 Webhook、LLM key、机器人关键词、表格地址、规则路径、状态/日志目录、时区、发送时间、虚拟环境路径或配置路径后，必须在新环境变量已生效的终端执行 `restart`，以重写 runtime snapshot 并重新加载 LaunchAgent；发生系统时区或夏令时切换后也建议重启服务，以确保 plist 中的下一组触发时间已刷新。
 
 ## LLM 可选降级
 
@@ -195,11 +203,13 @@ LLM 只用于补充风险理由，基础规则和基础通知不依赖 LLM。未
 git diff --check
 ```
 
-默认 `pytest` 会跳过 `tests/integration/test_live_bitable.py` 和 `tests/integration/test_live_webhook.py`。live Bitable 测试使用当前已认证的 `feishu` CLI，并从 `REQUIREMENT_MONITOR_CONFIG` 或默认 `config.local.json` 读取表格配置；它只验证 metadata 的 `type`、`app_token` 和 table 标识。live Webhook 测试只在同时设置 `REQUIREMENT_MONITOR_LIVE_TEST=1` 与 `REQUIREMENT_MONITOR_WEBHOOK_URL` 时发送一次明确标记的文本：
+默认 `pytest` 会跳过 `tests/integration/test_live_bitable.py` 和 `tests/integration/test_live_webhook.py`。live Bitable 测试使用当前已认证的 `feishu` CLI，并从 `REQUIREMENT_MONITOR_CONFIG` 或默认 `config.local.json` 读取表格配置；针对 wiki URL，它验证真实 metadata 形态中的 `app_token`、`table_id`、`name` 和 `url_type: wiki`。live Webhook 测试只在同时设置 `REQUIREMENT_MONITOR_LIVE_TEST=1` 与 `REQUIREMENT_MONITOR_WEBHOOK_URL` 时发送一次明确标记的文本；如果机器人配置了关键词，同时设置 `REQUIREMENT_MONITOR_BOT_KEYWORD`：
 
 ```bash
 export REQUIREMENT_MONITOR_LIVE_TEST=1
 export REQUIREMENT_MONITOR_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
+# 仅当机器人后台启用了关键词校验时设置：
+export REQUIREMENT_MONITOR_BOT_KEYWORD='需求机器人'
 .venv/bin/pytest tests/integration -v
 ```
 

@@ -10,6 +10,7 @@ from requirement_monitor.config import ConfigError, load_settings
 ENVIRONMENT_KEYS = (
     "REQUIREMENT_MONITOR_CONFIG",
     "REQUIREMENT_MONITOR_WEBHOOK_URL",
+    "REQUIREMENT_MONITOR_BOT_KEYWORD",
     "REQUIREMENT_MONITOR_LLM_API_KEY",
     "REQUIREMENT_MONITOR_LLM_BASE_URL",
     "REQUIREMENT_MONITOR_LLM_MODEL",
@@ -55,6 +56,7 @@ def test_environment_overrides_secret_values(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "REQUIREMENT_MONITOR_WEBHOOK_URL", OVERRIDE_WEBHOOK_URL
     )
+    monkeypatch.setenv("REQUIREMENT_MONITOR_BOT_KEYWORD", "需求提醒")
     monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", "env-key")
     monkeypatch.setenv(
         "REQUIREMENT_MONITOR_LLM_BASE_URL", "https://env.example/v1"
@@ -66,6 +68,7 @@ def test_environment_overrides_secret_values(tmp_path, monkeypatch):
     assert (
         settings.webhook_url.get_secret_value() == OVERRIDE_WEBHOOK_URL
     )
+    assert settings.bot_keyword == "需求提醒"
     assert settings.llm.api_key.get_secret_value() == "env-key"
     assert settings.llm.base_url == "https://env.example/v1"
     assert settings.llm.model == "env-model"
