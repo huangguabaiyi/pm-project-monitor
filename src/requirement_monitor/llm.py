@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Dict, Iterable, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -45,11 +46,16 @@ _DATE_PATTERN = re.compile(
     r"(?<!\d)(\d{4})[年./-](\d{1,2})[月./-](\d{1,2})日?(?!\d)"
 )
 _SHORT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日(?!\d)")
+_NUMERIC_CANDIDATE = r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+_NUMERIC_TOKEN_START = r"(?<![0-9A-Za-z_.+-])"
+_NUMERIC_TOKEN_END = r"(?![0-9A-Za-z_.+-])"
 _DAY_COUNT_PATTERN = re.compile(
-    r"(?<![\dA-Za-z])(\d{1,3})\s*(个)?(工作日|自然日|天)(?![\dA-Za-z])"
+    rf"{_NUMERIC_TOKEN_START}(?P<number>{_NUMERIC_CANDIDATE})\s*"
+    rf"(?P<modifier>个)?(?P<unit>工作日|自然日|天){_NUMERIC_TOKEN_END}"
 )
 _PERCENT_PATTERN = re.compile(
-    r"(?<![\dA-Za-z])(\d{1,3})(?:\.(\d))?\s*[%％](?![\dA-Za-z])"
+    rf"{_NUMERIC_TOKEN_START}(?P<number>{_NUMERIC_CANDIDATE})\s*"
+    rf"[%％]{_NUMERIC_TOKEN_END}"
 )
 _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _IDENTITY_PATTERN = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
@@ -407,16 +413,12 @@ def _safe_signal_summary(value: Any, label: str) -> str:
         if token is not None:
             signals.append((match.start(), match.end(), token))
     for match in _DAY_COUNT_PATTERN.finditer(sanitized):
-        count = int(match.group(1))
-        if count <= 365:
-            unit = "{}{}".format(match.group(2) or "", match.group(3))
-            signals.append((match.start(), match.end(), f"{count}{unit}"))
+        token = _normalize_day_count(match)
+        if token is not None:
+            signals.append((match.start(), match.end(), token))
     for match in _PERCENT_PATTERN.finditer(sanitized):
-        whole = int(match.group(1))
-        decimal = match.group(2)
-        percentage = whole + (int(decimal) / 10 if decimal else 0)
-        if percentage <= 100:
-            token = f"{whole}.{decimal}%" if decimal else f"{whole}%"
+        token = _normalize_percentage(match)
+        if token is not None:
             signals.append((match.start(), match.end(), token))
     for keyword in _SAFE_BUSINESS_KEYWORDS:
         signals.extend(
@@ -467,3 +469,42 @@ def _normalize_short_date(match: re.Match) -> Optional[str]:
     except ValueError:
         return None
     return f"{month:02d}-{day:02d}"
+
+
+def _normalize_day_count(match: re.Match) -> Optional[str]:
+    raw_number = match.group("number")
+    if (
+        raw_number.startswith(("+", "-"))
+        or "." in raw_number
+        or "e" in raw_number.lower()
+        or len(raw_number) > 3
+    ):
+        return None
+    try:
+        value = Decimal(raw_number)
+    except InvalidOperation:
+        return None
+    if not Decimal(0) <= value <= Decimal(365):
+        return None
+    unit = "{}{}".format(
+        match.group("modifier") or "", match.group("unit")
+    )
+    return f"{int(value)}{unit}"
+
+
+def _normalize_percentage(match: re.Match) -> Optional[str]:
+    raw_number = match.group("number")
+    if raw_number.startswith(("+", "-")) or "e" in raw_number.lower():
+        return None
+    integer_part, separator, decimal_part = raw_number.partition(".")
+    if len(integer_part) > 3 or (separator and len(decimal_part) != 1):
+        return None
+    try:
+        value = Decimal(raw_number)
+    except InvalidOperation:
+        return None
+    if not Decimal(0) <= value <= Decimal(100):
+        return None
+    if separator:
+        return f"{int(integer_part)}.{decimal_part}%"
+    return f"{int(integer_part)}%"

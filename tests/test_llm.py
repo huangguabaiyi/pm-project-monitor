@@ -353,6 +353,50 @@ def test_llm_request_rejects_disguised_numeric_pii_and_invalid_metrics(
     assert "[REDACTED]" in serialized
 
 
+def test_llm_request_metrics_require_complete_unsigned_numeric_tokens(
+    httpx_mock, llm_settings
+):
+    httpx_mock.add_response(json=response_content())
+    risk = make_risk().model_copy(
+        update={
+            "project_notes": (
+                "拒绝-3天、+3天、-1%、85.25%、0.01%、99.99%、"
+                "1e2%、2e1天、1234天；保留7天、85.5%、100.0%"
+            )
+        }
+    )
+
+    LLMClient(llm_settings).enrich(risk, "固定规则", "")
+
+    body = httpx_mock.get_request().content.decode("utf-8")
+    user_input = json.loads(json.loads(body)["messages"][1]["content"])
+    summary = user_input["risk"]["context"]["project_notes"]
+    tokens = set(summary.partition("：")[2].split("；"))
+    assert {"7天", "85.5%", "100.0%"} <= tokens
+    assert {
+        "3天",
+        "1%",
+        "25%",
+        "0.01%",
+        "99%",
+        "2%",
+        "1天",
+        "234天",
+    }.isdisjoint(tokens)
+    for rejected in (
+        "-3天",
+        "+3天",
+        "-1%",
+        "85.25%",
+        "0.01%",
+        "99.99%",
+        "1e2%",
+        "2e1天",
+        "1234天",
+    ):
+        assert rejected not in body
+
+
 @pytest.mark.parametrize(
     ("chinese_level", "expected"),
     (
