@@ -226,15 +226,15 @@ class MonitorRunner:
             send_records.append(self._notification_record(item, result, started_at))
             recent_sends.append(self._recent_send(item, result, started_at))
 
+        notification_write_failed = False
         if send_records:
             try:
                 self.repository.append_notification_records(send_records)
             except MemoryError:
                 raise
             except Exception:
-                return self._finish_runtime_failure(
-                    report, "NOTIFICATION_WRITE_ERROR", dry_run
-                )
+                notification_write_failed = True
+                report.errors.append("NOTIFICATION_WRITE_ERROR")
 
         active_fingerprints = {
             fingerprint
@@ -268,6 +268,10 @@ class MonitorRunner:
             return self._finish_runtime_failure(
                 report, "STATE_WRITE_ERROR", dry_run
             )
+        if notification_write_failed:
+            return self._finish_runtime_failure(
+                report, "NOTIFICATION_WRITE_ERROR", dry_run
+            )
         return report
 
     def _authentication_error(self) -> Optional[str]:
@@ -299,7 +303,8 @@ class MonitorRunner:
         error_code: str,
         dry_run: bool,
     ) -> MonitorRunReport:
-        report.errors.append(error_code)
+        if error_code not in report.errors:
+            report.errors.append(error_code)
         payload = interactive_card(
             "需求进展监控异常",
             "red",

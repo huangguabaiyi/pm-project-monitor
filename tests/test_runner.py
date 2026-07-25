@@ -633,19 +633,49 @@ def test_default_runner_clock_is_timezone_aware():
     assert report.started_at.utcoffset() is not None
 
 
-def test_notification_record_failure_is_normalized_and_state_is_not_saved():
+@pytest.mark.parametrize(
+    ("daily_result", "expected_result"),
+    [
+        (
+            SendResult(success=True, attempts=1, format_used="card"),
+            "success",
+        ),
+        (
+            SendResult(
+                success=False,
+                attempts=4,
+                format_used="card",
+                error="service_error",
+            ),
+            "failed",
+        ),
+    ],
+)
+def test_notification_record_failure_persists_scheduled_attempt_and_prevents_retry(
+    daily_result, expected_result
+):
     dependencies = FakeDependencies()
     dependencies.repository.notification_error = RuntimeError(
         "bitable write failed sk-secret"
     )
+    dependencies.webhook.results = [daily_result]
 
-    report = dependencies.runner().run(trigger="manual")
+    first = dependencies.runner().run(trigger="scheduled")
+    payload_count = len(dependencies.webhook.payloads)
+    second = dependencies.runner().run(trigger="scheduled")
 
-    assert dependencies.state_store.saved == []
-    assert report.errors == ["NOTIFICATION_WRITE_ERROR"]
-    assert "sk-secret" not in str(report)
-    assert len(dependencies.webhook.payloads) == 2
+    scheduled = dependencies.state_store.state.scheduled_daily_results[
+        "2026-07-25|米家"
+    ]
+    assert scheduled.result == expected_result
+    assert dependencies.state_store.saved
+    assert first.errors == ["NOTIFICATION_WRITE_ERROR"]
+    assert "sk-secret" not in str(first)
+    assert payload_count == 2
+    assert len(dependencies.webhook.payloads) == payload_count
     assert "NOTIFICATION_WRITE_ERROR" in str(dependencies.webhook.payloads[-1])
+    assert second.sent_cards == 0
+    assert second.failed_sends == 0
 
 
 @pytest.mark.parametrize(
