@@ -1,13 +1,31 @@
+"""macOS LaunchAgent helpers.
+
+launchd evaluates ``StartCalendarInterval`` in the host system timezone.
+The plist therefore stores intervals converted from the configured timezone
+using the current system zone.  ``scheduled-run`` remains the final guard in
+the configured timezone, and ``start`` should be rerun after a system
+timezone or DST transition so the static calendar mapping is refreshed.
+"""
+
 import os
 import plistlib
 import subprocess
-from datetime import datetime, timedelta
+import tempfile
+from datetime import (
+    date,
+    datetime,
+    timedelta,
+    time as datetime_time,
+    timezone as utc_timezone,
+    tzinfo,
+)
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 LAUNCH_AGENT_LABEL = "com.mi.requirement-monitor"
+TimezoneValue = Union[str, tzinfo]
 DEFAULT_PLIST_PATH = (
     Path.home()
     / "Library"
@@ -54,6 +72,64 @@ def in_scheduled_window(
     return scheduled_at <= now < scheduled_at + timedelta(minutes=window_minutes)
 
 
+def current_system_timezone() -> tzinfo:
+    current = datetime.now().astimezone()
+    return current.tzinfo or utc_timezone.utc
+
+
+def _coerce_timezone(value: TimezoneValue) -> tzinfo:
+    if isinstance(value, str):
+        try:
+            return ZoneInfo(value)
+        except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
+            raise ValueError("timezone must be a valid IANA timezone") from error
+    if value is None or not isinstance(value, tzinfo):
+        raise ValueError("timezone must be a valid timezone")
+    return value
+
+
+def _resolve_local_datetime(value: datetime, zone: tzinfo) -> datetime:
+    candidate = value.replace(tzinfo=zone)
+    round_trip = candidate.astimezone(utc_timezone.utc).astimezone(zone)
+    if round_trip.replace(tzinfo=None) != value.replace(tzinfo=None):
+        return round_trip
+    return candidate
+
+
+def scheduled_intervals_in_system_timezone(
+    *,
+    hour: int,
+    minute: int,
+    configured_timezone: TimezoneValue,
+    system_timezone: TimezoneValue,
+    reference_date: date,
+) -> List[Dict[str, int]]:
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError("scheduled time is invalid")
+    configured_zone = _coerce_timezone(configured_timezone)
+    system_zone = _coerce_timezone(system_timezone)
+    monday = reference_date - timedelta(days=reference_date.weekday())
+    intervals: List[Dict[str, int]] = []
+    for weekday in range(5):
+        local_date = monday + timedelta(days=weekday)
+        local_datetime = _resolve_local_datetime(
+            datetime.combine(
+                local_date,
+                datetime_time(hour=hour, minute=minute),
+            ),
+            configured_zone,
+        )
+        system_datetime = local_datetime.astimezone(system_zone)
+        intervals.append(
+            {
+                "Weekday": system_datetime.isoweekday(),
+                "Hour": system_datetime.hour,
+                "Minute": system_datetime.minute,
+            }
+        )
+    return intervals
+
+
 def render_plist(
     *,
     python_path: str,
@@ -61,13 +137,24 @@ def render_plist(
     hour: int,
     minute: int,
     timezone: str = "Asia/Shanghai",
+    system_timezone: Optional[TimezoneValue] = None,
+    reference_date: Optional[date] = None,
     working_directory: Optional[Path] = None,
     label: str = LAUNCH_AGENT_LABEL,
 ) -> str:
-    try:
-        ZoneInfo(timezone)
-    except (TypeError, ValueError, ZoneInfoNotFoundError) as error:
-        raise ValueError("timezone must be a valid IANA timezone") from error
+    configured_zone = _coerce_timezone(timezone)
+    host_zone = (
+        _coerce_timezone(system_timezone)
+        if system_timezone is not None
+        else current_system_timezone()
+    )
+    intervals = scheduled_intervals_in_system_timezone(
+        hour=hour,
+        minute=minute,
+        configured_timezone=configured_zone,
+        system_timezone=host_zone,
+        reference_date=reference_date or datetime.now().date(),
+    )
     config = Path(config_path).expanduser().resolve()
     python = Path(python_path).expanduser()
     if not python.is_absolute():
@@ -83,10 +170,7 @@ def render_plist(
     payload: Mapping[str, Any] = {
         "Label": label,
         "ProgramArguments": program_arguments,
-        "StartCalendarInterval": [
-            {"Weekday": weekday, "Hour": hour, "Minute": minute}
-            for weekday in range(1, 6)
-        ],
+        "StartCalendarInterval": intervals,
         "EnvironmentVariables": {"TZ": timezone},
         "WorkingDirectory": str(
             Path(working_directory or config.parent).expanduser().resolve()
@@ -99,8 +183,26 @@ def render_plist(
 def write_plist(path: Path, content: str) -> Path:
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    os.chmod(target, 0o600)
+    temporary_path = None
+    try:
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            dir=str(target.parent),
+        )
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+        os.chmod(target, 0o600)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
     return target
 
 
@@ -125,7 +227,10 @@ def _run_launchctl(
             check=False,
         )
     except OSError as error:
-        raise LaunchdError("launchctl could not be executed") from error
+        raise LaunchdError(
+            "launchctl could not be executed",
+            stderr=str(error),
+        ) from error
     return_code = getattr(result, "returncode", 0)
     if return_code != 0:
         raise LaunchdError(
@@ -219,8 +324,10 @@ def status(
             ["print", f"gui/{user_id}/{label}"],
             command_runner=command_runner,
         )
-    except LaunchdError:
-        return False
+    except LaunchdError as error:
+        if _is_missing_service(error.stderr):
+            return False
+        raise
     return True
 
 

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from requirement_monitor import cli
+from requirement_monitor.launchd import LaunchdError
 
 
 def test_version_command(capsys):
@@ -226,6 +227,66 @@ def test_report_exit_codes_are_explicit(report, expected):
     assert cli._report_exit_code(report) == expected
 
 
+def test_mixed_webhook_failure_returns_four_and_reports_partial(capsys, tmp_path):
+    class FakeRunner:
+        def run(self, *, trigger, dry_run=False):
+            return SimpleNamespace(
+                payloads=[],
+                errors=[],
+                failed_sends=1,
+                sent_cards=1,
+            )
+
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=Path(".state"),
+        log_dir=Path("logs"),
+        fixed_rules_path=Path("固定业务规则"),
+    )
+
+    exit_code = cli.main(
+        ["run-once", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda loaded, config_path: FakeRunner(),
+    )
+
+    assert exit_code == 4
+    assert "partial" in capsys.readouterr().err.lower()
+
+
+def test_status_missing_service_is_stopped_but_launchctl_error_is_five(
+    capsys, tmp_path
+):
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+        fixed_rules_path=tmp_path / "固定业务规则",
+    )
+
+    stopped = cli.main(
+        ["status", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        status_fn=lambda: False,
+    )
+    assert stopped == 0
+    assert "loaded: no" in capsys.readouterr().out
+
+    denied = cli.main(
+        ["status", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        status_fn=lambda: (_ for _ in ()).throw(
+            LaunchdError("launchctl command failed", stderr="Operation not permitted")
+        ),
+    )
+    assert denied == 5
+    assert "Operation not permitted" in capsys.readouterr().err
+
+
 def test_start_writes_private_plist_and_bootstraps(tmp_path):
     calls = []
     settings = SimpleNamespace(
@@ -251,6 +312,111 @@ def test_start_writes_private_plist_and_bootstraps(tmp_path):
     assert calls == ["enable", plist_path]
     assert "scheduled-run" in plist_path.read_text()
     assert "Asia/Shanghai" in plist_path.read_text()
+
+
+def test_start_write_failure_restores_plist_and_disables_agent(tmp_path):
+    calls = []
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+        fixed_rules_path=tmp_path / "固定业务规则",
+    )
+    plist_path = tmp_path / "monitor.plist"
+    plist_path.write_text("old plist", encoding="utf-8")
+
+    def failing_write(path, content):
+        Path(path).write_text("new plist", encoding="utf-8")
+        raise OSError("write failed")
+
+    exit_code = cli.main(
+        ["start", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        plist_path=plist_path,
+        enable_fn=lambda: calls.append("enable"),
+        write_plist_fn=failing_write,
+        disable_fn=lambda: calls.append("disable"),
+        bootstrap_fn=lambda path: calls.append("bootstrap"),
+    )
+
+    assert exit_code == 5
+    assert plist_path.read_text(encoding="utf-8") == "old plist"
+    assert calls == ["enable", "disable"]
+
+
+def test_start_bootstrap_retry_failure_cleans_up_and_preserves_stderr(tmp_path, capsys):
+    calls = []
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+        fixed_rules_path=tmp_path / "固定业务规则",
+    )
+    plist_path = tmp_path / "monitor.plist"
+    plist_path.write_text("old plist", encoding="utf-8")
+    bootstrap_calls = []
+
+    def failing_bootstrap(path):
+        bootstrap_calls.append(path)
+        if len(bootstrap_calls) == 1:
+            raise LaunchdError("first bootstrap", stderr="first stderr")
+        raise LaunchdError("retry bootstrap", stderr="retry stderr")
+
+    exit_code = cli.main(
+        ["start", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        plist_path=plist_path,
+        enable_fn=lambda: calls.append("enable"),
+        write_plist_fn=lambda path, content: Path(path).write_text(content),
+        bootstrap_fn=failing_bootstrap,
+        bootout_fn=lambda: calls.append("bootout"),
+        disable_fn=lambda: calls.append("disable"),
+    )
+
+    assert exit_code == 5
+    assert len(bootstrap_calls) == 2
+    assert calls == ["enable", "bootout", "disable"]
+    assert plist_path.read_text(encoding="utf-8") == "old plist"
+    error_output = capsys.readouterr().err
+    assert "first stderr" in error_output
+    assert "retry stderr" in error_output
+
+
+def test_start_failure_restores_previously_loaded_service(tmp_path):
+    calls = []
+    settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        send_hour=20,
+        send_minute=0,
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+        fixed_rules_path=tmp_path / "固定业务规则",
+    )
+    plist_path = tmp_path / "monitor.plist"
+    plist_path.write_text("old plist", encoding="utf-8")
+
+    def failing_bootstrap(path):
+        raise LaunchdError("bootstrap failed", stderr="bootstrap stderr")
+
+    exit_code = cli.main(
+        ["start", "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        plist_path=plist_path,
+        status_fn=lambda: True,
+        enable_fn=lambda: calls.append("enable"),
+        write_plist_fn=lambda path, content: Path(path).write_text(content),
+        bootstrap_fn=failing_bootstrap,
+        bootout_fn=lambda: calls.append("bootout"),
+        disable_fn=lambda: calls.append("disable"),
+    )
+
+    assert exit_code == 5
+    assert plist_path.read_text(encoding="utf-8") == "old plist"
+    assert calls == ["enable", "bootout", "enable", "disable"]
 
 
 def test_stop_boots_out_then_persistently_disables_agent():

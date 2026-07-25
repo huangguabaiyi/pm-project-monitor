@@ -1,16 +1,21 @@
 import stat
 import plistlib
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from requirement_monitor.launchd import (
     LAUNCH_AGENT_LABEL,
+    LaunchdError,
     bootout,
+    bootstrap,
     disable,
     enable,
     in_scheduled_window,
     render_plist,
+    scheduled_intervals_in_system_timezone,
+    status,
     write_plist,
 )
 
@@ -49,6 +54,8 @@ def test_plist_runs_only_weekdays_at_configured_time(tmp_path):
         hour=20,
         minute=0,
         timezone="Asia/Shanghai",
+        system_timezone=TZ,
+        reference_date=date(2026, 7, 20),
         working_directory=tmp_path,
     )
     payload = plistlib.loads(content.encode("utf-8"))
@@ -59,6 +66,62 @@ def test_plist_runs_only_weekdays_at_configured_time(tmp_path):
     assert str(tmp_path / "config.local.json") in content
     assert str(tmp_path) in content
     assert payload["EnvironmentVariables"]["TZ"] == "Asia/Shanghai"
+
+
+def test_schedule_conversion_handles_date_rollover_with_fixed_offsets():
+    intervals = scheduled_intervals_in_system_timezone(
+        hour=20,
+        minute=0,
+        configured_timezone=timezone(timedelta(hours=-5)),
+        system_timezone=timezone(timedelta(hours=14)),
+        reference_date=date(2026, 7, 20),
+    )
+
+    friday = intervals[4]
+    assert friday == {"Weekday": 6, "Hour": 15, "Minute": 0}
+
+
+def test_schedule_conversion_uses_injected_zoneinfo_dst_offset():
+    intervals = scheduled_intervals_in_system_timezone(
+        hour=20,
+        minute=0,
+        configured_timezone="America/New_York",
+        system_timezone=ZoneInfo("UTC"),
+        reference_date=date(2026, 3, 9),
+    )
+
+    assert intervals[0] == {"Weekday": 2, "Hour": 0, "Minute": 0}
+
+
+def test_launchctl_status_distinguishes_missing_service_from_execution_error():
+    missing = lambda command, **kwargs: SimpleNamespace(
+        returncode=1,
+        stderr="Could not find service",
+    )
+    denied = lambda command, **kwargs: SimpleNamespace(
+        returncode=1,
+        stderr="Operation not permitted",
+    )
+
+    assert status(uid=501, command_runner=missing) is False
+    try:
+        status(uid=501, command_runner=denied)
+    except LaunchdError as error:
+        assert error.stderr == "Operation not permitted"
+    else:
+        raise AssertionError("launchctl execution errors must not look stopped")
+
+
+def test_launchctl_oserror_preserves_detail():
+    def raise_oserror(command, **kwargs):
+        raise OSError("launchctl permission detail")
+
+    try:
+        bootstrap(Path("/tmp/monitor.plist"), command_runner=raise_oserror)
+    except LaunchdError as error:
+        assert "launchctl permission detail" in error.stderr
+    else:
+        raise AssertionError("launchctl OSError must be wrapped with detail")
 
 
 def test_write_plist_uses_private_permissions(tmp_path):

@@ -10,8 +10,10 @@ from zoneinfo import ZoneInfo
 from requirement_monitor import __version__
 from requirement_monitor.config import ConfigError
 from requirement_monitor.launchd import (
+    LaunchdError,
     bootstrap,
     bootout,
+    current_system_timezone,
     default_plist_path,
     disable,
     enable,
@@ -29,12 +31,34 @@ EXIT_WEBHOOK = 4
 EXIT_UNEXPECTED = 5
 
 
+class _RootParser(argparse.ArgumentParser):
+    def __init__(self, *args, scheduled_parser=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._scheduled_parser = scheduled_parser
+
+    def parse_args(self, args=None, namespace=None):
+        values = list(sys.argv[1:] if args is None else args)
+        if values and values[0] == "scheduled-run" and self._scheduled_parser:
+            parsed = self._scheduled_parser.parse_args(values[1:])
+            parsed.command = "scheduled-run"
+            return parsed
+        return super().parse_args(values, namespace)
+
+
 def _add_config_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="requirement-monitor")
+    scheduled_parser = argparse.ArgumentParser(
+        prog="requirement-monitor scheduled-run"
+    )
+    _add_config_argument(scheduled_parser)
+
+    parser = _RootParser(
+        prog="requirement-monitor",
+        scheduled_parser=scheduled_parser,
+    )
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
@@ -48,16 +72,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_once_parser = subparsers.add_parser("run-once")
     _add_config_argument(run_once_parser)
     run_once_parser.add_argument("--dry-run", action="store_true")
-
-    scheduled_parser = subparsers.add_parser(
-        "scheduled-run", help=argparse.SUPPRESS
-    )
-    _add_config_argument(scheduled_parser)
-    subparsers._choices_actions = [
-        action
-        for action in subparsers._choices_actions
-        if action.dest != "scheduled-run"
-    ]
 
     subparsers.add_parser("version")
 
@@ -178,7 +192,7 @@ def _report_exit_code(report: Any) -> int:
         return EXIT_FEISHU
     failed_sends = int(getattr(report, "failed_sends", 0))
     sent_cards = int(getattr(report, "sent_cards", 0))
-    if failed_sends > 0 and sent_cards == 0:
+    if failed_sends > 0:
         return EXIT_WEBHOOK
     return EXIT_UNEXPECTED if errors else EXIT_OK
 
@@ -197,6 +211,17 @@ def _run_monitor(
         if dry_run:
             for payload in getattr(report, "payloads", []):
                 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        failed_sends = int(getattr(report, "failed_sends", 0))
+        if failed_sends > 0:
+            outcome = "partial" if getattr(report, "sent_cards", 0) else "complete"
+            print(
+                "Webhook delivery {} failure: {} failed, {} sent.".format(
+                    outcome,
+                    failed_sends,
+                    getattr(report, "sent_cards", 0),
+                ),
+                file=sys.stderr,
+            )
         _write_run_log(settings, config_path, report)
         return _report_exit_code(report)
     finally:
@@ -218,7 +243,11 @@ def _status(
     *,
     status_fn: Optional[Callable[[], bool]],
 ) -> int:
-    loaded = (status_fn or launchd_status)()
+    try:
+        loaded = (status_fn or launchd_status)()
+    except LaunchdError as error:
+        _print_launchd_error(error)
+        return EXIT_UNEXPECTED
     print(f"launchd loaded: {'yes' if loaded else 'no'}")
     print(
         "schedule: weekdays at {:02d}:{:02d} {}".format(
@@ -269,26 +298,58 @@ def _start(
     enable_fn: Optional[Callable[[], Any]],
     bootstrap_fn: Optional[Callable[[Path], Any]],
     bootout_fn: Optional[Callable[[], Any]],
+    disable_fn: Optional[Callable[[], Any]],
+    system_timezone_fn: Optional[Callable[[], Any]],
+    status_fn: Optional[Callable[[], bool]],
 ) -> int:
     target = Path(plist_path or default_plist_path()).expanduser()
-    (enable_fn or enable)()
-    content = render_plist(
-        python_path=sys.executable,
-        config_path=config_path,
-        hour=settings.send_hour,
-        minute=settings.send_minute,
-        timezone=settings.timezone,
-        working_directory=config_path.parent,
-    )
-    (write_plist_fn or write_plist)(target, content)
-    try:
-        (bootstrap_fn or bootstrap)(target)
-    except Exception as first_error:
+    previous_plist = _snapshot_plist(target)
+    previous_loaded = None
+    if status_fn is not None:
         try:
-            (bootout_fn or bootout)()
+            previous_loaded = bool(status_fn())
+        except LaunchdError:
+            previous_loaded = None
+    state_changed = True
+    try:
+        (enable_fn or enable)()
+        content = render_plist(
+            python_path=sys.executable,
+            config_path=config_path,
+            hour=settings.send_hour,
+            minute=settings.send_minute,
+            timezone=settings.timezone,
+            system_timezone=(
+                system_timezone_fn or current_system_timezone
+            )(),
+            working_directory=config_path.parent,
+        )
+        (write_plist_fn or write_plist)(target, content)
+        try:
             (bootstrap_fn or bootstrap)(target)
-        except Exception:
-            raise first_error
+        except Exception as first_error:
+            try:
+                (bootout_fn or bootout)()
+                (bootstrap_fn or bootstrap)(target)
+            except Exception as retry_error:
+                if isinstance(first_error, LaunchdError) and isinstance(
+                    retry_error, LaunchdError
+                ):
+                    raise _merge_launchd_errors(
+                        first_error, retry_error
+                    ) from retry_error
+                raise
+    except Exception:
+        _rollback_start(
+            target,
+            previous_plist,
+            disable_fn or disable,
+            state_changed,
+            previous_loaded,
+            enable_fn or enable,
+            bootstrap_fn or bootstrap,
+        )
+        raise
     print(f"started: {target}")
     return EXIT_OK
 
@@ -302,6 +363,63 @@ def _stop(
     (disable_fn or disable)()
     print("stopped")
     return EXIT_OK
+
+
+def _snapshot_plist(path: Path):
+    try:
+        stat_result = path.stat()
+        return path.read_bytes(), stat_result.st_mode & 0o777
+    except FileNotFoundError:
+        return None
+
+
+def _rollback_start(
+    path: Path,
+    snapshot,
+    disable_fn,
+    state_changed: bool,
+    previous_loaded: Optional[bool],
+    enable_fn,
+    bootstrap_fn,
+):
+    try:
+        if snapshot is None:
+            path.unlink(missing_ok=True)
+        else:
+            content, mode = snapshot
+            path.write_bytes(content)
+            os.chmod(path, mode)
+    except OSError:
+        pass
+    if state_changed and previous_loaded:
+        try:
+            enable_fn()
+            bootstrap_fn(path)
+            return
+        except Exception:
+            pass
+    if state_changed:
+        try:
+            disable_fn()
+        except Exception:
+            pass
+
+
+def _merge_launchd_errors(first: LaunchdError, retry: LaunchdError):
+    stderr = "\n".join(
+        detail for detail in (first.stderr, retry.stderr) if detail
+    )
+    return LaunchdError(
+        "launchctl bootstrap failed after retry",
+        returncode=retry.returncode or first.returncode,
+        stderr=stderr,
+    )
+
+
+def _print_launchd_error(error: LaunchdError) -> None:
+    print(f"Launchd error: {error}", file=sys.stderr)
+    if error.stderr:
+        print(error.stderr, file=sys.stderr)
 
 
 def main(
@@ -318,6 +436,7 @@ def main(
     bootout_fn: Optional[Callable[[], Any]] = None,
     disable_fn: Optional[Callable[[], Any]] = None,
     status_fn: Optional[Callable[[], bool]] = None,
+    system_timezone_fn: Optional[Callable[[], Any]] = None,
 ) -> int:
     args = build_parser().parse_args(argv)
 
@@ -365,6 +484,9 @@ def main(
                 enable_fn=enable_fn,
                 bootstrap_fn=bootstrap_fn,
                 bootout_fn=bootout_fn,
+                disable_fn=disable_fn,
+                system_timezone_fn=system_timezone_fn,
+                status_fn=status_fn,
             )
         if args.command == "restart":
             _stop(bootout_fn=bootout_fn, disable_fn=disable_fn)
@@ -376,6 +498,9 @@ def main(
                 enable_fn=enable_fn,
                 bootstrap_fn=bootstrap_fn,
                 bootout_fn=bootout_fn,
+                disable_fn=disable_fn,
+                system_timezone_fn=system_timezone_fn,
+                status_fn=status_fn,
             )
         if args.command == "status":
             return _status(settings, config_path, status_fn=status_fn)
@@ -416,6 +541,9 @@ def main(
                 runner_factory_fn=runner_factory_fn,
             )
         return EXIT_CONFIG
+    except LaunchdError as error:
+        _print_launchd_error(error)
+        return EXIT_UNEXPECTED
     except ConfigError:
         print("Configuration error.", file=sys.stderr)
         return EXIT_CONFIG
