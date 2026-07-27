@@ -471,10 +471,53 @@ class BitableRepository:
         if not isinstance(app_token, str) or not app_token:
             raise RepositorySchemaError("Bitable metadata did not include app_token")
         tables = data.get("tables", data.get("items"))
-        if not isinstance(tables, list):
-            raise RepositorySchemaError(
-                "Bitable metadata did not include a table list"
-            )
+        direct_table_id = data.get("table_id")
+        direct_table_name = data.get("name", data.get("table_name"))
+        if not isinstance(tables, list) or not tables:
+            if not isinstance(direct_table_id, str) or not direct_table_id:
+                raise RepositorySchemaError(
+                    "Bitable metadata did not include a table list"
+                )
+            if not isinstance(direct_table_name, str) or not direct_table_name:
+                raise RepositorySchemaError(
+                    "Bitable metadata did not include direct table name"
+                )
+
+            app_meta = self.client.meta(app_token)
+            app_data = _data_object(app_meta)
+            app_tables = app_data.get("tables", app_data.get("items"))
+            if not isinstance(app_tables, list) or not app_tables:
+                raise RepositorySchemaError(
+                    "Bitable app metadata did not include a table list"
+                )
+            app_meta_token = app_data.get("app_token")
+            if app_meta_token is not None and app_meta_token != app_token:
+                raise RepositorySchemaError(
+                    "Bitable app metadata returned a different app_token"
+                )
+
+            tables = app_tables
+            matching_by_id = [
+                table
+                for table in tables
+                if isinstance(table, Mapping)
+                and table.get("table_id") == direct_table_id
+            ]
+            matching_by_name = [
+                table
+                for table in tables
+                if isinstance(table, Mapping)
+                and table.get("name", table.get("table_name"))
+                == direct_table_name
+            ]
+            if (
+                len(matching_by_id) != 1
+                or len(matching_by_name) != 1
+                or matching_by_id[0] is not matching_by_name[0]
+            ):
+                raise RepositorySchemaError(
+                    "Wiki direct table identity did not match app metadata"
+                )
         table_ids: Dict[str, str] = {}
         for table in tables:
             if not isinstance(table, Mapping):

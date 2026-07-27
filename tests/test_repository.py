@@ -375,6 +375,21 @@ class FakeCLI:
             return json.load(input_file)
 
 
+class WikiMetaCLI(FakeCLI):
+    def __init__(self, url_meta, app_meta):
+        super().__init__(url_meta)
+        self.app_meta = app_meta
+        self.meta_calls = []
+
+    def meta(self, url_or_token):
+        self.meta_calls.append(url_or_token)
+        if url_or_token == "wiki-table-url":
+            return self.meta_payload
+        if url_or_token == "app-token":
+            return self.app_meta
+        raise AssertionError("unexpected metadata target: {}".format(url_or_token))
+
+
 def repository_meta(*table_names):
     return {
         "data": {
@@ -410,6 +425,69 @@ def repository_fields(meta):
             items.append(field)
         responses[table_id] = {"data": {"items": items}}
     return responses
+
+
+def test_discover_tables_resolves_wiki_table_metadata_via_app_metadata():
+    client = WikiMetaCLI(
+        {
+            "data": {
+                "app_token": "app-token",
+                "table_id": "tbl-0",
+                "name": "需求主表",
+                "url_type": "wiki",
+            }
+        },
+        repository_meta(
+            "需求主表",
+            "进展节点表",
+            "阻塞项表",
+            "项目配置表",
+            "基础配置表",
+            "通知记录表",
+        ),
+    )
+
+    repository = BitableRepository("wiki-table-url", client=client)
+    repository._discover_tables()
+
+    assert client.meta_calls == ["wiki-table-url", "app-token"]
+    assert repository._app_token == "app-token"
+    assert repository._table_ids["需求主表"] == "tbl-0"
+    assert repository._table_ids["通知记录表"] == "tbl-5"
+
+
+def test_discover_tables_rejects_wiki_table_identity_not_in_app_metadata():
+    client = WikiMetaCLI(
+        {
+            "data": {
+                "app_token": "app-token",
+                "table_id": "tbl-main",
+                "name": "需求主表",
+                "url_type": "wiki",
+            }
+        },
+        repository_meta("需求主表备份", "进展节点表"),
+    )
+
+    with pytest.raises(RepositorySchemaError, match="direct table"):
+        BitableRepository("wiki-table-url", client=client)._discover_tables()
+
+
+def test_discover_tables_rejects_app_metadata_without_table_list():
+    client = WikiMetaCLI(
+        {
+            "data": {
+                "app_token": "app-token",
+                "table_id": "tbl-main",
+                "name": "需求主表",
+                "url_type": "wiki",
+            }
+        },
+        {"data": {"app_token": "app-token"}},
+    )
+
+    with pytest.raises(RepositorySchemaError, match="table list"):
+        BitableRepository("wiki-table-url", client=client)._discover_tables()
 
 
 def test_load_snapshot_discovers_exact_names_and_reads_all_pages(raw_tables):
