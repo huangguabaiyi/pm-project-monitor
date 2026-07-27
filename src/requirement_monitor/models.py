@@ -1,6 +1,6 @@
 import re
 from enum import Enum, IntEnum
-from typing import Annotated, List, Literal, Optional, Set
+from typing import Annotated, Dict, List, Literal, Optional, Set
 
 from pydantic import (
     AwareDatetime,
@@ -206,6 +206,34 @@ class DataSnapshot(BaseModel):
     blockers: List[Blocker] = Field(default_factory=list)
     project_configs: List[ProjectConfig] = Field(default_factory=list)
     base_configs: List[BaseConfig] = Field(default_factory=list)
+    project_config_by_record_id: Dict[str, ProjectConfig] = Field(
+        default_factory=dict
+    )
+    project_config_by_project: Dict[str, ProjectConfig] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def build_project_config_indexes(self):
+        return self.rebuild_project_config_indexes()
+
+    def rebuild_project_config_indexes(self):
+        by_record_id: Dict[str, List[ProjectConfig]] = {}
+        by_project: Dict[str, List[ProjectConfig]] = {}
+        for config in self.project_configs:
+            by_record_id.setdefault(config.record_id, []).append(config)
+            by_project.setdefault(config.project, []).append(config)
+        self.project_config_by_record_id = {
+            record_id: configs[0]
+            for record_id, configs in by_record_id.items()
+            if len(configs) == 1
+        }
+        self.project_config_by_project = {
+            project: configs[0]
+            for project, configs in by_project.items()
+            if len(configs) == 1
+        }
+        return self
 
     def eligible_requirements(self) -> List[Requirement]:
         return [

@@ -18,6 +18,7 @@ from requirement_monitor.cards import (
 )
 from requirement_monitor.fixed_rules import parse_fixed_rules
 from requirement_monitor.models import (
+    DataSnapshot,
     FixedRules,
     LLMEnrichment,
     Person,
@@ -45,6 +46,10 @@ class MonitorRunReport(RunReport):
     payloads: List[Dict[str, object]] = Field(default_factory=list)
     dry_run: bool = False
     llm_skipped: bool = False
+
+
+class ProjectConfigConsistencyError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -164,9 +169,20 @@ class MonitorRunner:
         report.validation_issues = list(issues)
         report.invalid_records = len(issues)
 
+        snapshot.rebuild_project_config_indexes()
         eligible = snapshot.eligible_requirements()
         report.eligible_requirement_count = len(eligible)
-        project_configs = self._project_configs(snapshot.project_configs)
+        try:
+            project_configs = {
+                requirement.record_id: self._select_project_config(
+                    requirement, snapshot
+                )
+                for requirement in eligible
+            }
+        except ProjectConfigConsistencyError:
+            return self._finish_runtime_failure(
+                report, "SNAPSHOT_ERROR", dry_run
+            )
         risks: List[RequirementRisk] = []
         failed_requirement_ids = {
             issue.requirement_id
@@ -174,7 +190,7 @@ class MonitorRunner:
             if issue.requirement_id is not None
         }
         for requirement in eligible:
-            project_config = project_configs.get(requirement.project)
+            project_config = project_configs[requirement.record_id]
             try:
                 evaluator_arguments = (
                     requirement,
@@ -713,13 +729,33 @@ class MonitorRunner:
         return pending, severe_by_fingerprint
 
     @staticmethod
-    def _project_configs(
-        configs: Sequence[ProjectConfig],
-    ) -> Dict[str, ProjectConfig]:
-        result: Dict[str, ProjectConfig] = {}
-        for config in configs:
-            result.setdefault(config.project, config)
-        return result
+    def _select_project_config(
+        requirement: Requirement, snapshot: DataSnapshot
+    ) -> Optional[ProjectConfig]:
+        record_id = requirement.project_config_record_id
+        if record_id:
+            config = snapshot.project_config_by_record_id.get(record_id)
+            if config is None:
+                raise ProjectConfigConsistencyError(
+                    "project config link does not resolve"
+                )
+            if config.project != requirement.project:
+                raise ProjectConfigConsistencyError(
+                    "project config link crosses project boundary"
+                )
+            return config
+
+        config = snapshot.project_config_by_project.get(requirement.project)
+        if config is not None:
+            return config
+        if any(
+            item.project == requirement.project
+            for item in snapshot.project_configs
+        ):
+            raise ProjectConfigConsistencyError(
+                "project has multiple unlinked project configs"
+            )
+        return None
 
     @staticmethod
     def _project_groups(

@@ -379,6 +379,63 @@ def test_run_orders_dependencies_and_writes_before_sending():
     ]
 
 
+def test_runner_uses_requirement_project_config_record_link():
+    dependencies = FakeDependencies()
+    linked_requirement = dependencies.repository.snapshot.requirements[0].model_copy(
+        update={"project_config_record_id": "cfg-b"}
+    )
+    config_a = make_config().model_copy(update={"record_id": "cfg-a"})
+    config_b = make_config().model_copy(update={"record_id": "cfg-b"})
+    dependencies.repository.snapshot = DataSnapshot(
+        requirements=[linked_requirement],
+        nodes=dependencies.repository.snapshot.nodes,
+        project_configs=[config_a, config_b],
+    )
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.errors == []
+    assert dependencies.evaluator_calls == [config_b]
+
+
+@pytest.mark.parametrize("case", ["missing", "cross_project", "duplicate_unlinked"])
+def test_runner_rejects_invalid_project_config_consistency(case):
+    dependencies = FakeDependencies()
+    requirement = dependencies.repository.snapshot.requirements[0]
+    if case == "missing":
+        requirement = requirement.model_copy(
+            update={"project_config_record_id": "cfg-missing"}
+        )
+        configs = [make_config().model_copy(update={"record_id": "cfg-a"})]
+    elif case == "cross_project":
+        requirement = requirement.model_copy(
+            update={"project_config_record_id": "cfg-b"}
+        )
+        configs = [
+            make_config().model_copy(update={"record_id": "cfg-a"}),
+            make_config("项目B").model_copy(update={"record_id": "cfg-b"}),
+        ]
+    else:
+        requirement = requirement.model_copy(update={"project_config_record_id": None})
+        configs = [
+            make_config().model_copy(update={"record_id": "cfg-a"}),
+            make_config().model_copy(update={"record_id": "cfg-b"}),
+        ]
+    dependencies.repository.snapshot = DataSnapshot(
+        requirements=[requirement],
+        nodes=dependencies.repository.snapshot.nodes,
+        project_configs=configs,
+    )
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.errors == ["SNAPSHOT_ERROR"]
+    assert report.sent_cards == 1
+    assert len(dependencies.webhook.payloads) == 1
+    assert "SNAPSHOT_ERROR" in str(dependencies.webhook.payloads[0])
+    assert dependencies.evaluator_calls == []
+
+
 @pytest.mark.parametrize("raise_error", [False, True])
 def test_llm_failure_still_sends_daily_card(raise_error):
     dependencies = FakeDependencies()

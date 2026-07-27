@@ -142,6 +142,8 @@ def test_parses_people_dates_single_selects_and_link_record_ids(raw_tables):
     project_config = snapshot.project_configs[0]
     assert project_config.duration_mode == "workday"
     assert project_config.launch_weekdays == {0, 2, 4}
+    assert snapshot.project_config_by_record_id["rec-config-1"] == project_config
+    assert snapshot.project_config_by_project["米家"] == project_config
 
 
 def test_invalid_node_date_isolated_from_valid_sibling(raw_tables):
