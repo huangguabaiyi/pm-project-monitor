@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import datetime
 import json
+import logging
 import os
 from zoneinfo import ZoneInfo
 
@@ -454,6 +455,38 @@ def test_discover_tables_resolves_wiki_table_metadata_via_app_metadata():
     assert repository._app_token == "app-token"
     assert repository._table_ids["需求主表"] == "tbl-0"
     assert repository._table_ids["通知记录表"] == "tbl-5"
+
+
+def test_discover_tables_accepts_wiki_title_different_from_app_table_name(caplog):
+    client = WikiMetaCLI(
+        {
+            "data": {
+                "app_token": "app-token",
+                "table_id": "tblQl123",
+                "name": "需求进展机器人",
+                "url_type": "wiki",
+            }
+        },
+        {
+            "data": {
+                "app_token": "app-token",
+                "tables": [
+                    {"table_id": "tblQl123", "name": "需求主表"},
+                    {"table_id": "tbl-node", "name": "进展节点表"},
+                ],
+            }
+        },
+    )
+
+    repository = BitableRepository("wiki-table-url", client=client)
+    with caplog.at_level(logging.WARNING, logger="requirement_monitor.repository"):
+        repository._discover_tables()
+
+    assert repository._table_ids == {
+        "需求主表": "tblQl123",
+        "进展节点表": "tbl-node",
+    }
+    assert "Ignoring wiki metadata title" in caplog.text
 
 
 def test_discover_tables_rejects_wiki_table_identity_not_in_app_metadata():

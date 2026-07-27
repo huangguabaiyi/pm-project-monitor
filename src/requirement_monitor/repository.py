@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import tempfile
@@ -37,6 +38,7 @@ SNAPSHOT_TABLE_NAMES = (
 BATCH_SIZE = 500
 MIN_MILLISECONDS_TIMESTAMP = 1_000_000_000_000
 MAX_MILLISECONDS_TIMESTAMP = 99_999_999_999_999
+LOGGER = logging.getLogger(__name__)
 
 
 class RepositorySchemaError(RuntimeError):
@@ -473,14 +475,11 @@ class BitableRepository:
         tables = data.get("tables", data.get("items"))
         direct_table_id = data.get("table_id")
         direct_table_name = data.get("name", data.get("table_name"))
+        url_type = data.get("url_type", data.get("type"))
         if not isinstance(tables, list) or not tables:
             if not isinstance(direct_table_id, str) or not direct_table_id:
                 raise RepositorySchemaError(
-                    "Bitable metadata did not include a table list"
-                )
-            if not isinstance(direct_table_name, str) or not direct_table_name:
-                raise RepositorySchemaError(
-                    "Bitable metadata did not include direct table name"
+                    "Bitable metadata did not include direct table_id"
                 )
 
             app_meta = self.client.meta(app_token)
@@ -503,21 +502,30 @@ class BitableRepository:
                 if isinstance(table, Mapping)
                 and table.get("table_id") == direct_table_id
             ]
-            matching_by_name = [
-                table
-                for table in tables
-                if isinstance(table, Mapping)
-                and table.get("name", table.get("table_name"))
-                == direct_table_name
-            ]
-            if (
-                len(matching_by_id) != 1
-                or len(matching_by_name) != 1
-                or matching_by_id[0] is not matching_by_name[0]
-            ):
+            if len(matching_by_id) != 1:
                 raise RepositorySchemaError(
-                    "Wiki direct table identity did not match app metadata"
+                    "Wiki direct table_id did not match app metadata"
                 )
+            app_table_name = matching_by_id[0].get(
+                "name", matching_by_id[0].get("table_name")
+            )
+            if (
+                isinstance(direct_table_name, str)
+                and direct_table_name
+                and isinstance(app_table_name, str)
+                and direct_table_name != app_table_name
+            ):
+                if url_type == "wiki":
+                    LOGGER.warning(
+                        "Ignoring wiki metadata title %r for table %r named %r",
+                        direct_table_name,
+                        direct_table_id,
+                        app_table_name,
+                    )
+                else:
+                    raise RepositorySchemaError(
+                        "Direct table name did not match app metadata"
+                    )
         table_ids: Dict[str, str] = {}
         for table in tables:
             if not isinstance(table, Mapping):
