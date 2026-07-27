@@ -46,9 +46,14 @@ _DATE_PATTERN = re.compile(
     r"(?<!\d)(\d{4})[年./-](\d{1,2})[月./-](\d{1,2})日?(?!\d)"
 )
 _SHORT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日(?!\d)")
-_NUMERIC_CANDIDATE = r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+_UNSIGNED_NUMERIC_CANDIDATE = r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+_NUMERIC_CANDIDATE = rf"[+-]?{_UNSIGNED_NUMERIC_CANDIDATE}"
 _NUMERIC_TOKEN_START = r"(?<![0-9A-Za-z_.+-])"
 _NUMERIC_TOKEN_END = r"(?![0-9A-Za-z_.+-])"
+_SIGNED_METRIC_PATTERN = re.compile(
+    rf"[+-]\s*{_UNSIGNED_NUMERIC_CANDIDATE}\s*"
+    rf"(?:个)?(?:工作日|自然日|天|[%％]){_NUMERIC_TOKEN_END}"
+)
 _DAY_COUNT_PATTERN = re.compile(
     rf"{_NUMERIC_TOKEN_START}(?P<number>{_NUMERIC_CANDIDATE})\s*"
     rf"(?P<modifier>个)?(?P<unit>工作日|自然日|天){_NUMERIC_TOKEN_END}"
@@ -61,6 +66,23 @@ _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _IDENTITY_PATTERN = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
 _LONG_DIGIT_PATTERN = re.compile(r"(?<!\d)\d{7,}(?!\d)")
 _NUMERIC_PATH_PATTERN = re.compile(r"(?<=/)\d+")
+_SIGN_TRANSLATION = str.maketrans(
+    {
+        "－": "-",
+        "﹣": "-",
+        "−": "-",
+        "‐": "-",
+        "‑": "-",
+        "‒": "-",
+        "–": "-",
+        "—": "-",
+        "﹘": "-",
+        "⁻": "-",
+        "＋": "+",
+        "﹢": "+",
+        "⁺": "+",
+    }
+)
 _SAFE_BUSINESS_KEYWORDS = (
     "进行中",
     "未开始",
@@ -387,8 +409,10 @@ def _safe_signal_summaries(values: Iterable[str], label: str) -> List[str]:
 def _safe_signal_summary(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
-    sanitized = _URL_PATTERN.sub("[URL]", value)
+    sanitized = value.translate(_SIGN_TRANSLATION)
+    sanitized = _URL_PATTERN.sub("[URL]", sanitized)
     sanitized = _DATE_PATTERN.sub(_normalize_full_date, sanitized)
+    sanitized = _SIGNED_METRIC_PATTERN.sub("[REDACTED]", sanitized)
     sanitized = _NUMERIC_PATH_PATTERN.sub("[REDACTED]", sanitized)
     sanitized = _PHONE_PATTERN.sub("[REDACTED]", sanitized)
     sanitized = _IDENTITY_PATTERN.sub("[REDACTED]", sanitized)

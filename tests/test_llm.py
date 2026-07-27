@@ -397,6 +397,32 @@ def test_llm_request_metrics_require_complete_unsigned_numeric_tokens(
         assert rejected not in body
 
 
+def test_llm_request_rejects_unicode_signed_metric_variants(
+    httpx_mock, llm_settings
+):
+    httpx_mock.add_response(json=response_content())
+    risk = make_risk().model_copy(
+        update={
+            "project_notes": (
+                "拒绝- 3天、+ 3天、－3天、＋3天、−3天、"
+                "﹣　3天、﹢　3天、–3天、—3天；"
+                "拒绝- 1%、+ 1%、－1%、＋1%、−1%、"
+                "﹣　1%、﹢　1%、–1%、—1%；"
+                "保留7天、30个工作日、85.5%、100.0%"
+            )
+        }
+    )
+
+    LLMClient(llm_settings).enrich(risk, "固定规则", "")
+
+    body = httpx_mock.get_request().content.decode("utf-8")
+    user_input = json.loads(json.loads(body)["messages"][1]["content"])
+    summary = user_input["risk"]["context"]["project_notes"]
+    tokens = set(summary.partition("：")[2].split("；"))
+    assert {"7天", "30个工作日", "85.5%", "100.0%"} <= tokens
+    assert {"3天", "1%"}.isdisjoint(tokens)
+
+
 @pytest.mark.parametrize(
     ("chinese_level", "expected"),
     (
