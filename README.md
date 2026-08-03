@@ -54,7 +54,7 @@ chmod 600 config.local.json
 - `bot_keyword`：飞书自定义机器人安全关键词；当前机器人使用 `需求进展推送` 时应保持一致。
 - `fixed_rules_path`：固定业务规则文件，默认是项目根目录的 `固定业务规则`。
 - `timezone`：默认 `Asia/Shanghai`。
-- `send_hour` / `send_minute`：默认工作日 `20:00`。
+- `send_hour` / `send_minute`：默认工作日 `19:30`。
 - `state_dir` / `log_dir`：本地状态和日志目录。
 - `llm.enabled`：是否启用可选 LLM 补充判断，默认关闭。
 - `llm.api_key` / `llm.base_url` / `llm.model`：启用 LLM 时直接维护在本地配置中。
@@ -241,7 +241,7 @@ chmod 600 config.local.json
 
 `status` 和 `logs` 仅查看本机运行状态与日志，不要求配置 Webhook。
 
-默认调度为 `Asia/Shanghai` 每个工作日 `20:00`。周六、周日不自动发送；如果 Mac 在 `20:00` 关机或休眠，恢复后也不补发错过的日报。调度进程只接受计划时间后五分钟内的触发，避免休眠恢复导致误补跑。
+默认调度为 `Asia/Shanghai` 每个工作日 `19:30`。周六、周日不自动发送；如果 Mac 在 `19:30` 关机或休眠，恢复后也不补发错过的日报。调度进程只接受计划时间后五分钟内的触发，避免休眠恢复导致误补跑。
 
 后台模式必须通过 `start` 或 `restart` 生成配置，不能手工让 LaunchAgent 直接指向仓库中的源配置。macOS LaunchAgent 不继承执行 `start` 时的 shell 环境，因此 `start` 会先解析源配置和当前环境变量，再将完整运行设置写入 `state_dir/runtime-config.json`；该文件使用原子写入、`0600` 权限，包含 Webhook、可选 LLM key 和机器人关键词，plist 的 `scheduled-run --config` 只指向这份私密快照。源配置不需要、也不应保存 Webhook 或 LLM key。`stop` 会卸载并禁用任务，但保留 runtime snapshot；它位于本地状态目录，不得提交或共享。
 

@@ -8,8 +8,8 @@
   "bot_keyword": "需求进展推送",
   "fixed_rules_path": "固定业务规则",
   "timezone": "Asia/Shanghai",
-  "send_hour": 20,
-  "send_minute": 0,
+  "send_hour": 19,
+  "send_minute": 30,
   "state_dir": ".state",
   "log_dir": "logs",
   "llm": {
