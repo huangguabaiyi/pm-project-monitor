@@ -679,7 +679,11 @@ def _evaluate_domain(
         requirement.current_stage,
     )
     phases = _build_phase_events(events, rules, now)
-    downstream_durations = _downstream_durations(phases)
+    safe_deadlines = _safe_deadlines(
+        phases,
+        requirement.merge_at,
+        rules.duration_mode,
+    )
     node_risks: List[NodeRisk] = []
     reasons: List[str] = []
     findings: List[RiskFinding] = []
@@ -696,11 +700,7 @@ def _evaluate_domain(
     )
 
     for phase in phases:
-        safe_deadline = subtract_days(
-            requirement.merge_at,
-            downstream_durations[phase.order],
-            rules.duration_mode,
-        )
+        safe_deadline = safe_deadlines[phase.order]
         for event in phase.events:
             if event.node is None:
                 continue
@@ -754,11 +754,7 @@ def _evaluate_domain(
             or not phase.unfinished
         ):
             continue
-        safe_deadline = subtract_days(
-            requirement.merge_at,
-            downstream_durations[phase.order],
-            rules.duration_mode,
-        )
+        safe_deadline = safe_deadlines[phase.order]
         latest_start = subtract_days(
             safe_deadline, phase.remaining_duration, rules.duration_mode
         )
@@ -1524,13 +1520,37 @@ def _remaining_event_duration(
     return max(0, event.duration - consumed)
 
 
-def _downstream_durations(phases: Sequence[_PhaseEvent]) -> Dict[_PhaseRank, int]:
-    downstream: Dict[_PhaseRank, int] = {}
+def _safe_deadlines(
+    phases: Sequence[_PhaseEvent],
+    merge_at: datetime,
+    duration_mode: DayMode,
+) -> Dict[_PhaseRank, datetime]:
+    deadlines: Dict[_PhaseRank, datetime] = {}
     suffix_duration = 0
+    earliest_downstream_start: Optional[datetime] = None
     for phase in reversed(phases):
-        downstream[phase.order] = suffix_duration
+        deadline = subtract_days(merge_at, suffix_duration, duration_mode)
+        if phase.unfinished and earliest_downstream_start is not None:
+            deadline = min(deadline, earliest_downstream_start)
+        deadlines[phase.order] = deadline
+
+        planned_starts = [
+            event.node.planned_start
+            for event in phase.events
+            if event.node is not None
+            and not _node_done(event.node)
+            and event.node.planned_start is not None
+            and event.node.planned_end is not None
+        ]
+        if planned_starts:
+            phase_start = min(planned_starts)
+            earliest_downstream_start = (
+                phase_start
+                if earliest_downstream_start is None
+                else min(earliest_downstream_start, phase_start)
+            )
         suffix_duration += phase.remaining_duration
-    return downstream
+    return deadlines
 
 
 def _missing_schedule_stage_refs(phases: Sequence[_PhaseEvent]) -> List[str]:
