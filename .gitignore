@@ -1,1 +1,10 @@
 .worktrees/
+.venv/
+.DS_Store
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+config.local.json
+.state/
+logs/
