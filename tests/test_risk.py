@@ -484,6 +484,52 @@ def test_safe_deadline_uses_the_project_day_mode(rules):
     assert node_result(natural, "AT 测试第一轮").safe_deadline == in_aug(1, 18)
 
 
+def test_safe_deadline_is_capped_by_downstream_planned_start(rules):
+    config = make_config(
+        at1_days=4,
+        at2_days=4,
+        pv1_days=3,
+        pv2_days=2,
+        regression_days=2,
+    )
+    nodes = [
+        make_node(
+            "各端开发",
+            planned_start=at(21, 0),
+            planned_end=in_aug(5, 0),
+        ),
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            planned_start=in_aug(5, 0),
+            planned_end=in_aug(12, 0),
+            status=NodeStatus.NOT_STARTED,
+        ),
+        make_node(
+            "AT 测试第二轮",
+            work_type="测试",
+            planned_start=in_aug(13, 0),
+            planned_end=in_aug(18, 0),
+            status=NodeStatus.NOT_STARTED,
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(
+            current_stage="各端开发",
+            merge_at=in_aug(28, 0),
+        ),
+        nodes,
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert node_result(result, "各端开发").safe_deadline == in_aug(5, 0)
+    assert node_result(result, "AT 测试第一轮").safe_deadline == in_aug(13, 0)
+
+
 def test_at_rounds_use_independent_project_durations(rules):
     config = make_config(
         at1_days=3,
