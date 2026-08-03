@@ -462,8 +462,8 @@ def test_environment_overrides_secret_values(tmp_path, monkeypatch):
     assert settings.state_dir == Path(".state")
     assert settings.log_dir == Path("logs")
     assert settings.timezone == "Asia/Shanghai"
-    assert settings.send_hour == 20
-    assert settings.send_minute == 0
+    assert settings.send_hour == 19
+    assert settings.send_minute == 30
 
 
 def test_config_path_comes_from_environment(tmp_path, monkeypatch):

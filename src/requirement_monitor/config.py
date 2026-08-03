@@ -74,8 +74,8 @@ class Settings(BaseModel):
     bot_keyword: Optional[NonEmptyStr] = None
     fixed_rules_path: Path
     timezone: NonEmptyStr = "Asia/Shanghai"
-    send_hour: int = Field(default=20, ge=0, le=23)
-    send_minute: int = Field(default=0, ge=0, le=59)
+    send_hour: int = Field(default=19, ge=0, le=23)
+    send_minute: int = Field(default=30, ge=0, le=59)
     state_dir: Path
     log_dir: Path
     llm: LLMSettings = Field(default_factory=LLMSettings)
