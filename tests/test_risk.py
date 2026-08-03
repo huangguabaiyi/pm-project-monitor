@@ -38,8 +38,11 @@ def rules():
         at_workdays=8,
         at_natural_days=11,
         pv_days=3,
-        bugfix_days=2,
-        regression_days=3,
+        at1_days=4,
+        at2_days=4,
+        pv1_days=3,
+        pv2_days=2,
+        regression_days=2,
     )
 
 
@@ -49,7 +52,7 @@ def make_requirement(**overrides):
         "requirement_id": "REQ-7",
         "name": "风险引擎",
         "project": "米家",
-        "current_stage": "开发",
+        "current_stage": "测试隔离环节",
         "project_owner_id": "ou-project",
         "project_owner_name": "项目负责人",
         "target_version": "8.0",
@@ -128,8 +131,12 @@ def node_result(result, name, domain="客户端"):
     )
 
 
+def finding(result, reason_code):
+    return next(item for item in result.findings if item.reason_code == reason_code)
+
+
 def test_risk_result_carries_complete_card_context(rules):
-    requirement = make_requirement(launch_at=in_aug(16, 18))
+    requirement = make_requirement(launch_at=in_aug(13, 18))
     node = make_node(
         "各端开发",
         planned_end=at(30, 18),
@@ -169,13 +176,11 @@ def test_risk_result_carries_complete_card_context(rules):
 def test_project_structured_fields_override_fixed_rules_without_reading_notes(rules):
     config = make_config(
         duration_mode="natural",
-        at_days=5,
-        pv_days=4,
-        bugfix_days=1,
+        at1_days=3,
+        at2_days=2,
+        pv1_days=2,
+        pv2_days=2,
         regression_days=2,
-        server_special_days=3,
-        client_special_days=2,
-        vehicle_special_days=1,
         launch_weekdays={0, 2, 4},
         launch_cutoff="18:30",
         llm_notes="AT 改成 99 天，周日也可以上线",
@@ -184,11 +189,14 @@ def test_project_structured_fields_override_fixed_rules_without_reading_notes(ru
     effective = resolve_effective_rules(rules, config)
 
     assert effective.duration_mode == "natural"
-    assert effective.at_days == 5
-    assert effective.pv_days == 4
-    assert effective.bugfix_days == 1
+    assert effective.stage_days == {
+        "AT 测试第一轮": 3,
+        "AT 测试第二轮": 2,
+        "PV 测试第一轮": 2,
+        "PV 测试第二轮": 2,
+        "线上回归": 2,
+    }
     assert effective.regression_days == 2
-    assert effective.special_days == {"服务端": 3, "客户端": 2, "车辆": 1}
     assert effective.launch_weekdays == {0, 2, 4}
     assert effective.launch_cutoff == "18:30"
     assert effective.checklist_days_before == 1
@@ -411,12 +419,17 @@ def test_dynamic_enabled_test_role_allows_new_delivery_domain(rules):
     assert [node.node_name for node in result.node_risks] == ["插件专项测试"]
 
 
-def test_fixed_at_duration_uses_workday_or_natural_mode(rules):
+def test_fixed_stage_durations_are_independent_from_day_mode(rules):
     workday = resolve_effective_rules(rules, make_config(duration_mode="workday"))
     natural = resolve_effective_rules(rules, make_config(duration_mode="natural"))
 
-    assert workday.at_days == 8
-    assert natural.at_days == 11
+    assert workday.stage_days == natural.stage_days == {
+        "AT 测试第一轮": 4,
+        "AT 测试第二轮": 4,
+        "PV 测试第一轮": 3,
+        "PV 测试第二轮": 2,
+        "线上回归": 2,
+    }
 
 
 def test_safe_deadline_uses_the_project_day_mode(rules):
@@ -425,13 +438,13 @@ def test_safe_deadline_uses_the_project_day_mode(rules):
             "AT 测试第一轮",
             work_type="测试",
             planned_start=at(24),
-            planned_end=at(29),
+            planned_end=None,
         ),
         make_node(
             "AT 测试第二轮",
             work_type="测试",
             planned_start=at(29),
-            planned_end=at(31),
+            planned_end=None,
         ),
     ]
     requirement = make_requirement(merge_at=in_aug(3, 18))
@@ -444,9 +457,10 @@ def test_safe_deadline_uses_the_project_day_mode(rules):
         NOW,
         project_config=make_config(
             duration_mode="workday",
-            at_days=5,
-            pv_days=0,
-            bugfix_days=0,
+            at1_days=3,
+            at2_days=2,
+            pv1_days=0,
+            pv2_days=0,
             regression_days=0,
         ),
     )
@@ -458,9 +472,10 @@ def test_safe_deadline_uses_the_project_day_mode(rules):
         NOW,
         project_config=make_config(
             duration_mode="natural",
-            at_days=5,
-            pv_days=0,
-            bugfix_days=0,
+            at1_days=3,
+            at2_days=2,
+            pv1_days=0,
+            pv2_days=0,
             regression_days=0,
         ),
     )
@@ -469,68 +484,95 @@ def test_safe_deadline_uses_the_project_day_mode(rules):
     assert node_result(natural, "AT 测试第一轮").safe_deadline == in_aug(1, 18)
 
 
-def test_at_budget_is_split_with_ceil_for_at1_and_floor_for_at2(rules):
-    config = make_config(at_days=5, pv_days=0, bugfix_days=0, regression_days=0)
+def test_at_rounds_use_independent_project_durations(rules):
+    config = make_config(
+        at1_days=3,
+        at2_days=2,
+        pv1_days=0,
+        pv2_days=0,
+        regression_days=0,
+    )
     nodes = [
         make_node(
             "AT 测试第一轮",
             work_type="测试",
             planned_start=at(27),
-            planned_end=at(30),
+            planned_end=None,
         ),
         make_node(
             "AT 测试第二轮",
             work_type="测试",
             planned_start=at(30),
-            planned_end=in_aug(3),
+            planned_end=None,
         ),
     ]
 
     result = evaluate_requirement(
-        make_requirement(), nodes, [], rules, NOW, project_config=config
+        make_requirement(current_stage="开发"),
+        nodes,
+        [],
+        rules,
+        NOW,
+        project_config=config,
     )
 
     assert node_result(result, "AT 测试第一轮").safe_deadline == in_aug(12, 18)
     assert node_result(result, "AT 测试第二轮").safe_deadline == in_aug(14, 18)
 
 
-def test_pv_bug_reserve_and_regression_are_independent_downstream_stages(rules):
-    config = make_config(at_days=0, pv_days=3, bugfix_days=2, regression_days=3)
+def test_pv_rounds_and_regression_are_independent_downstream_stages(rules):
+    config = make_config(
+        at1_days=0,
+        at2_days=0,
+        pv1_days=2,
+        pv2_days=1,
+        regression_days=3,
+    )
     nodes = [
-        make_node("PV 测试第一轮", work_type="测试", planned_end=at(28)),
-        make_node("PV 测试第二轮", work_type="测试", planned_end=at(29)),
-        make_node("线上回归", work_type="测试", planned_end=in_aug(3)),
+        make_node("PV 测试第一轮", work_type="测试", planned_end=None),
+        make_node("PV 测试第二轮", work_type="测试", planned_end=None),
+        make_node("线上回归", work_type="测试", planned_end=None),
     ]
 
     result = evaluate_requirement(
         make_requirement(), nodes, [], rules, NOW, project_config=config
     )
 
-    assert node_result(result, "PV 测试第一轮").safe_deadline == in_aug(6, 18)
-    assert node_result(result, "PV 测试第二轮").safe_deadline == in_aug(7, 18)
+    assert node_result(result, "PV 测试第一轮").safe_deadline == in_aug(10, 18)
+    assert node_result(result, "PV 测试第二轮").safe_deadline == in_aug(11, 18)
     assert node_result(result, "线上回归").safe_deadline == in_aug(14, 18)
 
 
-def test_domain_special_days_only_shift_the_matching_domain(rules):
+def test_schedule_formula_exposes_only_remaining_key_stages(rules):
     config = make_config(
-        at_days=0,
-        pv_days=0,
-        bugfix_days=0,
-        regression_days=0,
-        server_special_days=3,
-        client_special_days=1,
+        at1_days=0,
+        at2_days=0,
+        pv1_days=2,
+        pv2_days=1,
+        regression_days=1,
     )
     nodes = [
-        make_node("各端开发", domain="服务端"),
-        make_node("各端开发", domain="客户端"),
+        make_node("PV 测试第一轮", work_type="测试", planned_end=None),
+        make_node("PV 测试第二轮", work_type="测试", planned_end=None),
+        make_node("线上回归", work_type="测试", planned_end=None),
     ]
 
     result = evaluate_requirement(
         make_requirement(), nodes, [], rules, NOW, project_config=config
     )
 
-    assert node_result(result, "各端开发", "服务端").safe_deadline == in_aug(11, 18)
-    assert node_result(result, "各端开发", "客户端").safe_deadline == in_aug(13, 18)
+    assert result.schedule_formula is not None
+    assert result.schedule_formula.domain == "客户端"
+    assert [term.label for term in result.schedule_formula.terms] == [
+        "PV 测试第一轮",
+        "PV 测试第二轮",
+        "线上回归",
+    ]
+    assert [term.days for term in result.schedule_formula.terms] == [2, 1, 1]
+    assert (
+        result.schedule_formula.predicted_completion
+        == result.predicted_completion
+    )
 
 
 def test_requirement_prediction_is_the_latest_domain_prediction(rules):
@@ -563,7 +605,13 @@ def test_overdue_node_with_remaining_buffer_is_warning(rules):
 
 
 def test_buffer_of_two_days_or_less_is_warning(rules):
-    config = make_config(at_days=8, pv_days=0, bugfix_days=0, regression_days=0)
+    config = make_config(
+        at1_days=4,
+        at2_days=4,
+        pv1_days=0,
+        pv2_days=0,
+        regression_days=0,
+    )
     nodes = [
         make_node(
             "AT 测试第一轮",
@@ -588,14 +636,83 @@ def test_buffer_of_two_days_or_less_is_warning(rules):
     assert "剩余缓冲不超过2天" in result.reasons
 
 
+def test_buffer_low_exposes_missing_schedule_stages(rules):
+    nodes = [
+        make_node(
+            "PV 测试第一轮",
+            work_type="测试",
+            planned_start=NOW,
+            planned_end=at(27),
+            status=NodeStatus.NOT_STARTED,
+        ),
+        make_node(
+            "PV 测试第二轮",
+            work_type="测试",
+            planned_start=at(27),
+            planned_end=None,
+            status=NodeStatus.NOT_STARTED,
+        ),
+    ]
+    config = make_config(
+        at1_days=0,
+        at2_days=0,
+        pv1_days=3,
+        pv2_days=1,
+        regression_days=1,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮", merge_at=at(31)),
+        nodes,
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    buffer_finding = finding(result, "schedule.buffer_low")
+    assert buffer_finding.stage_refs == ["PV 测试第二轮", "线上回归"]
+
+
+def test_buffer_low_keeps_exhausted_unscheduled_stage_visible(rules):
+    node = make_node(
+        "PV 测试第一轮",
+        work_type="测试",
+        planned_start=at(31),
+        planned_end=None,
+        status=NodeStatus.IN_PROGRESS,
+    )
+    config = make_config(
+        at1_days=0,
+        at2_days=0,
+        pv1_days=1,
+        pv2_days=0,
+        regression_days=0,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮", merge_at=in_aug(4)),
+        [node],
+        [],
+        rules,
+        in_aug(3),
+        project_config=config,
+        base_configs=[base_config("环节", "PV 测试第一轮", 10)],
+    )
+
+    buffer_finding = finding(result, "schedule.buffer_low")
+    assert buffer_finding.stage_refs == ["PV 测试第一轮"]
+
+
 def test_two_day_buffer_warning_always_uses_workdays(rules):
     node = make_node(planned_end=at(31, 18))
     requirement = make_requirement(merge_at=in_aug(3, 18))
     config = make_config(
         duration_mode="natural",
-        at_days=0,
-        pv_days=0,
-        bugfix_days=0,
+        at1_days=0,
+        at2_days=0,
+        pv1_days=0,
+        pv2_days=0,
         regression_days=0,
     )
 
@@ -610,8 +727,8 @@ def test_two_day_buffer_warning_always_uses_workdays(rules):
 
 def test_minimum_test_duration_that_cannot_fit_is_severe(rules):
     nodes = [
-        make_node("AT 测试第一轮", work_type="测试", planned_end=at(28)),
-        make_node("AT 测试第二轮", work_type="测试", planned_end=at(30)),
+        make_node("AT 测试第一轮", work_type="测试", planned_end=None),
+        make_node("AT 测试第二轮", work_type="测试", planned_end=None),
     ]
     requirement = make_requirement(merge_at=at(31, 18))
 
@@ -718,7 +835,7 @@ def test_overdue_non_merge_blocker_is_warning(rules):
     ],
 )
 def test_server_wednesday_or_after_1730_is_severe(rules, launch_at, expected_reason):
-    requirement = make_requirement(launch_at=launch_at)
+    requirement = make_requirement(merge_at=in_aug(21, 18), launch_at=launch_at)
     server_node = make_node(domain="服务端")
 
     result = evaluate_requirement(requirement, [server_node], [], rules, NOW)
@@ -729,7 +846,7 @@ def test_server_wednesday_or_after_1730_is_severe(rules, launch_at, expected_rea
 
 def test_incomplete_checklist_is_severe_on_day_before_launch(rules):
     now = at(27, 9)
-    requirement = make_requirement(merge_at=at(27, 8), launch_at=at(28, 17))
+    requirement = make_requirement(merge_at=at(30, 18), launch_at=at(28, 17))
     nodes = [
         make_node(domain="服务端", planned_end=at(27, 8), updated_at=now),
         make_node(
@@ -753,10 +870,51 @@ def test_incomplete_checklist_is_severe_on_day_before_launch(rules):
     assert checklist_risk.safe_deadline == at(27, 17)
 
 
+def test_explicit_server_launch_node_does_not_require_legacy_checklist(rules):
+    now = in_aug(19, 9)
+    requirement = make_requirement(merge_at=in_aug(21, 18), launch_at=in_aug(20, 17))
+    server_launch = make_node(
+        "服务端上线",
+        domain="服务端",
+        work_type="发布",
+        planned_start=in_aug(19, 9),
+        planned_end=in_aug(19, 17),
+        status=NodeStatus.IN_PROGRESS,
+        updated_at=now,
+    )
+
+    result = evaluate_requirement(requirement, [server_launch], [], rules, now)
+
+    assert "服务端上线 Checklist 未完成" not in result.reasons
+    assert result.launch_at == server_launch.planned_end
+
+
+def test_explicit_server_launch_node_drives_launch_rule_checks(rules):
+    server_launch = make_node(
+        "服务端上线",
+        domain="服务端",
+        work_type="发布",
+        planned_start=in_aug(18, 9),
+        planned_end=in_aug(19, 17),
+        status=NodeStatus.NOT_STARTED,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(merge_at=in_aug(21, 18), launch_at=None),
+        [server_launch],
+        [],
+        rules,
+        NOW,
+    )
+
+    assert result.launch_at == server_launch.planned_end
+    assert "服务端上线日期不符合允许星期" in result.reasons
+
+
 def test_checklist_only_participates_in_launch_checks_not_domain_aggregation(rules):
     now = in_aug(17, 9)
     requirement = make_requirement(
-        merge_at=in_aug(18, 12),
+        merge_at=in_aug(18, 18),
         launch_at=in_aug(18, 17),
     )
     client_done = make_node(
@@ -801,9 +959,36 @@ def test_checklist_only_participates_in_launch_checks_not_domain_aggregation(rul
 
 
 def test_completed_downstream_stages_do_not_consume_remaining_duration(rules):
-    config = make_config(at_days=0, pv_days=3, bugfix_days=2, regression_days=3)
+    config = make_config(
+        at1_days=0,
+        at2_days=0,
+        pv1_days=2,
+        pv2_days=1,
+        regression_days=3,
+    )
     completed_at = at(23, 18)
     nodes = [
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            planned_start=None,
+            planned_end=None,
+            status=NodeStatus.SKIPPED,
+        ),
+        make_node(
+            "AT 测试第二轮",
+            work_type="测试",
+            planned_start=None,
+            planned_end=None,
+            status=NodeStatus.SKIPPED,
+        ),
+        make_node(
+            "各端开发",
+            planned_start=at(15),
+            planned_end=at(16),
+            actual_end=at(16),
+            status=NodeStatus.COMPLETED,
+        ),
         make_node(
             "PV 测试第一轮",
             work_type="测试",
@@ -828,6 +1013,21 @@ def test_completed_downstream_stages_do_not_consume_remaining_duration(rules):
             actual_end=completed_at,
             status=NodeStatus.COMPLETED,
         ),
+        make_node(
+            "多语言翻译",
+            work_type="发布",
+            planned_start=at(22),
+            planned_end=completed_at,
+            actual_end=completed_at,
+            status=NodeStatus.COMPLETED,
+        ),
+        make_node(
+            "版本合入",
+            planned_start=completed_at,
+            planned_end=completed_at,
+            actual_end=completed_at,
+            status=NodeStatus.COMPLETED,
+        ),
     ]
 
     result = evaluate_requirement(
@@ -837,6 +1037,64 @@ def test_completed_downstream_stages_do_not_consume_remaining_duration(rules):
     assert result.level == RiskLevel.NORMAL
     assert result.predicted_completion == completed_at
     assert result.buffer_days > 0
+
+
+@pytest.mark.parametrize("current_stage", ["多语言翻译", "版本合入"])
+def test_incomplete_translation_is_warning_at_or_after_translation(rules, current_stage):
+    node = make_node("多语言翻译", work_type="发布", planned_start=at(25), planned_end=at(28), status=NodeStatus.IN_PROGRESS)
+    regression = make_node(
+        "线上回归",
+        work_type="发布",
+        planned_start=at(20),
+        planned_end=at(24),
+        actual_end=at(24),
+        status=NodeStatus.COMPLETED,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage=current_stage), [node, regression], [], rules, NOW
+    )
+
+    assert result.level == RiskLevel.WARNING
+    assert "多语言翻译未完成，建议合板前完成" in result.reasons
+
+
+def test_failed_test_gate_marks_the_failed_test_node(rules):
+    nodes = [
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            planned_start=at(25),
+            planned_end=at(27),
+            status=NodeStatus.IN_PROGRESS,
+        ),
+        make_node(
+            "AT 测试第二轮",
+            work_type="测试",
+            planned_start=at(27),
+            planned_end=at(29),
+            status=NodeStatus.NOT_STARTED,
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮"), nodes, [], rules, NOW
+    )
+
+    at1_risk = node_result(result, "AT 测试第一轮")
+    at2_risk = node_result(result, "AT 测试第二轮")
+    assert at1_risk.level == RiskLevel.SEVERE
+    assert at2_risk.level == RiskLevel.SEVERE
+    assert any("AT1 测试未通过" in reason for reason in at1_risk.reasons)
+    assert any("AT2 测试未通过" in reason for reason in at2_risk.reasons)
+    assert any(
+        item.reason_code == "test_gate.at_incomplete"
+        for item in at1_risk.findings
+    )
+    assert any(
+        item.reason_code == "test_gate.at_incomplete"
+        for item in at2_risk.findings
+    )
 
 
 def test_far_future_blocker_does_not_mark_domain_as_affected(rules):
@@ -853,7 +1111,7 @@ def test_far_future_blocker_does_not_mark_domain_as_affected(rules):
 
 
 def test_missing_near_term_test_start_schedule_is_warning(rules):
-    config = make_config(at_days=2, pv_days=0, bugfix_days=0, regression_days=0)
+    config = make_config(at1_days=1, at2_days=1, pv1_days=0, pv2_days=0, regression_days=0)
     node = make_node(
         "AT 测试第一轮",
         work_type="测试",
@@ -867,11 +1125,11 @@ def test_missing_near_term_test_start_schedule_is_warning(rules):
     )
 
     assert result.level == RiskLevel.WARNING
-    assert "测试排期缺少计划开始时间" in result.reasons
+    assert "测试排期缺少计划开始时间：客户端｜AT 测试第一轮" in result.reasons
 
 
-def test_missing_next_test_round_remains_in_budget_and_warns_near_start(rules):
-    config = make_config(at_days=2, pv_days=0, bugfix_days=0, regression_days=0)
+def test_missing_next_test_round_does_not_extend_budget_or_raise_risk(rules):
+    config = make_config(at1_days=1, at2_days=1, pv1_days=0, pv2_days=0, regression_days=0)
     completed_at = at(24, 10)
     node = make_node(
         "AT 测试第一轮",
@@ -887,13 +1145,13 @@ def test_missing_next_test_round_remains_in_budget_and_warns_near_start(rules):
         requirement, [node], [], rules, NOW, project_config=config
     )
 
-    assert result.level == RiskLevel.WARNING
-    assert result.predicted_completion == at(27, 12)
-    assert "测试排期缺少计划开始时间" in result.reasons
+    assert result.level == RiskLevel.NORMAL
+    assert result.predicted_completion == completed_at
+    assert not any("AT 测试第二轮" in reason for reason in result.reasons)
 
 
 def test_in_progress_test_budget_deducts_elapsed_project_days(rules):
-    config = make_config(at_days=4, pv_days=0, bugfix_days=0, regression_days=0)
+    config = make_config(at1_days=2, at2_days=2, pv1_days=0, pv2_days=0, regression_days=0)
     completed_upstream = make_node(
         "提测",
         planned_start=at(21),
@@ -918,17 +1176,17 @@ def test_in_progress_test_budget_deducts_elapsed_project_days(rules):
         project_config=config,
     )
 
-    assert result.predicted_completion == at(28)
-    assert node_result(result, "提测").safe_deadline == in_aug(12, 18)
+    assert result.predicted_completion == NOW
+    assert node_result(result, "提测").safe_deadline == in_aug(14, 18)
 
 
 def test_in_progress_test_without_planned_start_keeps_full_budget(rules):
-    config = make_config(at_days=4, pv_days=0, bugfix_days=0, regression_days=0)
+    config = make_config(at1_days=2, at2_days=2, pv1_days=0, pv2_days=0, regression_days=0)
     node = make_node(
         "AT 测试第一轮",
         work_type="测试",
         planned_start=None,
-        planned_end=NOW,
+        planned_end=None,
         status=NodeStatus.IN_PROGRESS,
     )
 
@@ -936,32 +1194,33 @@ def test_in_progress_test_without_planned_start_keeps_full_budget(rules):
         make_requirement(), [node], [], rules, NOW, project_config=config
     )
 
-    assert result.predicted_completion == at(30)
+    assert result.predicted_completion == at(28)
 
 
 def test_parallel_nodes_in_same_phase_use_max_budget_and_completion(rules):
-    config = make_config(at_days=0, pv_days=4, bugfix_days=0, regression_days=0)
+    config = make_config(at1_days=0, at2_days=0, pv1_days=2, pv2_days=2, regression_days=0)
     nodes = [
         make_node(
             "PV1 客户端主链路",
             work_type="测试",
             record_id="rec-pv1-main",
             planned_start=NOW,
-            planned_end=at(28),
+            planned_end=None,
         ),
         make_node(
             "PV1 客户端兼容性",
             work_type="测试",
             record_id="rec-pv1-compat",
             planned_start=NOW,
-            planned_end=at(29),
+            planned_end=None,
         ),
         make_node(
             "PV2 客户端主链路",
             work_type="测试",
             record_id="rec-pv2-main",
             planned_start=at(29),
-            planned_end=at(31),
+            planned_end=None,
+            status=NodeStatus.NOT_STARTED,
         ),
     ]
 
@@ -974,8 +1233,8 @@ def test_parallel_nodes_in_same_phase_use_max_budget_and_completion(rules):
     assert node_result(result, "PV1 客户端兼容性").safe_deadline == in_aug(12, 18)
 
 
-def test_extra_at_and_pv_rounds_keep_family_order_and_downstream_reserves(rules):
-    config = make_config(at_days=2, pv_days=4, bugfix_days=2, regression_days=3)
+def test_extra_at_and_pv_rounds_use_explicit_planned_completion(rules):
+    config = make_config(at1_days=1, at2_days=1, pv1_days=2, pv2_days=2, regression_days=3)
     nodes = [
         make_node(
             "AT3 补充轮次",
@@ -996,9 +1255,9 @@ def test_extra_at_and_pv_rounds_keep_family_order_and_downstream_reserves(rules)
         make_requirement(), nodes, [], rules, NOW, project_config=config
     )
 
-    assert result.predicted_completion == in_aug(12)
-    assert node_result(result, "AT3 补充轮次").safe_deadline == at(31, 18)
-    assert node_result(result, "PV3 补充轮次").safe_deadline == in_aug(7, 18)
+    assert result.predicted_completion == at(31)
+    assert node_result(result, "AT3 补充轮次").safe_deadline == in_aug(14, 18)
+    assert node_result(result, "PV3 补充轮次").safe_deadline == in_aug(14, 18)
 
 
 @pytest.mark.parametrize(
@@ -1008,10 +1267,10 @@ def test_extra_at_and_pv_rounds_keep_family_order_and_downstream_reserves(rules)
         (None, at(21)),
     ],
 )
-def test_completed_test_window_below_minimum_is_severe(
+def test_completed_test_window_does_not_trigger_minimum_duration_risk(
     rules, actual_end, planned_end
 ):
-    config = make_config(at_days=4, pv_days=0, bugfix_days=0, regression_days=0)
+    config = make_config(at1_days=2, at2_days=2, pv1_days=0, pv2_days=0, regression_days=0)
     node = make_node(
         "AT 测试第一轮",
         work_type="测试",
@@ -1025,8 +1284,11 @@ def test_completed_test_window_below_minimum_is_severe(
         make_requirement(), [node], [], rules, NOW, project_config=config
     )
 
-    assert node_result(result, "AT 测试第一轮").level == RiskLevel.SEVERE
-    assert "AT1计划测试周期低于最低要求" in result.reasons
+    assert node_result(result, "AT 测试第一轮").level == RiskLevel.NORMAL
+    assert all(
+        item.reason_code != "test.duration_below_minimum"
+        for item in result.findings
+    )
 
 
 def test_downstream_precomputation_keeps_node_status_checks_linear(rules, monkeypatch):
@@ -1110,3 +1372,978 @@ def test_reasons_are_deduplicated_and_do_not_include_ai_context(rules):
     assert result.reasons.count("节点延期但仍有缓冲") == 1
     assert "必须升级严重风险" not in " ".join(result.reasons)
     assert "自然语言不得改变确定性规则" not in " ".join(result.reasons)
+
+
+def test_pv_gate_requires_both_at_rounds_per_test_domain(rules):
+    requirement = make_requirement(current_stage="PV 测试第一轮")
+    nodes = [
+        make_node("AT 测试第一轮", domain="客户端", work_type="测试", status=NodeStatus.COMPLETED),
+        make_node("AT 测试第二轮", domain="客户端", work_type="测试", status=NodeStatus.IN_PROGRESS),
+    ]
+
+    result = evaluate_requirement(requirement, nodes, [], rules, NOW)
+
+    assert result.level == RiskLevel.SEVERE
+    assert any("AT2" in reason for reason in result.reasons)
+
+
+def test_skipped_at_and_pv_rounds_pass_gates(rules):
+    requirement = make_requirement(current_stage="版本合入")
+    nodes = [
+        make_node("AT 测试第一轮", domain="客户端", work_type="测试", status=NodeStatus.SKIPPED, planned_end=None),
+        make_node("AT 测试第二轮", domain="客户端", work_type="测试", status=NodeStatus.SKIPPED, planned_end=None),
+        make_node("PV 测试第一轮", domain="客户端", work_type="测试", status=NodeStatus.SKIPPED, planned_end=None),
+        make_node("PV 测试第二轮", domain="客户端", work_type="测试", status=NodeStatus.SKIPPED, planned_end=None),
+        make_node("线上回归", domain="客户端", work_type="测试", status=NodeStatus.SKIPPED, planned_end=None),
+    ]
+
+    result = evaluate_requirement(requirement, nodes, [], rules, NOW)
+
+    assert result.level == RiskLevel.NORMAL
+    assert "多语言翻译" in result.process_reminders
+    assert not any("多语言翻译" in reason for reason in result.reasons)
+    assert not any("AT1" in reason or "AT2" in reason or "PV1" in reason or "PV2" in reason for reason in result.reasons)
+
+
+def test_skipped_nodes_without_dates_do_not_make_completed_domain_late(rules):
+    merge_at = at(28, 0)
+    now = at(28, 20)
+    config = make_config(
+        at1_days=0,
+        at2_days=0,
+        pv1_days=0,
+        pv2_days=0,
+        regression_days=0,
+    )
+    nodes = [
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.SKIPPED,
+            planned_start=None,
+            planned_end=None,
+        ),
+        make_node(
+            "AT 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.SKIPPED,
+            planned_start=None,
+            planned_end=None,
+        ),
+        make_node(
+            "PV 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            planned_start=at(23, 0),
+            planned_end=merge_at,
+            actual_end=merge_at,
+        ),
+        make_node(
+            "PV 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            planned_start=at(27, 0),
+            planned_end=merge_at,
+            actual_end=merge_at,
+        ),
+        make_node(
+            "版本合入",
+            status=NodeStatus.COMPLETED,
+            planned_start=merge_at,
+            planned_end=merge_at,
+            actual_end=merge_at,
+        ),
+        make_node(
+            "线上回归",
+            work_type="测试",
+            status=NodeStatus.SKIPPED,
+            planned_start=None,
+            planned_end=None,
+        ),
+        make_node(
+            "多语言翻译",
+            work_type="发布",
+            status=NodeStatus.SKIPPED,
+            planned_start=None,
+            planned_end=None,
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮", merge_at=merge_at),
+        nodes,
+        [],
+        rules,
+        now,
+        project_config=config,
+    )
+
+    assert result.level == RiskLevel.NORMAL
+    assert result.predicted_completion == merge_at
+    assert not any("预计完成时间晚于合板时间" in reason for reason in result.reasons)
+    assert "剩余缓冲不超过2天" not in result.reasons
+
+
+def test_current_stage_advances_after_all_parallel_nodes_complete(rules):
+    config = make_config(
+        at1_days=0,
+        at2_days=0,
+        pv1_days=0,
+        pv2_days=0,
+        regression_days=0,
+    )
+    nodes = [
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.SKIPPED,
+            planned_end=None,
+        ),
+        make_node(
+            "AT 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.SKIPPED,
+            planned_end=None,
+        ),
+        make_node(
+            "PV 测试第一轮",
+            domain="客户端",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(24),
+        ),
+        make_node(
+            "PV 测试第一轮",
+            domain="车辆",
+            work_type="测试",
+            status=NodeStatus.SKIPPED,
+            planned_end=None,
+        ),
+        make_node(
+            "PV 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.NOT_STARTED,
+            planned_start=at(25),
+            planned_end=at(28),
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮"),
+        nodes,
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert result.current_stage == "PV 测试第二轮"
+
+
+def test_current_stage_waits_for_every_parallel_node(rules):
+    nodes = [
+        make_node(
+            "PV 测试第一轮",
+            domain="客户端",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(24),
+        ),
+        make_node(
+            "PV 测试第一轮",
+            domain="车辆",
+            work_type="测试",
+            status=NodeStatus.IN_PROGRESS,
+        ),
+        make_node(
+            "PV 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.NOT_STARTED,
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮"),
+        nodes,
+        [],
+        rules,
+        NOW,
+    )
+
+    assert result.current_stage == "PV 测试第一轮"
+
+
+def test_current_stage_advances_to_merge_when_all_nodes_are_done(rules):
+    config = make_config(
+        at1_days=0,
+        at2_days=0,
+        pv1_days=0,
+        pv2_days=0,
+        regression_days=0,
+    )
+    nodes = [
+        make_node(
+            stage,
+            work_type="测试",
+            status=NodeStatus.SKIPPED,
+            planned_end=None,
+        )
+        for stage in (
+            "AT 测试第一轮",
+            "AT 测试第二轮",
+            "线上回归",
+        )
+    ]
+    nodes.extend(
+        [
+            make_node(
+                "PV 测试第一轮",
+                work_type="测试",
+                status=NodeStatus.COMPLETED,
+                actual_end=at(24),
+            ),
+            make_node(
+                "PV 测试第二轮",
+                work_type="测试",
+                status=NodeStatus.COMPLETED,
+                actual_end=at(25),
+            ),
+            make_node(
+                "版本合入",
+                status=NodeStatus.COMPLETED,
+                actual_end=at(26),
+            ),
+        ]
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮"),
+        nodes,
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert result.current_stage == "服务端上线"
+
+
+def test_cancelled_test_round_does_not_pass_gate(rules):
+    requirement = make_requirement(current_stage="PV 测试第一轮")
+    nodes = [
+        make_node(
+            "AT 测试第一轮",
+            domain="服务端",
+            work_type="测试",
+            status=NodeStatus.CANCELLED,
+            actual_end=at(23),
+        ),
+        make_node("AT 测试第二轮", domain="服务端", work_type="测试", status=NodeStatus.COMPLETED),
+    ]
+
+    result = evaluate_requirement(requirement, nodes, [], rules, NOW)
+
+    assert result.level == RiskLevel.SEVERE
+    assert any("AT1" in reason for reason in result.reasons)
+
+
+def test_development_stage_without_nodes_uses_virtual_schedule_with_warning(rules):
+    result = evaluate_requirement(
+        make_requirement(current_stage="开发"), [], [], rules, NOW
+    )
+
+    assert result.level == RiskLevel.WARNING
+    assert result.current_stage == "开发"
+    assert any("测试排期缺少" in reason for reason in result.reasons)
+    assert all(
+        not item.reason_code.startswith("test_gate.")
+        for item in result.findings
+    )
+    assert "开发" in result.process_reminders
+    assert result.schedule_formula is not None
+
+
+def test_translation_warning_is_checked_without_test_domains(rules):
+    requirement = make_requirement(current_stage="版本合入")
+    nodes = [
+        make_node(
+            "线上回归",
+            domain="公共流程",
+            work_type="发布",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(23),
+        ),
+        make_node(
+            "多语言翻译",
+            domain="公共流程",
+            work_type="产品",
+            status=NodeStatus.IN_PROGRESS,
+        ),
+    ]
+
+    result = evaluate_requirement(requirement, nodes, [], rules, NOW)
+
+    assert "多语言翻译未完成，建议合板前完成" in result.reasons
+
+
+def test_explicit_test_window_does_not_create_minimum_duration_finding(rules):
+    node = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=at(24),
+        planned_end=at(25),
+    )
+
+    result = evaluate_requirement(make_requirement(), [node], [], rules, NOW)
+
+    assert all(
+        item.reason_code != "test.duration_below_minimum"
+        for item in result.findings
+    )
+
+
+def test_explicit_planned_end_is_authoritative_without_minimum_duration_risk(rules):
+    node = make_node(
+        "AT 测试第二轮",
+        work_type="测试",
+        planned_start=in_aug(13, 0),
+        planned_end=in_aug(18, 0),
+        status=NodeStatus.NOT_STARTED,
+    )
+    config = make_config(at2_days=4)
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"),
+        [node],
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert result.predicted_completion == node.planned_end
+    assert not any(
+        item.reason_code == "test.duration_below_minimum"
+        for item in result.findings
+    )
+
+
+def test_node_without_planned_end_uses_configured_stage_duration(rules):
+    node = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=NOW,
+        planned_end=None,
+        status=NodeStatus.NOT_STARTED,
+    )
+    config = make_config(at1_days=4)
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"),
+        [node],
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert result.predicted_completion == at(30)
+
+
+def test_missing_current_and_future_key_stages_use_virtual_durations(rules):
+    development = make_node(
+        "各端开发",
+        planned_start=NOW,
+        planned_end=in_aug(5, 0),
+        status=NodeStatus.IN_PROGRESS,
+    )
+    config = make_config(
+        at1_days=1,
+        at2_days=1,
+        pv1_days=1,
+        pv2_days=1,
+        regression_days=1,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="各端开发"),
+        [development],
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert result.predicted_completion == in_aug(12, 0)
+    assert result.schedule_formula is not None
+    assert [term.label for term in result.schedule_formula.terms] == [
+        "AT 测试第一轮",
+        "AT 测试第二轮",
+        "PV 测试第一轮",
+        "PV 测试第二轮",
+        "线上回归",
+    ]
+    assert not any(
+        item.reason_code.startswith("test_gate.") for item in result.findings
+    )
+
+
+def test_development_domain_receives_full_virtual_test_chain(rules):
+    platform_development = make_node(
+        "各端开发",
+        domain="平台",
+        planned_start=NOW,
+        planned_end=in_aug(5, 0),
+        status=NodeStatus.IN_PROGRESS,
+    )
+    configs = [
+        base_config("测试角色", "客户端测试", 10),
+        base_config("测试角色", "服务端测试", 20),
+        base_config("测试角色", "车辆测试", 30),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="各端开发"),
+        [platform_development],
+        [],
+        rules,
+        NOW,
+        base_configs=configs,
+    )
+
+    assert result.schedule_formula is not None
+    labels = [term.label for term in result.schedule_formula.terms]
+    assert labels == [
+        "AT 测试第一轮",
+        "AT 测试第二轮",
+        "PV 测试第一轮",
+        "PV 测试第二轮",
+        "线上回归",
+    ]
+
+
+def test_design_only_domain_does_not_receive_at_or_pv_virtual_stages(rules):
+    platform_design = make_node(
+        "设计稿输出",
+        domain="平台",
+        work_type="设计",
+        planned_start=NOW,
+        planned_end=in_aug(5, 0),
+        status=NodeStatus.IN_PROGRESS,
+    )
+    configs = [
+        base_config("测试角色", "客户端测试", 10),
+        base_config("测试角色", "服务端测试", 20),
+        base_config("测试角色", "车辆测试", 30),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="各端开发"),
+        [platform_design],
+        [],
+        rules,
+        NOW,
+        base_configs=configs,
+    )
+
+    assert result.schedule_formula is not None
+    labels = [term.label for term in result.schedule_formula.terms]
+    assert "AT 测试第一轮" not in labels
+    assert "AT 测试第二轮" not in labels
+    assert "PV 测试第一轮" not in labels
+    assert "PV 测试第二轮" not in labels
+    assert "线上回归" in labels
+
+
+def test_completed_current_stage_advances_to_immediate_missing_stage(rules):
+    nodes = [
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(23),
+        ),
+        make_node(
+            "PV 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.NOT_STARTED,
+            planned_start=in_aug(6),
+            planned_end=in_aug(10),
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="AT 测试第一轮"),
+        nodes,
+        [],
+        rules,
+        NOW,
+    )
+
+    assert result.current_stage == "AT 测试第二轮"
+    assert result.schedule_formula is not None
+    assert result.schedule_formula.terms[0].label == "AT 测试第二轮"
+
+
+def test_missing_planned_end_uses_original_planned_start_even_if_started_in_past(rules):
+    node = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=at(23),
+        planned_end=None,
+        status=NodeStatus.NOT_STARTED,
+    )
+    config = make_config(
+        at1_days=4,
+        at2_days=0,
+        pv1_days=0,
+        pv2_days=0,
+        regression_days=0,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(), [node], [], rules, NOW, project_config=config
+    )
+
+    assert result.predicted_completion == at(29)
+
+
+def test_empty_project_uses_virtual_schedule_from_current_stage(rules):
+    config = make_config(
+        at1_days=1,
+        at2_days=1,
+        pv1_days=1,
+        pv2_days=1,
+        regression_days=1,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="AT 测试第二轮"),
+        [],
+        [],
+        rules,
+        NOW,
+        project_config=config,
+    )
+
+    assert result.predicted_completion == at(30)
+    assert result.schedule_formula is not None
+    assert result.schedule_formula.domain == "项目排期"
+    assert [term.label for term in result.schedule_formula.terms] == [
+        "AT 测试第二轮",
+        "PV 测试第一轮",
+        "PV 测试第二轮",
+        "线上回归",
+    ]
+
+
+def test_finding_for_node_delay_consuming_buffer(rules):
+    node = make_node(planned_start=at(20, 9), planned_end=at(24, 18))
+    requirement = make_requirement(merge_at=at(25, 18))
+
+    result = evaluate_requirement(requirement, [node], [], rules, at(27))
+
+    delay_finding = finding(result, "node.delay_consumes_buffer")
+    assert "耗尽全部缓冲" in delay_finding.reason_text
+    assert delay_finding.stage_refs == ["各端开发"]
+    assert delay_finding.domain_refs == ["客户端"]
+    assert delay_finding.level == RiskLevel.SEVERE
+    assert delay_finding.source == "node_schedule"
+
+
+def test_finding_for_missing_test_schedule(rules):
+    config = make_config(at1_days=1, at2_days=1, pv1_days=0, pv2_days=0, regression_days=0)
+    node = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        planned_start=None,
+        planned_end=at(27, 18),
+    )
+    requirement = make_requirement(merge_at=at(28, 18))
+
+    result = evaluate_requirement(
+        requirement, [node], [], rules, NOW, project_config=config
+    )
+
+    schedule_finding = finding(result, "test.schedule_missing")
+    assert "缺少计划开始时间" in schedule_finding.reason_text
+    assert schedule_finding.stage_refs == ["AT 测试第一轮"]
+    assert schedule_finding.domain_refs == ["客户端"]
+    assert schedule_finding.level == RiskLevel.WARNING
+    assert schedule_finding.source == "test_schedule"
+
+
+def test_finding_for_incomplete_at_blocking_pv(rules):
+    nodes = [
+        make_node("AT 测试第一轮", work_type="测试"),
+        make_node("AT 测试第二轮", work_type="测试"),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮"), nodes, [], rules, NOW
+    )
+
+    at_finding = finding(result, "test_gate.at_incomplete")
+    assert "不能进入 PV" in at_finding.reason_text
+    assert at_finding.stage_refs == ["AT 测试第一轮"]
+    assert at_finding.domain_refs == ["客户端"]
+    assert at_finding.level == RiskLevel.SEVERE
+    assert at_finding.source == "test_gate"
+
+
+def test_finding_for_incomplete_pv_blocking_regression(rules):
+    nodes = [
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(20),
+        ),
+        make_node(
+            "AT 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(21),
+        ),
+        make_node("PV 测试第一轮", work_type="测试"),
+        make_node("PV 测试第二轮", work_type="测试"),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="线上回归"), nodes, [], rules, NOW
+    )
+
+    pv_finding = finding(result, "test_gate.pv_incomplete")
+    assert "不能进入线上回归" in pv_finding.reason_text
+    assert pv_finding.stage_refs == ["PV 测试第一轮"]
+    assert pv_finding.domain_refs == ["客户端"]
+    assert pv_finding.level == RiskLevel.SEVERE
+    assert pv_finding.source == "test_gate"
+
+
+def test_finding_for_incomplete_pv_blocking_server_launch(rules):
+    nodes = [
+        make_node("PV 测试第一轮", domain="服务端", work_type="测试"),
+        make_node("PV 测试第二轮", domain="服务端", work_type="测试"),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="服务端上线"), nodes, [], rules, NOW
+    )
+
+    pv_finding = finding(result, "test_gate.pv_incomplete")
+    assert pv_finding.reason_text == "PV 测试未通过，不能进入服务端上线"
+    assert pv_finding.stage_refs == ["PV 测试第一轮"]
+    assert pv_finding.domain_refs == ["服务端"]
+    assert pv_finding.level == RiskLevel.SEVERE
+    assert pv_finding.source == "test_gate"
+    assert "服务端 PV1 测试未通过，不能进入服务端上线" in result.reasons
+    assert not any("不能进入线上回归" in reason for reason in result.reasons)
+
+
+def test_missing_online_regression_is_process_reminder_not_failed_gate(rules):
+    node = make_node("各端开发", work_type="研发")
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"), [node], [], rules, NOW
+    )
+
+    assert not any(
+        item.reason_code.startswith("test_gate.regression_")
+        for item in result.findings
+    )
+    assert not any("线上回归未通过" in reason for reason in result.reasons)
+    assert "线上回归" in result.process_reminders
+
+
+def test_absent_test_rounds_are_reminders_not_failed_gates(rules):
+    merge_node = make_node(
+        "版本合入",
+        domain="客户端",
+        work_type="发布",
+        status=NodeStatus.NOT_STARTED,
+        planned_start=in_aug(10),
+        planned_end=in_aug(12),
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"), [merge_node], [], rules, NOW
+    )
+
+    assert not any(
+        item.reason_code.startswith("test_gate.at_")
+        or item.reason_code.startswith("test_gate.pv_")
+        or item.reason_code.startswith("test_gate.regression_")
+        for item in result.findings
+    )
+    assert result.process_reminders == [
+        "AT 测试第一轮",
+        "AT 测试第二轮",
+        "PV 测试第一轮",
+        "PV 测试第二轮",
+        "线上回归",
+        "多语言翻译",
+    ]
+
+
+def test_absent_synthetic_test_phases_do_not_create_schedule_findings(rules):
+    node = make_node(
+        "AT 测试第一轮",
+        work_type="测试",
+        status=NodeStatus.COMPLETED,
+        actual_end=at(24),
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="PV 测试第一轮"), [node], [], rules, NOW
+    )
+
+    assert not any(
+        item.reason_code == "test.schedule_missing"
+        and item.stage_refs != ["AT 测试第一轮"]
+        for item in result.findings
+    )
+    assert "AT 测试第二轮" in result.process_reminders
+    assert "PV 测试第一轮" in result.process_reminders
+
+
+def test_in_progress_regression_is_incomplete_not_missing(rules):
+    nodes = [
+        make_node(
+            "AT 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(20),
+        ),
+        make_node(
+            "AT 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(21),
+        ),
+        make_node(
+            "PV 测试第一轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(22),
+        ),
+        make_node(
+            "PV 测试第二轮",
+            work_type="测试",
+            status=NodeStatus.COMPLETED,
+            actual_end=at(23),
+        ),
+        make_node(
+            "线上回归",
+            work_type="发布",
+            status=NodeStatus.IN_PROGRESS,
+            planned_start=at(24),
+            planned_end=at(27),
+        ),
+    ]
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"), nodes, [], rules, NOW
+    )
+
+    regression_findings = [
+        item
+        for item in result.findings
+        if item.reason_code.startswith("test_gate.regression_")
+    ]
+    assert [item.reason_code for item in regression_findings] == [
+        "test_gate.regression_incomplete"
+    ]
+    assert regression_findings[0].stage_refs == ["线上回归"]
+    assert regression_findings[0].domain_refs == ["客户端"]
+    assert regression_findings[0].level == RiskLevel.SEVERE
+    assert regression_findings[0].source == "test_gate"
+    assert result.reasons.count("客户端 线上回归未通过，不能版本合入") == 1
+    assert "线上回归未通过，不能版本合入" not in result.reasons
+
+
+def test_shared_in_progress_regression_covers_test_domains_without_missing_findings(
+    rules,
+):
+    nodes = []
+    for domain in ("客户端", "车辆"):
+        for stage, day in (
+            ("AT 测试第一轮", 20),
+            ("AT 测试第二轮", 21),
+            ("PV 测试第一轮", 22),
+            ("PV 测试第二轮", 23),
+        ):
+            nodes.append(
+                make_node(
+                    stage,
+                    domain=domain,
+                    work_type="测试",
+                    status=NodeStatus.COMPLETED,
+                    actual_end=at(day),
+                )
+            )
+    nodes.append(
+        make_node(
+            "线上回归",
+            domain="平台",
+            work_type="发布",
+            status=NodeStatus.IN_PROGRESS,
+            planned_start=at(24),
+            planned_end=in_aug(3),
+        )
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"), nodes, [], rules, NOW
+    )
+
+    regression_findings = [
+        item
+        for item in result.findings
+        if item.reason_code.startswith("test_gate.regression_")
+    ]
+    assert [item.reason_code for item in regression_findings] == [
+        "test_gate.regression_incomplete"
+    ]
+    assert regression_findings[0].stage_refs == ["线上回归"]
+    assert regression_findings[0].domain_refs == ["平台"]
+    assert [reason for reason in result.reasons if "线上回归" in reason] == [
+        "线上回归未通过，不能版本合入"
+    ]
+
+
+def test_shared_in_progress_regression_is_ignored_before_regression_gate(rules):
+    shared_regression = make_node(
+        "线上回归",
+        domain="平台",
+        work_type="发布",
+        status=NodeStatus.IN_PROGRESS,
+        planned_start=at(24),
+        planned_end=in_aug(3),
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="开发"),
+        [shared_regression],
+        [],
+        rules,
+        NOW,
+    )
+
+    assert not any(
+        item.reason_code.startswith("test_gate.regression_")
+        for item in result.findings
+    )
+    assert not any("线上回归未通过" in reason for reason in result.reasons)
+
+
+def test_finding_for_domain_completion_later_than_merge(rules):
+    node = make_node(planned_end=in_aug(20, 18))
+
+    result = evaluate_requirement(
+        make_requirement(merge_at=in_aug(14, 18)), [node], [], rules, NOW
+    )
+
+    completion_finding = finding(result, "domain.completion_after_merge")
+    assert "晚于合板时间" in completion_finding.reason_text
+    assert completion_finding.stage_refs == []
+    assert completion_finding.domain_refs == ["客户端"]
+    assert completion_finding.level == RiskLevel.SEVERE
+    assert completion_finding.source == "domain_schedule"
+
+
+def test_finding_for_overdue_blocker(rules):
+    node = make_node()
+    blocker = make_blocker(
+        node_record_id=node.record_id,
+        planned_resolution_at=at(23, 18),
+    )
+
+    result = evaluate_requirement(make_requirement(), [node], [blocker], rules, NOW)
+
+    blocker_finding = finding(result, "blocker.overdue")
+    assert "阻塞项已超期" in blocker_finding.reason_text
+    assert blocker_finding.stage_refs == ["各端开发"]
+    assert blocker_finding.domain_refs == ["客户端"]
+    assert blocker_finding.level == RiskLevel.SEVERE
+    assert blocker_finding.source == "blocker"
+
+
+def test_finding_for_server_launch_rule_failure(rules):
+    requirement = make_requirement(
+        merge_at=in_aug(21, 18),
+        launch_at=in_aug(19, 17),
+    )
+    server_node = make_node(domain="服务端")
+
+    result = evaluate_requirement(requirement, [server_node], [], rules, NOW)
+
+    launch_finding = finding(result, "server_launch.weekday_invalid")
+    assert "不符合允许星期" in launch_finding.reason_text
+    assert launch_finding.stage_refs == ["服务端上线"]
+    assert launch_finding.domain_refs == ["服务端"]
+    assert launch_finding.level == RiskLevel.SEVERE
+    assert launch_finding.source == "server_launch"
+
+
+def test_finding_for_incomplete_translation_warning(rules):
+    node = make_node(
+        "多语言翻译",
+        domain="公共流程",
+        work_type="发布",
+        planned_start=at(25),
+        planned_end=at(28),
+        status=NodeStatus.IN_PROGRESS,
+    )
+    regression = make_node(
+        "线上回归",
+        domain="公共流程",
+        work_type="发布",
+        planned_start=at(20),
+        planned_end=at(24),
+        actual_end=at(24),
+        status=NodeStatus.COMPLETED,
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"), [node, regression], [], rules, NOW
+    )
+
+    translation_finding = finding(result, "translation.incomplete")
+    assert "翻译未完成" in translation_finding.reason_text
+    assert translation_finding.stage_refs == ["多语言翻译"]
+    assert translation_finding.domain_refs == ["公共流程"]
+    assert translation_finding.level == RiskLevel.WARNING
+    assert translation_finding.source == "test_gate"
+
+
+def test_missing_translation_is_process_reminder_not_warning(rules):
+    regression = make_node(
+        "线上回归",
+        domain="公共流程",
+        work_type="发布",
+        status=NodeStatus.COMPLETED,
+        actual_end=at(24),
+    )
+    merge_node = make_node(
+        "版本合入",
+        domain="公共流程",
+        work_type="发布",
+        status=NodeStatus.IN_PROGRESS,
+        planned_start=at(24),
+        planned_end=in_aug(3),
+    )
+
+    result = evaluate_requirement(
+        make_requirement(current_stage="版本合入"),
+        [regression, merge_node],
+        [],
+        rules,
+        NOW,
+    )
+
+    assert not any(
+        item.reason_code == "translation.incomplete" for item in result.findings
+    )
+    assert "多语言翻译未完成，建议合板前完成" not in result.reasons
+    assert "多语言翻译" in result.process_reminders

@@ -13,14 +13,18 @@ from requirement_monitor.models import (
     LLMEnrichment,
     NodeRisk,
     NodeStatus,
+    Person,
     ProjectConfig,
     Requirement,
     RequirementRisk,
+    RiskFinding,
     RiskLevel,
+    RunReport,
     SendResult,
     ValidationIssue,
 )
 from requirement_monitor.runner import MonitorRunner, severe_fingerprint
+from requirement_monitor.cards import build_daily_cards, build_severe_cards
 from requirement_monitor.state import (
     MonitorState,
     RunLockUnavailable,
@@ -97,12 +101,17 @@ def make_rules():
         at_workdays=5,
         at_natural_days=7,
         pv_days=3,
-        bugfix_days=2,
         regression_days=3,
     )
 
 
-def make_risk(requirement, level=RiskLevel.WARNING, *, owner_id="ou-node"):
+def make_risk(
+    requirement,
+    level=RiskLevel.WARNING,
+    *,
+    owner_id="ou-node",
+    findings=None,
+):
     node_risk = NodeRisk(
         node_record_id="node-{}".format(requirement.requirement_id.lower()),
         requirement_id=requirement.requirement_id,
@@ -110,6 +119,7 @@ def make_risk(requirement, level=RiskLevel.WARNING, *, owner_id="ou-node"):
         domain="客户端",
         owner_id=owner_id,
         owner_name="节点负责人",
+        owners=[Person(open_id=owner_id, name="节点负责人")],
         planned_end=at(26),
         status=NodeStatus.IN_PROGRESS,
         level=level,
@@ -134,6 +144,7 @@ def make_risk(requirement, level=RiskLevel.WARNING, *, owner_id="ou-node"):
         affected_domains=["客户端"],
         reasons=["预计晚于安全时间"],
         actions=["今天确认交付计划"],
+        findings=findings or [],
         node_risks=[node_risk],
     )
 
@@ -398,7 +409,28 @@ def test_runner_uses_requirement_project_config_record_link():
     assert dependencies.evaluator_calls == [config_b]
 
 
-@pytest.mark.parametrize("case", ["missing", "cross_project", "duplicate_unlinked"])
+def test_runner_accepts_explicit_project_config_link_across_project_names():
+    dependencies = FakeDependencies()
+    linked_requirement = dependencies.repository.snapshot.requirements[0].model_copy(
+        update={"project_config_record_id": "cfg-cycle"}
+    )
+    config_a = make_config().model_copy(update={"record_id": "cfg-a"})
+    config_cycle = make_config("端测试周期配置").model_copy(
+        update={"record_id": "cfg-cycle"}
+    )
+    dependencies.repository.snapshot = DataSnapshot(
+        requirements=[linked_requirement],
+        nodes=dependencies.repository.snapshot.nodes,
+        project_configs=[config_a, config_cycle],
+    )
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.errors == []
+    assert dependencies.evaluator_calls == [config_cycle]
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate_unlinked"])
 def test_runner_rejects_invalid_project_config_consistency(case):
     dependencies = FakeDependencies()
     requirement = dependencies.repository.snapshot.requirements[0]
@@ -407,14 +439,6 @@ def test_runner_rejects_invalid_project_config_consistency(case):
             update={"project_config_record_id": "cfg-missing"}
         )
         configs = [make_config().model_copy(update={"record_id": "cfg-a"})]
-    elif case == "cross_project":
-        requirement = requirement.model_copy(
-            update={"project_config_record_id": "cfg-b"}
-        )
-        configs = [
-            make_config().model_copy(update={"record_id": "cfg-a"}),
-            make_config("项目B").model_copy(update={"record_id": "cfg-b"}),
-        ]
     else:
         requirement = requirement.model_copy(update={"project_config_record_id": None})
         configs = [
@@ -483,7 +507,7 @@ def test_ineligible_requirements_are_filtered_before_evaluation():
     ]
 
 
-def test_manual_sends_one_daily_card_per_project_every_run():
+def test_manual_does_not_resend_successful_daily_card_per_project():
     dependencies = FakeDependencies()
     second = make_requirement("REQ-002", project="IoT平台")
     dependencies.repository.snapshot.requirements.append(second)
@@ -494,8 +518,56 @@ def test_manual_sends_one_daily_card_per_project_every_run():
     second_report = dependencies.runner().run(trigger="manual")
 
     assert first.sent_cards == 2
-    assert second_report.sent_cards == 2
+    assert second_report.sent_cards == 0
+    assert len(dependencies.webhook.payloads) == 2
+
+
+def test_manual_force_resends_daily_and_severe_cards():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    runner = dependencies.runner()
+
+    first = runner.run(trigger="manual")
+    duplicate = runner.run(trigger="manual")
+    forced = runner.run(trigger="manual", force=True)
+
+    assert first.sent_cards == 2
+    assert duplicate.sent_cards == 0
+    assert forced.sent_cards == 2
+    assert forced.severe_cards == 1
     assert len(dependencies.webhook.payloads) == 4
+
+
+def test_manual_force_dry_run_rebuilds_deduplicated_cards_without_side_effects():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    runner = dependencies.runner()
+
+    first = runner.run(trigger="manual")
+    side_effect_counts = (
+        len(dependencies.webhook.payloads),
+        len(dependencies.repository.requirement_writes),
+        len(dependencies.repository.node_writes),
+        len(dependencies.repository.notification_batches),
+        len(dependencies.state_store.saved),
+    )
+
+    dry_run = runner.run(trigger="manual", dry_run=True, force=True)
+    titles = [
+        payload["card"]["header"]["title"]["content"]
+        for payload in dry_run.payloads
+    ]
+
+    assert first.sent_cards == 2
+    assert len(dry_run.payloads) == 2
+    assert any("需求进展日报" in title for title in titles)
+    assert any("严重风险" in title for title in titles)
+    assert dry_run.sent_cards == 0
+    assert (
+        len(dependencies.webhook.payloads),
+        len(dependencies.repository.requirement_writes),
+        len(dependencies.repository.node_writes),
+        len(dependencies.repository.notification_batches),
+        len(dependencies.state_store.saved),
+    ) == side_effect_counts
 
 
 def test_scheduled_run_does_not_repeat_daily_cards_on_same_local_date():
@@ -514,7 +586,7 @@ def test_scheduled_run_does_not_repeat_daily_cards_on_same_local_date():
     assert scheduled.result == "success"
 
 
-def test_failed_scheduled_project_is_not_automatically_retried_same_day():
+def test_failed_scheduled_project_retries_same_day():
     dependencies = FakeDependencies()
     dependencies.webhook.results = [
         SendResult(
@@ -529,14 +601,14 @@ def test_failed_scheduled_project_is_not_automatically_retried_same_day():
     second = dependencies.runner().run(trigger="scheduled")
 
     assert first.failed_sends == 1
-    assert second.sent_cards == 0
+    assert second.sent_cards == 1
     assert second.failed_sends == 0
-    assert len(dependencies.webhook.payloads) == 1
+    assert len(dependencies.webhook.payloads) == 2
     scheduled = dependencies.state_store.state.scheduled_daily_results[
         "2026-07-25|米家"
     ]
-    assert scheduled.result == "failed"
-    assert scheduled.error_code == "service_error"
+    assert scheduled.result == "success"
+    assert scheduled.error_code is None
 
 
 def test_scheduled_deduplication_is_per_date_and_project():
@@ -559,15 +631,15 @@ def test_scheduled_deduplication_is_per_date_and_project():
     }
 
 
-def test_manual_run_can_resend_after_scheduled_attempt():
+def test_manual_run_does_not_resend_scheduled_success():
     dependencies = FakeDependencies()
 
     scheduled = dependencies.runner().run(trigger="scheduled")
     manual = dependencies.runner().run(trigger="manual")
 
     assert scheduled.sent_cards == 1
-    assert manual.sent_cards == 1
-    assert len(dependencies.webhook.payloads) == 2
+    assert manual.sent_cards == 0
+    assert len(dependencies.webhook.payloads) == 1
 
 
 def test_severe_fingerprint_is_deduplicated_until_resolution_or_change():
@@ -582,11 +654,11 @@ def test_severe_fingerprint_is_deduplicated_until_resolution_or_change():
 
     assert first.sent_cards == 2
     assert first.severe_cards == 1
-    assert second.sent_cards == 1
+    assert second.sent_cards == 0
     assert second.severe_cards == 0
-    assert resolved.sent_cards == 1
+    assert resolved.sent_cards == 0
     assert dependencies.state_store.saved[-2].active_fingerprints == set()
-    assert reappeared.sent_cards == 2
+    assert reappeared.sent_cards == 1
     assert reappeared.severe_cards == 1
 
 
@@ -600,6 +672,230 @@ def test_duplicate_severe_fingerprint_is_only_sent_once_in_a_run():
     assert report.processed_requirements == 2
     assert report.severe_cards == 1
     assert report.sent_cards == 2
+
+
+def test_runner_sends_all_severe_parts_and_retries_only_failed_part():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    findings = [
+        RiskFinding(
+            reason_code="runner.reason.{:03d}".format(index),
+            reason_text="Runner 风险原因 {:03d}".format(index),
+            stage_refs=["阶段{:03d}".format(index)],
+            domain_refs=["域{:03d}".format(index)],
+            level=RiskLevel.SEVERE,
+            source="test",
+        )
+        for index in range(60)
+    ]
+
+    def evaluator(requirement, nodes, blockers, fixed_rules, now, project_config):
+        return make_risk(requirement, RiskLevel.SEVERE, findings=findings)
+
+    dependencies.evaluate = evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = evaluator
+    risk = evaluator(
+        dependencies.repository.snapshot.requirements[0],
+        [],
+        [],
+        make_rules(),
+        NOW,
+        make_config(),
+    )
+    daily_count = len(
+        build_daily_cards(
+            RunReport(
+                trigger="manual",
+                started_at=NOW,
+                requirement_risks=[risk],
+            )
+        )
+    )
+    severe_payloads = build_severe_cards(risk)
+    assert len(severe_payloads) > 1
+    failed_title = severe_payloads[-1]["card"]["header"]["title"]["content"]
+    failed_once = [False]
+
+    def flaky_send(payload):
+        dependencies.events.append("send")
+        dependencies.webhook.payloads.append(payload)
+        title = payload["card"]["header"]["title"]["content"]
+        if title == failed_title and not failed_once[0]:
+            failed_once[0] = True
+            return SendResult(
+                success=False,
+                attempts=1,
+                format_used="card",
+                error="temporary_failure",
+            )
+        return SendResult(success=True, attempts=1, format_used="card")
+
+    dependencies.webhook.send = flaky_send
+
+    first = runner.run(trigger="manual")
+    first_records = dependencies.repository.notification_batches[-1]
+    first_severe_records = [
+        record
+        for record in first_records
+        if record["notification_type"] == "严重风险"
+    ]
+    first_severe_fingerprints = [
+        record["fingerprint"] for record in first_severe_records
+    ]
+
+    second = runner.run(trigger="manual")
+    second_records = dependencies.repository.notification_batches[-1]
+    second_severe_records = [
+        record
+        for record in second_records
+        if record["notification_type"] == "严重风险"
+    ]
+
+    assert first.failed_sends == 1
+    assert len(first_severe_records) == len(severe_payloads)
+    assert all(":part:" in fingerprint for fingerprint in first_severe_fingerprints)
+    assert first_severe_fingerprints == sorted(first_severe_fingerprints)
+    assert second.severe_cards == 1
+    assert second.sent_cards == 1
+    assert len(second_severe_records) == 1
+    assert second_severe_records[0]["fingerprint"] == first_severe_fingerprints[-1]
+    assert second_severe_records[0]["fingerprint"] not in first_severe_fingerprints[:-1]
+
+
+def test_legacy_severe_base_fingerprint_does_not_suppress_current_multi_parts():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+    findings = [
+        RiskFinding(
+            reason_code="legacy.multi.{:03d}".format(index),
+            reason_text="Legacy 多卡风险 {:03d}".format(index),
+            stage_refs=["阶段{:03d}".format(index)],
+            domain_refs=["域{:03d}".format(index)],
+            level=RiskLevel.SEVERE,
+            source="test",
+        )
+        for index in range(60)
+    ]
+
+    def evaluator(requirement, nodes, blockers, fixed_rules, now, project_config):
+        return make_risk(requirement, RiskLevel.SEVERE, findings=findings)
+
+    dependencies.evaluate = evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = evaluator
+    current_risk = evaluator(
+        dependencies.repository.snapshot.requirements[0],
+        [],
+        [],
+        make_rules(),
+        NOW,
+        make_config(),
+    )
+    legacy_base = severe_fingerprint(current_risk)
+    dependencies.state_store.state = MonitorState(active_fingerprints={legacy_base})
+
+    report = runner.run(trigger="manual")
+    part_count = len(build_severe_cards(current_risk))
+    daily_part_count = len(
+        build_daily_cards(
+            RunReport(
+                trigger="manual",
+                started_at=NOW,
+                requirement_risks=[current_risk],
+            )
+        )
+    )
+
+    assert part_count > 1
+    assert report.severe_cards == part_count
+    assert report.sent_cards == part_count + daily_part_count
+    assert all(
+        ":part:" in fingerprint
+        for fingerprint in dependencies.state_store.state.active_fingerprints
+    )
+
+
+def _make_multi_part_daily_evaluator(findings):
+    def evaluator(requirement, nodes, blockers, fixed_rules, now, project_config):
+        return make_risk(requirement, RiskLevel.WARNING, findings=findings)
+
+    return evaluator
+
+
+def _daily_part_test_findings():
+    return [
+        RiskFinding(
+            reason_code="daily.reason.{:03d}".format(index),
+            reason_text="日报风险原因 {:03d}".format(index),
+            stage_refs=["阶段{:03d}".format(index)],
+            domain_refs=["域{:03d}".format(index)],
+            level=RiskLevel.WARNING,
+            source="test",
+        )
+        for index in range(60)
+    ]
+
+
+def test_manual_daily_parts_retry_failed_part_without_resending_success():
+    dependencies = FakeDependencies()
+    evaluator = _make_multi_part_daily_evaluator(_daily_part_test_findings())
+    dependencies.evaluate = evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = evaluator
+    dependencies.webhook.results = [
+        SendResult(success=True, attempts=1, format_used="card"),
+        SendResult(success=False, attempts=1, format_used="card", error="failed"),
+    ]
+
+    first = runner.run(trigger="manual")
+    assert dependencies.repository.notification_time_writes == []
+    second = runner.run(trigger="manual")
+
+    assert first.failed_sends == 1
+    assert first.sent_cards == 1
+    assert second.sent_cards == 1
+    assert second.failed_sends == 0
+    assert dependencies.repository.notification_time_writes == [(["rec-req-001"], NOW)]
+    assert len(dependencies.webhook.payloads) == 3
+    assert second.payloads[0]["card"]["header"]["title"]["content"].endswith(
+        "第 2/2 部分"
+    )
+
+
+def test_manual_daily_successful_parts_are_not_resent():
+    dependencies = FakeDependencies()
+    evaluator = _make_multi_part_daily_evaluator(_daily_part_test_findings())
+    dependencies.evaluate = evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = evaluator
+
+    first = runner.run(trigger="manual")
+    second = runner.run(trigger="manual")
+
+    assert first.sent_cards == 2
+    assert second.sent_cards == 0
+    assert second.failed_sends == 0
+    assert len(dependencies.webhook.payloads) == 2
+
+
+def test_scheduled_daily_failed_part_retries_without_resending_success():
+    dependencies = FakeDependencies()
+    evaluator = _make_multi_part_daily_evaluator(_daily_part_test_findings())
+    dependencies.evaluate = evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = evaluator
+    dependencies.webhook.results = [
+        SendResult(success=True, attempts=1, format_used="card"),
+        SendResult(success=False, attempts=1, format_used="card", error="failed"),
+    ]
+
+    first = runner.run(trigger="scheduled")
+    second = runner.run(trigger="scheduled")
+
+    assert first.failed_sends == 1
+    assert first.sent_cards == 1
+    assert second.sent_cards == 1
+    assert second.failed_sends == 0
+    assert len(dependencies.webhook.payloads) == 3
 
 
 def test_changed_severe_fingerprint_sends_again():
@@ -618,7 +914,23 @@ def test_changed_severe_fingerprint_sends_again():
     second = runner.run(trigger="manual")
 
     assert second.severe_cards == 1
-    assert second.sent_cards == 2
+    assert second.sent_cards == 1
+
+
+def test_severe_fingerprint_ignores_owner_order_and_duplicates():
+    first = make_risk(make_requirement(), RiskLevel.SEVERE)
+    first.node_risks[0].owners = [
+        Person(open_id="ou-a", name="A"),
+        Person(open_id="ou-b", name="B"),
+        Person(open_id="ou-a", name="A"),
+    ]
+    second = first.model_copy(deep=True)
+    second.node_risks[0].owners = [
+        Person(open_id="ou-b", name="B"),
+        Person(open_id="ou-a", name="A"),
+    ]
+
+    assert severe_fingerprint(first) == severe_fingerprint(second)
 
 
 def test_dry_run_returns_payloads_without_side_effects():
@@ -690,17 +1002,215 @@ def test_failed_requirement_notifications_do_not_update_recent_notification_time
     assert dependencies.repository.notification_time_writes == []
 
 
-def test_severe_notification_record_only_targets_project_owner():
+def test_notification_records_target_all_expected_owners():
     dependencies = FakeDependencies(level=RiskLevel.SEVERE)
 
     dependencies.runner().run(trigger="manual")
+
+    records = dependencies.repository.notification_batches[0]
+    daily = next(
+        record for record in records if record["notification_type"] == "项目日报"
+    )
+    severe = next(
+        record
+        for record in records
+        if record["notification_type"] == "严重风险"
+    )
+    assert daily["recipient_ids"] == ["ou-node"]
+    assert severe["recipient_ids"] == ["ou-project", "ou-node"]
+
+
+def test_notification_records_include_multiple_node_owners_without_duplicates():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+
+    def multi_owner_evaluator(
+        requirement, nodes, blockers, fixed_rules, now, project_config
+    ):
+        risk = make_risk(requirement, RiskLevel.SEVERE)
+        risk.node_risks[0].owners.append(
+            Person(open_id="ou-second", name="第二负责人")
+        )
+        return risk
+
+    dependencies.evaluate = multi_owner_evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = multi_owner_evaluator
+
+    runner.run(trigger="manual")
+
+    records = dependencies.repository.notification_batches[0]
+    daily = next(
+        record for record in records if record["notification_type"] == "项目日报"
+    )
+    severe = next(
+        record for record in records if record["notification_type"] == "严重风险"
+    )
+    assert daily["recipient_ids"] == ["ou-node", "ou-second"]
+    assert severe["recipient_ids"] == ["ou-project", "ou-node", "ou-second"]
+
+
+def test_daily_notification_targets_only_current_stage_owners():
+    dependencies = FakeDependencies()
+
+    def current_stage_evaluator(
+        requirement, nodes, blockers, fixed_rules, now, project_config
+    ):
+        risk = make_risk(requirement, RiskLevel.WARNING)
+        future_node = risk.node_risks[0].model_copy(
+            update={
+                "node_record_id": "node-future",
+                "node_name": "线上回归",
+                "owner_id": "ou-future",
+                "owner_name": "未来负责人",
+                "owners": [Person(open_id="ou-future", name="未来负责人")],
+                "level": RiskLevel.NORMAL,
+                "reasons": [],
+            }
+        )
+        return risk.model_copy(
+            update={
+                "current_stage": "各端开发",
+                "node_risks": [risk.node_risks[0], future_node],
+            }
+        )
+
+    dependencies.evaluate = current_stage_evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = current_stage_evaluator
+
+    runner.run(trigger="manual")
+
+    records = dependencies.repository.notification_batches[0]
+    daily = next(
+        record for record in records if record["notification_type"] == "项目日报"
+    )
+    assert daily["recipient_ids"] == ["ou-node"]
+
+
+def test_severe_notification_targets_only_risk_related_node_owners():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+
+    def related_node_evaluator(
+        requirement, nodes, blockers, fixed_rules, now, project_config
+    ):
+        risk = make_risk(requirement, RiskLevel.SEVERE)
+        normal_node = risk.node_risks[0].model_copy(
+            update={
+                "node_record_id": "node-normal",
+                "node_name": "线上回归",
+                "owner_id": "ou-normal",
+                "owner_name": "普通负责人",
+                "owners": [Person(open_id="ou-normal", name="普通负责人")],
+                "level": RiskLevel.NORMAL,
+                "reasons": [],
+            }
+        )
+        return risk.model_copy(update={"node_risks": [risk.node_risks[0], normal_node]})
+
+    dependencies.evaluate = related_node_evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = related_node_evaluator
+
+    runner.run(trigger="manual")
+
+    records = dependencies.repository.notification_batches[0]
+    severe = next(
+        record for record in records if record["notification_type"] == "严重风险"
+    )
+    assert severe["recipient_ids"] == ["ou-project", "ou-node"]
+
+
+def test_severe_notification_falls_back_to_all_node_owners_without_related_nodes():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+
+    def unrelated_node_evaluator(
+        requirement, nodes, blockers, fixed_rules, now, project_config
+    ):
+        risk = make_risk(requirement, RiskLevel.SEVERE)
+        first_node = risk.node_risks[0].model_copy(
+            update={"level": RiskLevel.NORMAL, "reasons": []}
+        )
+        second_node = first_node.model_copy(
+            update={
+                "node_record_id": "node-second",
+                "node_name": "线上回归",
+                "owner_id": "ou-second",
+                "owner_name": "第二负责人",
+                "owners": [Person(open_id="ou-second", name="第二负责人")],
+            }
+        )
+        return risk.model_copy(update={"node_risks": [first_node, second_node]})
+
+    dependencies.evaluate = unrelated_node_evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = unrelated_node_evaluator
+
+    runner.run(trigger="manual")
+
+    records = dependencies.repository.notification_batches[0]
+    severe = next(
+        record for record in records if record["notification_type"] == "严重风险"
+    )
+    assert severe["recipient_ids"] == ["ou-project", "ou-node", "ou-second"]
+
+
+def test_severe_notification_targets_failed_gate_node_owners_only():
+    dependencies = FakeDependencies(level=RiskLevel.SEVERE)
+
+    def gate_evaluator(
+        requirement, nodes, blockers, fixed_rules, now, project_config
+    ):
+        risk = make_risk(requirement, RiskLevel.SEVERE)
+        failed_gate = risk.node_risks[0].model_copy(
+            update={
+                "node_record_id": "node-at1",
+                "node_name": "AT 测试第一轮",
+                "owner_id": "ou-at1",
+                "owner_name": "AT负责人",
+                "owners": [Person(open_id="ou-at1", name="AT负责人")],
+                "level": RiskLevel.SEVERE,
+                "reasons": ["客户端 AT1 测试未通过，不能进入 PV"],
+            }
+        )
+        unrelated = risk.node_risks[0].model_copy(
+            update={
+                "node_record_id": "node-pv1",
+                "node_name": "PV 测试第一轮",
+                "owner_id": "ou-pv1",
+                "owner_name": "PV负责人",
+                "owners": [Person(open_id="ou-pv1", name="PV负责人")],
+                "level": RiskLevel.NORMAL,
+                "reasons": [],
+            }
+        )
+        return risk.model_copy(update={"node_risks": [failed_gate, unrelated]})
+
+    dependencies.evaluate = gate_evaluator
+    runner = dependencies.runner()
+    runner.risk_evaluator = gate_evaluator
+
+    runner.run(trigger="manual")
 
     severe = next(
         record
         for record in dependencies.repository.notification_batches[0]
         if record["notification_type"] == "严重风险"
     )
-    assert severe["recipient_ids"] == ["ou-project"]
+    assert severe["recipient_ids"] == ["ou-project", "ou-at1"]
+
+
+@pytest.mark.parametrize("malformed_response", [None, {}, object()])
+def test_malformed_llm_response_degrades_without_blocking_push(malformed_response):
+    dependencies = FakeDependencies()
+    dependencies.llm.enrich = lambda *args, response=malformed_response: response
+
+    report = dependencies.runner().run(trigger="manual")
+
+    assert report.sent_cards == 1
+    assert report.llm_degraded is True
+    assert report.llm_failure_reasons == ["invalid_response"]
+    assert report.requirement_risks[0].llm_enrichment is not None
+    assert report.requirement_risks[0].llm_enrichment.available is False
 
 
 def test_authentication_failure_stops_table_work_and_returns_exception_payload():
@@ -796,7 +1306,7 @@ def test_default_runner_clock_is_timezone_aware():
         ),
     ],
 )
-def test_notification_record_failure_persists_scheduled_attempt_and_prevents_retry(
+def test_notification_record_failure_persists_scheduled_attempt_and_retries_daily_part(
     daily_result, expected_result
 ):
     dependencies = FakeDependencies()
@@ -812,14 +1322,16 @@ def test_notification_record_failure_persists_scheduled_attempt_and_prevents_ret
     scheduled = dependencies.state_store.state.scheduled_daily_results[
         "2026-07-25|米家"
     ]
-    assert scheduled.result == expected_result
+    assert scheduled.result == "success"
     assert dependencies.state_store.saved
     assert first.errors == ["NOTIFICATION_WRITE_ERROR"]
     assert "sk-secret" not in str(first)
     assert payload_count == 2
-    assert len(dependencies.webhook.payloads) == payload_count
+    assert len(dependencies.webhook.payloads) == payload_count + (
+        0 if expected_result == "success" else 2
+    )
     assert "NOTIFICATION_WRITE_ERROR" in str(dependencies.webhook.payloads[-1])
-    assert second.sent_cards == 0
+    assert second.sent_cards == (0 if expected_result == "success" else 2)
     assert second.failed_sends == 0
 
 

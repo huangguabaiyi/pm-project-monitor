@@ -287,7 +287,11 @@ class LLMClient:
                 {
                     "node_ref": _stable_ref("node", node.node_record_id),
                     "domain_ref": _stable_ref("domain", node.domain),
-                    "planned_end": node.planned_end.isoformat(),
+                    "planned_end": (
+                        node.planned_end.isoformat()
+                        if node.planned_end
+                        else None
+                    ),
                     "status": node.status.value,
                     "level": int(node.level),
                     "predicted_completion": (

@@ -1,13 +1,16 @@
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 
 DayMode = Literal["workday", "natural"]
 _VALID_MODES = ("workday", "natural")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def add_days(dt: datetime, days: int, mode: DayMode) -> datetime:
     _validate_mode(mode)
+    dt = _as_shanghai(dt)
     if mode == "natural":
         target_date = dt.date() + timedelta(days=days)
         return _at_local_date(dt, target_date)
@@ -28,6 +31,8 @@ def subtract_days(dt: datetime, days: int, mode: DayMode) -> datetime:
 
 def days_available(start: datetime, end: datetime, mode: DayMode) -> int:
     _validate_mode(mode)
+    start = _as_shanghai(start)
+    end = _as_shanghai(end)
     if mode == "natural":
         return (end.date() - start.date()).days
 
@@ -51,6 +56,12 @@ def days_available(start: datetime, end: datetime, mode: DayMode) -> int:
 def _validate_mode(mode: str) -> None:
     if mode not in _VALID_MODES:
         raise ValueError("mode must be 'workday' or 'natural'")
+
+
+def _as_shanghai(dt: datetime) -> datetime:
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return dt.replace(tzinfo=_SHANGHAI)
+    return dt.astimezone(_SHANGHAI)
 
 
 def _at_local_date(dt: datetime, target_date: date) -> datetime:

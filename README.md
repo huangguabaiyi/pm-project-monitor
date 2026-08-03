@@ -2,6 +2,8 @@
 
 本工具运行在本机 Mac 上，从飞书多维表格读取需求、项目配置、进展节点和阻塞项，按固定业务规则计算风险，并通过飞书 Webhook 发送日报卡片。第一版不提供对外 Web 服务，也不启动 HTTP 上行接口；飞书表格读写使用本机已经认证的 `feishu` CLI。
 
+面向需求负责人、研发测试成员和管理员的逐表填写说明，请查看 [`使用说明.md`](使用说明.md)。
+
 ## 安装
 
 要求：
@@ -39,47 +41,107 @@ feishu auth status
 
 ```bash
 cp config.example.json config.local.json
-export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
+chmod 600 config.local.json
 ```
 
-默认配置文件是当前目录的 `config.local.json`；也可以通过 `REQUIREMENT_MONITOR_CONFIG` 指定其他路径，或通过各命令的 `--config PATH` 指定。`config.local.json` 不提交到仓库，示例文件只包含表格地址和非敏感默认值。
+默认配置文件是当前目录的 `config.local.json`；也可以通过各命令的 `--config PATH` 指定其他路径。`config.local.json` 已被 Git 忽略，可以保存本机测试/正式 Webhook、安全关键词和可选 LLM 密钥；程序读取时会将其权限收紧为 `0600`。`config.example.json` 只包含占位符，不保存真实 secret。
 
 配置至少应确认以下字段：
 
 - `bitable_url`：目标飞书多维表格或知识库表格 URL。
-- `bot_keyword`：可选的飞书自定义机器人安全关键词；未启用关键词校验时保持 `null`。
+- `runtime_environment`：运行环境，默认 `test`，只允许 `test` 或 `prod`。
+- `webhooks.test` / `webhooks.prod`：测试和正式机器人 Webhook，互不回退和混用。
+- `bot_keyword`：飞书自定义机器人安全关键词；当前机器人使用 `需求进展推送` 时应保持一致。
 - `fixed_rules_path`：固定业务规则文件，默认是项目根目录的 `固定业务规则`。
 - `timezone`：默认 `Asia/Shanghai`。
 - `send_hour` / `send_minute`：默认工作日 `20:00`。
 - `state_dir` / `log_dir`：本地状态和日志目录。
 - `llm.enabled`：是否启用可选 LLM 补充判断，默认关闭。
+- `llm.api_key` / `llm.base_url` / `llm.model`：启用 LLM 时直接维护在本地配置中。
 
-Webhook URL、LLM API key 以及其他 token/API key 不属于业务配置。推荐并优先从环境变量读取，不要把真实值写入仓库、测试、日志或多维表格：
+本机配置示例：
 
-```bash
-export REQUIREMENT_MONITOR_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
-
-# 机器人启用了“关键词”安全设置时，必须与飞书后台配置完全一致：
-export REQUIREMENT_MONITOR_BOT_KEYWORD='需求机器人'
-
-# 只有启用 LLM 时才设置：
-export REQUIREMENT_MONITOR_LLM_API_KEY='...'
-export REQUIREMENT_MONITOR_LLM_BASE_URL='https://api.example.com/v1'
-export REQUIREMENT_MONITOR_LLM_MODEL='model-name'
+```json
+{
+  "runtime_environment": "test",
+  "webhooks": {
+    "test": "填入测试机器人 Webhook",
+    "prod": null
+  },
+  "bot_keyword": "需求进展推送",
+  "llm": {
+    "enabled": false,
+    "base_url": null,
+    "api_key": null,
+    "model": null,
+    "timeout_seconds": 20
+  }
+}
 ```
 
-为兼容旧的本地配置，`webhook_url` 仍可出现在未提交的 `config.local.json` 中；如果同时设置 `REQUIREMENT_MONITOR_WEBHOOK_URL`，环境变量覆盖文件值。`bot_keyword` 也可写入本地配置，并由 `REQUIREMENT_MONITOR_BOT_KEYWORD` 覆盖。新配置的 Webhook 和 LLM key 应只使用环境变量，`config.local.json` 必须保持本地且不得提交，`config.example.json` 不包含任何 secret。`init-table`、`status`、`logs`、`run-once --dry-run`、`stop` 和 `version` 不要求 Webhook；普通 `run-once`、`start`、`restart` 和 `scheduled-run` 必须配置 Webhook。若使用一次性 shell，可先在当前终端设置变量；不要把真实值写进 shell 历史、脚本或 `.env` 并提交。`feishu` CLI 的认证凭据由 CLI 自己管理，机器人不会接收其 token。
+直接执行命令时，程序优先使用 `--env test|prod`，其次兼容 `REQUIREMENT_MONITOR_ENV`，然后读取文件中的 `runtime_environment`，最后默认 `test`。旧环境变量仍可临时覆盖本地配置，但正常使用不再需要任何 `export`。生产环境必须从 Git `main` 分支运行；非 `main` 分支会在发送前拒绝，不会构造正式 Webhook 客户端。`init-table`、`status`、`logs`、`run-once --dry-run`、`stop` 和 `version` 不要求当前环境存在 Webhook。
 
 飞书 Webhook 返回 HTTP `200` 但业务码 `19024` 时，表示机器人启用了关键词安全校验，而消息中没有找到必需关键词。设置 `bot_keyword` 或 `REQUIREMENT_MONITOR_BOT_KEYWORD` 后，发送器会在文本、互动卡片、降级文本和系统异常卡片中保证该关键词可见，并避免重复注入；未配置关键词的机器人保持原 payload 不变。
+
+## 运行示例
+
+使用配置文件默认环境预览和发送：
+
+```bash
+.venv/bin/requirement-monitor run-once --dry-run
+.venv/bin/requirement-monitor run-once
+```
+
+测试环境需要重复验收同一天、相同内容的卡片时：
+
+```bash
+.venv/bin/requirement-monitor run-once --env test
+.venv/bin/requirement-monitor run-once --env test --force
+.venv/bin/requirement-monitor run-once --env test --force --dry-run
+```
+
+普通 `run-once` 会读取本机 `.state/monitor.json` 去重；删除飞书 `通知记录表` 的记录不会清除这份本机状态。`--force` 仅供 `test` 环境的 `run-once` 使用，只绕过项目日报和严重风险去重，不绕过数据校验、需求宣讲、通知开关或归档条件；`prod`、`start` 和 `restart` 均不支持。
+
+生产环境只能在 `main` 分支运行，并建议先预览：
+
+```bash
+.venv/bin/requirement-monitor run-once --env prod --dry-run
+.venv/bin/requirement-monitor run-once --env prod
+```
+
+后台任务直接读取本地配置：
+
+```bash
+.venv/bin/requirement-monitor start
+.venv/bin/requirement-monitor restart
+```
+
+修改本地 Webhook、安全词、表格地址、发送时间或 LLM 配置后，执行 `restart`，让后台私密 runtime snapshot 使用新值。
+
+## 链接与卡片行为
+
+- 飞书链接字段读取真实的 `link`、`url` 或 `href`；展示名称本身不是 URL。字段只有展示名称时按空值处理，不报错，也不展示按钮。
+- 非空但不符合完整 HTTP/HTTPS URL 格式的值只隔离当前需求，其他需求继续计算和推送。
+- 需求文档、Meego、多语言翻译按钮使用提取到的真实 URL，不使用飞书展示名称。
+- 严重风险卡片不再展示独立节点七列表格；同类风险按风险族合并，并在同一风险块中展示影响环节、交付域、真实负责人 @ 和最早安全 DDL。
+- 严重风险逐项展示；Warning 合并到“其他预警”，但不会遗漏风险分类。找不到具体节点时显示“项目排期”，不再显示“未标注”。
+- 卡片会展示关键路径计算公式及参与计算的 AT1、AT2、PV1、PV2、线上回归时长；显式填写的计划完成时间直接作为该节点 DDL，缺失时才使用项目配置或固定默认时长，实际日期按项目配置的工作日/自然日计算。
+- 卡片接近元素数或字节上限时拆成带有“第 N/M 部分”的连续卡片，不拆开风险组，也不静默丢弃链接、负责人 @ 或风险组。
+- 每个部分使用确定性的部分指纹。重复运行时成功部分不会重复发送，失败部分会按原部分指纹重试；Webhook 卡片失败时仍按发送器规则降级为文本。
 
 ## 固定业务规则
 
 项目根目录的 `固定业务规则` 是只读业务基线，机器人只加载它，不通过配置文件、LLM 或多维表格修改它。当前规则包括：
 
 - 服务端上线固定为每周二、周四，前一天完成上线 Checklist，`17:30` 后禁止上线。
-- AT1 加 AT2 的测试周期通常不少于一周半。
-- PV 测试通常约三天，加两天解 Bug，合计约五天。
-- 线上回归通常约三天。
+- AT 第一轮、AT 第二轮、PV 第一轮、PV 第二轮、线上回归的固定默认时长依次为 `4/4/3/2/2` 个工作日；项目配置留空时继承对应默认值。
+- 节点显式填写 `计划完成时间` 时完全采用人工排期，不再用配置或默认时长延长，也不校验是否达到默认时长。
+- 节点缺少 `计划完成时间` 时，从计划开始时间计算；计划开始时间也缺失时从当前计算游标开始，再叠加项目配置时长或固定默认时长。
+- 当前环节及后续缺少的 AT1、AT2、PV1、PV2、线上回归会生成只读虚拟节点参与预计完成、缓冲和延期计算；任何存在研发节点的交付域都必须具备完整测试链路，已有测试节点或在基础配置中启用了同名测试角色的交付域也会纳入计算；只有设计等非研发、非测试工作不会单独触发 AT/PV 虚拟排期。虚拟节点不判定门禁失败、不 @ 人，也不写入进展节点表。
+- 对已创建的节点，`已完成` 和 `已跳过` 都视为门禁通过，`已跳过`按零时长计算，`已取消`不视为通过。
+- 流程顺序为 `PV 测试第二轮 → 服务端上线 → 线上回归 → 多语言翻译 → 版本合入`；需求主表的 `计划上线时间` 指服务端上线时间，必须早于或等于合板时间；多语言翻译未完成只产生 Warning，不阻塞合板。
+- 需求主表的 `当前环节` 首次手动填写，之后由机器人只向后自动推进：当前环节的全部并行节点完成或跳过后，选择后续最早的未完成节点环节；后续已有节点全部完成时写回 `版本合入`。当前环节缺少对应节点时不自动跳过，也不会判定为未通过。
+- 项目支持稀疏维护：未创建的 AT/PV/线上回归等环节本身不视为“未通过”，只在卡片底部合并显示“流程补充提醒”，不 @ 人、不写入节点表。当前及未来缺失的五个关键环节仍通过虚拟节点参与排期；只有虚拟路径实际导致预计完成晚于合板、缓冲不足等结果时，才形成对应排期风险。已经创建但未完成的门禁节点仍按原规则校验；明确不执行但已经建行的节点应标记为 `已跳过`。`--dry-run` 只预览推导结果，不写回表格。
 
 项目级差异应维护在 `项目配置表`，不要修改固定规则文件来适配单个项目。LLM 只能在已有规则和数据基础上补充可解释的风险判断，只能升级风险等级，不能降低风险、修改排期、改写固定规则或阻断基础通知。
 
@@ -104,7 +166,7 @@ export REQUIREMENT_MONITOR_LLM_MODEL='model-name'
 
 ```bash
 cp config.example.json config.local.json
-export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
+chmod 600 config.local.json
 .venv/bin/requirement-monitor init-table --dry-run
 .venv/bin/requirement-monitor init-table --apply
 .venv/bin/requirement-monitor init-table --dry-run
@@ -128,17 +190,21 @@ export REQUIREMENT_MONITOR_CONFIG="$PWD/config.local.json"
 
 业务成员可以直接编辑以下内容：
 
-- `需求主表`：需求、项目、负责人、目标版本、合板/上线时间、宣讲完成、通知开关和归档状态。
-- `进展节点表`：公共流程、研发、联调、提测、测试和发布节点，以及计划/实际时间、状态和说明。
+- `需求主表`：需求名称、OKR 目标、三个可选链接、负责人、目标版本、合板/上线时间、宣讲完成、通知开关和归档状态。卡片中需求名称与 OKR 目标相同时只展示一次。
+- `进展节点表`：平台、设计、研发、联调、测试和发布节点，以及多人负责人、计划/实际时间、状态和说明。卡片中的人员全部使用真实飞书 @。
 - `阻塞项表`：阻塞事项、责任人、解决计划、实际解决时间和是否影响合板。
-- `项目配置表`：工作日/自然日、AT/PV/回归/专项测试天数、上线日期/截止时间和 LLM 开关。
+- `项目配置表`：工作日/自然日、AT1、AT2、PV1、PV2、线上回归时长、上线日期/截止时间及 LLM 开关；天数留空时继承固定规则默认值 `4/4/3/2/2`。
 - `基础配置表`：环节、交付域、工作类型和测试角色等低频配置。
 
-参与方和流程节点是动态数据，不通过新增主表字段扩展。新增服务端、客户端、车辆等交付域，或增加额外测试轮次/测试角色时，在 `基础配置表` 增加并启用对应配置记录，再在 `进展节点表` 使用相同的交付域建立研发与测试配套关系。系统预置交付域包含 `客户端`、`服务端`、`车辆`，也支持 `公共流程`、`中枢平台`、`嵌入式`、`插件`、`助手` 和 `其他`。
+参与方和流程节点是动态数据，不通过新增主表字段扩展。新增服务端、客户端、车辆等交付域，或增加额外测试轮次/测试角色时，在 `基础配置表` 增加并启用对应配置记录，再在 `进展节点表` 使用相同的交付域建立研发与测试配套关系。系统预置交付域包含 `客户端`、`服务端`、`车辆`、`平台`，也支持 `中枢平台`、`嵌入式`、`插件`、`助手` 和 `其他`。
 
-服务端需求应配套 `服务端 / 发布 / 上线 Checklist` 节点；其计划完成时间由系统按上线日期计算为前一天，成员维护负责人、状态和实际完成时间。客户端和车辆研发/测试同样通过交付域配套展示，不要求为每个端增加固定字段。
+交付域、工作类型、流程环节和测试角色的新增、停用或删除，优先通过 `基础配置表` 维护，通常不需要修改代码。删除前应确认没有现有节点正在使用；对历史数据仍可能引用的配置，建议保留记录并关闭 `是否启用`。如果新增的是会改变 AT/PV/线上回归门禁或合板判断的关键环节，则必须同步补充代码规则和测试，不能只增加配置项。
+
+服务端需求应配套 `服务端 / 发布 / 服务端上线` 节点；兼容旧的 `上线 Checklist` 名称。节点手工填写的计划完成时间优先，未填写时使用需求主表的 `计划上线时间`；该时间不得晚于合板时间。`多语言翻译` 位于线上回归后、版本合入前，建议合板前完成，但不会形成严重门禁风险。客户端和车辆研发/测试同样通过交付域配套展示，不要求为每个端增加固定字段。
 
 只有同时满足“需求宣讲已完成”“允许通知为是”“未归档”的需求才具备通知资格。系统字段、风险等级、预计完成时间、DDL、检查时间、通知时间和通知记录由程序维护，不应手工覆盖。
+
+表格编辑过程中出现的完全空白行只会写入本地 Warning 日志并跳过，不会隔离其他需求，也不会阻断本次推送。
 
 ## 手动运行
 
@@ -209,13 +275,13 @@ LLM 只用于补充风险理由，基础规则和基础通知不依赖 LLM。未
 git diff --check
 ```
 
-默认 `pytest` 会跳过 `tests/integration/test_live_bitable.py` 和 `tests/integration/test_live_webhook.py`。live Bitable 测试使用当前已认证的 `feishu` CLI，并从 `REQUIREMENT_MONITOR_CONFIG` 或默认 `config.local.json` 读取表格配置；针对 wiki URL，它验证真实 metadata 形态中的 `app_token`、`table_id`、`name` 和 `url_type: wiki`。live Webhook 测试只在同时设置 `REQUIREMENT_MONITOR_LIVE_TEST=1` 与 `REQUIREMENT_MONITOR_WEBHOOK_URL` 时发送一次明确标记的文本；如果机器人配置了关键词，同时设置 `REQUIREMENT_MONITOR_BOT_KEYWORD`：
+默认 `pytest` 会跳过 `tests/integration/test_live_bitable.py` 和 `tests/integration/test_live_webhook.py`。live Bitable 测试使用当前已认证的 `feishu` CLI，并从默认 `config.local.json` 或显式 `--config` 对应文件读取表格配置；针对 wiki URL，它验证真实 metadata 形态中的 `app_token`、`table_id`、`name` 和 `url_type: wiki`。live Webhook 连通性测试保留旧环境变量作为测试夹具注入方式，只在同时设置 `REQUIREMENT_MONITOR_LIVE_TEST=1` 与 `REQUIREMENT_MONITOR_WEBHOOK_URL` 时发送一次明确标记的文本；这不代表正式运行仍需要环境变量。
 
 ```bash
 export REQUIREMENT_MONITOR_LIVE_TEST=1
 export REQUIREMENT_MONITOR_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
 # 仅当机器人后台启用了关键词校验时设置：
-export REQUIREMENT_MONITOR_BOT_KEYWORD='需求机器人'
+export REQUIREMENT_MONITOR_BOT_KEYWORD='需求进展推送'
 .venv/bin/pytest tests/integration -v
 ```
 

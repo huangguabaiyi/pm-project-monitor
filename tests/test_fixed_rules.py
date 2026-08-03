@@ -11,8 +11,19 @@ from requirement_monitor.fixed_rules import (
 
 CURRENT_FIXED_RULES = (
     "服务端的上线时间固定为每周二和周四，需在前一天提交对应的 checklist 上线表格，且下午5点30分后禁止上线\n"
-    "AT1轮加二轮的测试周期一般需要一周半以上，\n"
-    "PV 测试一般在 3 天左右，加上 2 天解 Bug 的时间，总计大约 5 天\n"
+    "AT 测试第一轮默认 4 个工作日\n"
+    "AT 测试第二轮默认 4 个工作日\n"
+    "PV 测试第一轮默认 3 个工作日\n"
+    "PV 测试第二轮默认 2 个工作日\n"
+    "线上回归一般在 2 天左右\n"
+)
+
+FIVE_STAGE_RULES = (
+    "服务端的上线时间固定为每周二和周四，需在前一天提交对应的 checklist 上线表格，且下午5点30分后禁止上线\n"
+    "AT 测试第一轮一般需要 4 天\n"
+    "AT 测试第二轮一般需要 5 天\n"
+    "PV 测试第一轮一般需要 3 天\n"
+    "PV 测试第二轮一般需要 2 天\n"
     "线上回归一般在3天左右\n"
 )
 
@@ -23,10 +34,16 @@ def test_parse_current_fixed_business_rules():
     assert rules.server_launch_weekdays == {1, 3}
     assert rules.server_launch_cutoff == "17:30"
     assert rules.checklist_days_before == 1
-    assert rules.at_workdays == 8
-    assert rules.at_natural_days == 11
-    assert rules.pv_days == 3
-    assert rules.bugfix_days == 2
+    assert (rules.at1_days, rules.at2_days) == (4, 4)
+    assert (rules.pv1_days, rules.pv2_days) == (3, 2)
+    assert rules.regression_days == 2
+
+
+def test_parse_fixed_rules_exposes_each_key_stage_duration():
+    rules = parse_fixed_rules(FIVE_STAGE_RULES)
+
+    assert (rules.at1_days, rules.at2_days) == (4, 5)
+    assert (rules.pv1_days, rules.pv2_days) == (3, 2)
     assert rules.regression_days == 3
 
 
@@ -41,10 +58,10 @@ def test_parse_fixed_rules_lists_every_missing_rule_once():
         "server_launch_weekdays",
         "server_launch_cutoff",
         "checklist_days_before",
-        "at_workdays",
-        "at_natural_days",
-        "pv_days",
-        "bugfix_days",
+        "at1_days",
+        "at2_days",
+        "pv1_days",
+        "pv2_days",
         "regression_days",
     }
     for missing_rule in expected_missing:
@@ -139,74 +156,68 @@ def test_negated_server_launch_weekdays_are_rejected():
 
 def test_negated_at_duration_is_rejected():
     rules_text = CURRENT_FIXED_RULES.replace(
-        "AT1轮加二轮的测试周期一般需要一周半以上",
-        "AT不需要一周半以上",
+        "AT 测试第一轮默认 4 个工作日", "AT 测试第一轮不需要 4 个工作日"
+    ).replace(
+        "AT 测试第二轮默认 4 个工作日", "AT 测试第二轮不需要 4 个工作日"
     )
 
     with pytest.raises(FixedRuleParseError) as exc_info:
         parse_fixed_rules(rules_text)
 
-    assert exc_info.value.missing_rules == ("at_workdays", "at_natural_days")
+    assert exc_info.value.missing_rules == ("at1_days", "at2_days")
 
 
 @pytest.mark.parametrize(
-    "at_rule",
+    ("source", "replacement", "missing_rule"),
     (
-        "AT测试周期最多需要一周半以上",
-        "AT测试周期一般需要一周半以下",
+        (
+            "AT 测试第一轮默认 4 个工作日",
+            "AT 测试第一轮最多 4 个工作日",
+            "at1_days",
+        ),
+        (
+            "AT 测试第二轮默认 4 个工作日",
+            "AT 测试第二轮一般在 4 个工作日以下",
+            "at2_days",
+        ),
     ),
 )
-def test_at_duration_requires_positive_minimum_structure(at_rule):
-    rules_text = CURRENT_FIXED_RULES.replace(
-        "AT1轮加二轮的测试周期一般需要一周半以上",
-        at_rule,
-    )
+def test_at_duration_requires_positive_structure(source, replacement, missing_rule):
+    rules_text = CURRENT_FIXED_RULES.replace(source, replacement)
 
     with pytest.raises(FixedRuleParseError) as exc_info:
         parse_fixed_rules(rules_text)
 
-    assert exc_info.value.missing_rules == ("at_workdays", "at_natural_days")
+    assert exc_info.value.missing_rules == (missing_rule,)
 
 
 def test_pv_total_days_do_not_count_as_pv_test_days():
     rules_text = CURRENT_FIXED_RULES.replace(
-        "PV 测试一般在 3 天左右，加上 2 天解 Bug 的时间，总计大约 5 天",
-        "PV 测试总计大约 5 天，加上 2 天解 Bug 的时间",
+        "PV 测试第一轮默认 3 个工作日",
+        "PV 测试总计大约 5 天",
     )
 
     with pytest.raises(FixedRuleParseError) as exc_info:
         parse_fixed_rules(rules_text)
 
-    assert exc_info.value.missing_rules == ("pv_days",)
+    assert exc_info.value.missing_rules == ("pv1_days",)
 
 
 def test_ambiguous_pv_test_durations_are_rejected():
     rules_text = CURRENT_FIXED_RULES.replace(
-        "PV 测试一般在 3 天左右",
-        "PV 测试一般在 3 天左右，PV 测试周期在 5 天左右",
+        "PV 测试第一轮默认 3 个工作日",
+        "PV 测试第一轮默认 3 个工作日，PV 测试第一轮默认 5 个工作日",
     )
 
     with pytest.raises(FixedRuleParseError) as exc_info:
         parse_fixed_rules(rules_text)
 
-    assert exc_info.value.missing_rules == ("pv_days",)
-
-
-def test_ambiguous_bugfix_durations_are_rejected():
-    rules_text = CURRENT_FIXED_RULES.replace(
-        "加上 2 天解 Bug 的时间",
-        "加上 2 天解 Bug 的时间，预留 4 天修复 Bug",
-    )
-
-    with pytest.raises(FixedRuleParseError) as exc_info:
-        parse_fixed_rules(rules_text)
-
-    assert exc_info.value.missing_rules == ("bugfix_days",)
+    assert exc_info.value.missing_rules == ("pv1_days",)
 
 
 def test_regression_days_require_explicit_positive_structure():
     rules_text = CURRENT_FIXED_RULES.replace(
-        "线上回归一般在3天左右", "线上回归最多3天"
+        "线上回归一般在 2 天左右", "线上回归最多 2 天"
     )
 
     with pytest.raises(FixedRuleParseError) as exc_info:
@@ -270,13 +281,9 @@ def test_client_cutoff_clause_does_not_inherit_server_context():
             ),
             ("checklist_days_before",),
         ),
-        (
-            CURRENT_FIXED_RULES + "AT测试周期至少一周半以上\n",
-            ("at_workdays", "at_natural_days"),
-        ),
     ),
 )
-def test_duplicate_service_and_at_rules_are_rejected(rules_text, missing_rules):
+def test_duplicate_service_rules_are_rejected(rules_text, missing_rules):
     with pytest.raises(FixedRuleParseError) as exc_info:
         parse_fixed_rules(rules_text)
 
@@ -290,13 +297,9 @@ def test_duplicate_service_and_at_rules_are_rejected(rules_text, missing_rules):
             "服务端上线时间固定为每周一和周三\n",
             ("server_launch_weekdays",),
         ),
-        (
-            "AT测试周期至少两周以上\n",
-            ("at_workdays", "at_natural_days"),
-        ),
     ),
 )
-def test_conflicting_service_and_at_rules_are_rejected(
+def test_conflicting_service_rules_are_rejected(
     conflicting_rule, missing_rules
 ):
     with pytest.raises(FixedRuleParseError) as exc_info:
@@ -309,18 +312,18 @@ def test_conflicting_service_and_at_rules_are_rejected(
     ("source", "replacement", "missing_rule"),
     (
         (
-            "PV 测试一般在 3 天左右",
-            "PV 测试一般在 3 天左右以下",
-            "pv_days",
+            "PV 测试第一轮默认 3 个工作日",
+            "PV 测试第一轮默认 3 个工作日以下",
+            "pv1_days",
         ),
         (
-            "加上 2 天解 Bug 的时间",
-            "加上 2 天解 Bug 的时间以下",
-            "bugfix_days",
+            "PV 测试第二轮默认 2 个工作日",
+            "PV 测试第二轮默认 2 个工作日以下",
+            "pv2_days",
         ),
         (
-            "线上回归一般在3天左右",
-            "线上回归一般在3天左右以下",
+            "线上回归一般在 2 天左右",
+            "线上回归一般在 2 天左右以下",
             "regression_days",
         ),
     ),
@@ -360,8 +363,6 @@ def test_load_repository_fixed_rules_file():
     assert rules.server_launch_weekdays == {1, 3}
     assert rules.server_launch_cutoff == "17:30"
     assert rules.checklist_days_before == 1
-    assert rules.at_workdays == 8
-    assert rules.at_natural_days == 11
-    assert rules.pv_days == 3
-    assert rules.bugfix_days == 2
-    assert rules.regression_days == 3
+    assert (rules.at1_days, rules.at2_days) == (4, 4)
+    assert (rules.pv1_days, rules.pv2_days) == (3, 2)
+    assert rules.regression_days == 2

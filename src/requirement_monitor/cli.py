@@ -28,6 +28,11 @@ from requirement_monitor.launchd import (
     status as launchd_status,
     write_plist,
 )
+from requirement_monitor.runtime_environment import (
+    RuntimeEnvironmentError,
+    current_git_branch,
+    validate_runtime_environment,
+)
 
 
 EXIT_OK = 0
@@ -61,6 +66,10 @@ def _add_config_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path)
 
 
+def _add_environment_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--env", choices=("test", "prod"))
+
+
 def build_parser() -> argparse.ArgumentParser:
     scheduled_parser = argparse.ArgumentParser(
         prog="requirement-monitor scheduled-run"
@@ -80,10 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("start", "stop", "restart", "status", "logs"):
         command_parser = subparsers.add_parser(command)
         _add_config_argument(command_parser)
+        if command in {"start", "restart"}:
+            _add_environment_argument(command_parser)
 
     run_once_parser = subparsers.add_parser("run-once")
     _add_config_argument(run_once_parser)
+    _add_environment_argument(run_once_parser)
     run_once_parser.add_argument("--dry-run", action="store_true")
+    run_once_parser.add_argument("--force", action="store_true")
 
     subparsers.add_parser("version")
 
@@ -112,12 +125,78 @@ def _load_settings(
     load_settings_fn: Optional[Callable[[Optional[Path]], Any]],
     *,
     require_webhook: bool = True,
+    runtime_environment: Optional[str] = None,
+    use_environment_overrides: bool = True,
 ) -> Any:
     if load_settings_fn is None:
         from requirement_monitor.config import load_settings
 
-        return load_settings(config_path, require_webhook=require_webhook)
-    return load_settings_fn(config_path)
+        return load_settings(
+            config_path,
+            require_webhook=require_webhook,
+            runtime_environment=runtime_environment,
+            use_environment_overrides=use_environment_overrides,
+        )
+    try:
+        parameters = inspect.signature(load_settings_fn).parameters.values()
+    except (TypeError, ValueError):
+        return load_settings_fn(config_path)
+    accepts_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    parameter_names = {parameter.name for parameter in parameters}
+    keyword_arguments = {}
+    if accepts_kwargs or "require_webhook" in parameter_names:
+        keyword_arguments["require_webhook"] = require_webhook
+    if accepts_kwargs or "runtime_environment" in parameter_names:
+        keyword_arguments["runtime_environment"] = runtime_environment
+    if accepts_kwargs or "use_environment_overrides" in parameter_names:
+        keyword_arguments["use_environment_overrides"] = (
+            use_environment_overrides
+        )
+    return load_settings_fn(config_path, **keyword_arguments)
+
+
+def _source_repository_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _validate_runtime_environment(args: Any, settings: Any) -> None:
+    if args.command not in {"run-once", "start", "restart"}:
+        return
+    requested_environment = getattr(args, "env", None)
+    environment = getattr(settings, "runtime_environment", None)
+    if (
+        requested_environment is not None
+        and environment != requested_environment
+    ):
+        raise RuntimeEnvironmentError(
+            "Loaded runtime environment does not match the requested environment."
+        )
+    if environment is None:
+        environment = "test"
+    if environment not in {"test", "prod"}:
+        raise RuntimeEnvironmentError("Loaded runtime environment is invalid.")
+    if environment == "prod":
+        validate_runtime_environment(
+            environment,
+            branch=current_git_branch(_source_repository_root()),
+        )
+
+
+def _validate_force_environment(args: Any, settings: Any = None) -> None:
+    if args.command != "run-once" or not getattr(args, "force", False):
+        return
+    environment = (
+        getattr(settings, "runtime_environment", None)
+        if settings is not None
+        else getattr(args, "env", None)
+    )
+    if environment == "prod":
+        raise RuntimeEnvironmentError(
+            "--force is only available in test runtime environment."
+        )
 
 
 def _absolute_setting_path(value: Path, config_path: Path) -> Path:
@@ -246,13 +325,18 @@ def _run_monitor(
     *,
     trigger: str,
     dry_run: bool,
+    force: bool = False,
     runner_factory_fn: Optional[Callable[..., Any]],
 ) -> int:
     runner = _runner_from(
         settings, config_path, runner_factory_fn, dry_run=dry_run
     )
     try:
-        report = runner.run(trigger=trigger, dry_run=dry_run)
+        report = runner.run(
+            trigger=trigger,
+            dry_run=dry_run,
+            force=force,
+        )
         if dry_run:
             for payload in getattr(report, "payloads", []):
                 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -672,6 +756,7 @@ def _runtime_config_payload(
     llm = settings.llm
     return {
         "bitable_url": settings.bitable_url,
+        "runtime_environment": settings.runtime_environment,
         "webhook_url": _secret_value(settings.webhook_url),
         "bot_keyword": getattr(settings, "bot_keyword", None),
         "fixed_rules_path": str(fixed_rules_path),
@@ -890,6 +975,7 @@ def main(
         return EXIT_OK
 
     try:
+        _validate_force_environment(args)
         if args.command == "stop":
             return _stop(
                 plist_path=plist_path,
@@ -905,7 +991,11 @@ def main(
                 args.command not in {"init-table", "status", "logs"}
                 and not (args.command == "run-once" and args.dry_run)
             ),
+            runtime_environment=getattr(args, "env", None),
+            use_environment_overrides=(args.command != "scheduled-run"),
         )
+        _validate_force_environment(args, settings)
+        _validate_runtime_environment(args, settings)
 
         if args.command == "init-table":
             if initialize_schema_fn is None:
@@ -972,6 +1062,7 @@ def main(
                 config_path,
                 trigger="manual",
                 dry_run=args.dry_run,
+                force=args.force,
                 runner_factory_fn=runner_factory_fn,
             )
         if args.command == "scheduled-run":
@@ -994,6 +1085,7 @@ def main(
                 config_path,
                 trigger="scheduled",
                 dry_run=False,
+                force=False,
                 runner_factory_fn=runner_factory_fn,
             )
         return EXIT_CONFIG
@@ -1003,6 +1095,9 @@ def main(
     except LifecycleLockedError:
         print("Lifecycle operation locked.", file=sys.stderr)
         return EXIT_UNEXPECTED
+    except RuntimeEnvironmentError as error:
+        print(f"Configuration error: {error}", file=sys.stderr)
+        return EXIT_CONFIG
     except ConfigError:
         print("Configuration error.", file=sys.stderr)
         return EXIT_CONFIG

@@ -78,11 +78,14 @@ def test_schema_manifest_has_only_the_approved_fields_and_types():
     } == {
         "需求编号": 1,
         "需求名称": 1,
-        "项目名称": 1,
+        "OKR目标": 1,
         "当前环节": 3,
         "项目负责人": 11,
         "产品负责人": 11,
         "目标版本": 1,
+        "需求文档链接": 1,
+        "Meego链接": 1,
+        "多语言翻译链接": 1,
         "合板时间": 5,
         "计划上线时间": 5,
         "需求宣讲是否完成": 7,
@@ -107,7 +110,7 @@ def test_schema_manifest_has_only_the_approved_fields_and_types():
         "关联需求": 18,
         "交付域": 3,
         "工作类型": 3,
-        "节点名称": 1,
+        "节点名称": 3,
         "负责人": 11,
         "计划开始时间": 5,
         "计划完成时间": 5,
@@ -127,13 +130,11 @@ def test_schema_manifest_has_only_the_approved_fields_and_types():
     } == {
         "项目名称": 1,
         "周期计算方式": 3,
-        "AT 最少测试天数": 2,
-        "PV 最少测试天数": 2,
-        "Bug 修复预留天数": 2,
-        "线上回归最少天数": 2,
-        "服务端专项测试天数": 2,
-        "客户端专项测试天数": 2,
-        "车辆专项测试天数": 2,
+        "AT 第一轮默认天数": 2,
+        "AT 第二轮默认天数": 2,
+        "PV 第一轮默认天数": 2,
+        "PV 第二轮默认天数": 2,
+        "线上回归默认天数": 2,
         "可上线日期": 1,
         "上线截止时间": 1,
         "是否启用 LLM": 7,
@@ -171,6 +172,12 @@ def test_basic_config_seed_names_match_the_approved_defaults():
         "AT 测试第二轮",
         "PV 测试第一轮",
         "PV 测试第二轮",
+    ]
+    assert process_names[14:18] == [
+        "服务端上线",
+        "线上回归",
+        "多语言翻译",
+        "版本合入",
     ]
     assert set(BASIC_CONFIG_SEEDS[0]) == {
         "配置名称",
@@ -333,7 +340,7 @@ def test_initialize_schema_applies_two_phases_and_seed_is_idempotent():
     assert any(operation.kind == "seed_records" for operation in first_operations)
     assert second_operations == []
     assert len(client.records_by_table["tbl-basic"]) == len(BASIC_CONFIG_SEEDS)
-    assert len(BASIC_CONFIG_SEEDS) == 35
+    assert len(BASIC_CONFIG_SEEDS) == 37
 
 
 def test_apply_recovers_after_table_rename_succeeds_and_field_rename_fails():
@@ -404,7 +411,7 @@ def test_first_dry_run_includes_seed_summary_without_writing():
     )
     assert seed_operation.payload == {
         "table_id": "<基础配置表>",
-        "record_count": 35,
+        "record_count": 37,
     }
     assert not any(call[0] in WRITE_METHODS for call in client.calls)
 
@@ -537,8 +544,38 @@ def complete_schema_state():
                     "table_id": table_ids[field.target_table],
                     "multiple": False,
                 }
+            elif field.property is not None:
+                item["property"] = deepcopy(dict(field.property))
             fields[table_id].append(item)
     return meta, fields
+
+
+def test_user_field_schema_requires_declared_multiple_property():
+    meta, fields = complete_schema_state()
+    progress_field = next(
+        item
+        for item in fields["tbl-progress"]
+        if item["field_name"] == "负责人"
+    )
+    progress_field["property"] = {"multiple": False}
+
+    with pytest.raises(SchemaError, match="进展节点表\.负责人.*multiple"):
+        build_schema_plan(meta, fields)
+
+
+def test_single_user_field_accepts_missing_property_but_rejects_multiple():
+    meta, fields = complete_schema_state()
+    owner_field = next(
+        item
+        for item in fields["tbl-main"]
+        if item["field_name"] == "项目负责人"
+    )
+    owner_field.pop("property", None)
+    assert build_schema_plan(meta, fields) == []
+
+    owner_field["property"] = {"multiple": True}
+    with pytest.raises(SchemaError, match="需求主表\.项目负责人.*multiple"):
+        build_schema_plan(meta, fields)
 
 
 class FakeSchemaClient:
@@ -604,6 +641,11 @@ class FakeSchemaClient:
                 "field_name": field["field_name"],
                 "type": field["type"],
                 "is_primary": index == 0,
+                **(
+                    {"property": deepcopy(field["property"])}
+                    if field.get("property") is not None
+                    else {}
+                ),
             }
             for index, field in enumerate(fields)
         ]

@@ -5,8 +5,11 @@ from typing import Annotated, Dict, List, Literal, Optional, Set
 from pydantic import (
     AwareDatetime,
     BaseModel,
+    ConfigDict,
     Field,
     StringConstraints,
+    ValidationInfo,
+    computed_field,
     field_validator,
     model_validator,
 )
@@ -21,6 +24,39 @@ class RiskLevel(IntEnum):
     NORMAL = 0
     WARNING = 1
     SEVERE = 2
+
+
+class RiskFinding(BaseModel):
+    reason_code: NonEmptyStr
+    reason_text: NonEmptyStr
+    stage_refs: List[NonEmptyStr] = Field(default_factory=list)
+    domain_refs: List[NonEmptyStr] = Field(default_factory=list)
+    level: RiskLevel
+    source: NonEmptyStr
+
+    @model_validator(mode="after")
+    def deduplicate_references(self):
+        self.stage_refs = list(dict.fromkeys(self.stage_refs))
+        self.domain_refs = list(dict.fromkeys(self.domain_refs))
+        return self
+
+
+class RiskGroup(BaseModel):
+    reason_code: NonEmptyStr
+    reason_text: NonEmptyStr
+    stage_refs: List[NonEmptyStr] = Field(default_factory=list)
+    domain_refs: List[NonEmptyStr] = Field(default_factory=list)
+    level: RiskLevel
+    source_findings: List[RiskFinding] = Field(default_factory=list)
+
+
+class RiskFamily(BaseModel):
+    code: NonEmptyStr
+    title: NonEmptyStr
+    level: RiskLevel
+    stage_refs: List[NonEmptyStr]
+    domain_refs: List[NonEmptyStr]
+    source_findings: List[RiskFinding]
 
 
 class NodeStatus(str, Enum):
@@ -60,13 +96,16 @@ class Requirement(BaseModel):
     record_id: NonEmptyStr
     requirement_id: NonEmptyStr
     name: NonEmptyStr
-    project: NonEmptyStr
+    okr_target: NonEmptyStr
     current_stage: NonEmptyStr
     project_owner_id: NonEmptyStr
     project_owner_name: NonEmptyStr
     product_owner_id: Optional[NonEmptyStr] = None
     product_owner_name: Optional[NonEmptyStr] = None
     target_version: NonEmptyStr
+    requirement_doc_url: Optional[NonEmptyStr] = None
+    meego_url: Optional[NonEmptyStr] = None
+    translation_url: Optional[NonEmptyStr] = None
     merge_at: AwareDatetime
     launch_at: Optional[AwareDatetime] = None
     briefing_completed: bool
@@ -75,23 +114,82 @@ class Requirement(BaseModel):
     project_config_record_id: Optional[NonEmptyStr] = None
     requirement_notes: StrippedStr = ""
 
-    @model_validator(mode="after")
-    def validate_schedule(self):
-        if self.launch_at is not None and self.launch_at < self.merge_at:
-            raise ValueError("launch_at must not precede merge_at")
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_project_name(cls, values):
+        if not isinstance(values, dict):
+            return values
+        normalized = dict(values)
+        okr_target = normalized.get("okr_target")
+        normalized_okr_target = (
+            okr_target.strip() if isinstance(okr_target, str) else okr_target
+        )
+        normalized_legacy_values = {}
+        for legacy_name in ("project", "项目名称"):
+            legacy_value = normalized.get(legacy_name)
+            normalized_legacy_value = (
+                legacy_value.strip()
+                if isinstance(legacy_value, str)
+                else legacy_value
+            )
+            normalized_legacy_values[legacy_name] = normalized_legacy_value
+            if (
+                normalized_okr_target
+                and normalized_legacy_value
+                and normalized_okr_target != normalized_legacy_value
+            ):
+                raise ValueError(
+                    f"okr_target conflicts with legacy field {legacy_name}"
+                )
+
+        if not normalized_okr_target:
+            project = normalized_legacy_values.get("project")
+            project_name = normalized_legacy_values.get("项目名称")
+            if project and project_name and project != project_name:
+                raise ValueError(
+                    "project and 项目名称 contain conflicting values while "
+                    "okr_target is empty"
+                )
+            for legacy_name in ("project", "项目名称"):
+                if legacy_name in normalized:
+                    normalized["okr_target"] = normalized[legacy_name]
+                    break
+        return normalized
+
+    @field_validator(
+        "requirement_doc_url", "meego_url", "translation_url", mode="before"
+    )
+    @classmethod
+    def normalize_blank_urls(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @computed_field
+    @property
+    def project(self) -> str:
+        return self.okr_target
+
+    @field_validator("launch_at")
+    @classmethod
+    def validate_launch_schedule(cls, value, info: ValidationInfo):
+        merge_at = info.data.get("merge_at")
+        if value is not None and merge_at is not None and value > merge_at:
+            raise ValueError("launch_at must not follow merge_at")
+        return value
 
 
 class DeliveryNode(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     record_id: NonEmptyStr
     requirement_id: NonEmptyStr
     domain: NonEmptyStr
     work_type: NonEmptyStr
     name: NonEmptyStr
-    owner_id: NonEmptyStr
-    owner_name: NonEmptyStr
+    owners: List[Person] = Field(min_length=1)
     planned_start: Optional[AwareDatetime] = None
-    planned_end: AwareDatetime
+    planned_end: Optional[AwareDatetime] = None
     actual_end: Optional[AwareDatetime] = None
     status: NodeStatus
     progress_note: StrippedStr = ""
@@ -100,11 +198,40 @@ class DeliveryNode(BaseModel):
     risk_reasons: List[NonEmptyStr] = Field(default_factory=list)
     safe_deadline: Optional[AwareDatetime] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_owner(cls, values):
+        if not isinstance(values, dict):
+            return values
+        normalized = dict(values)
+        if "owners" not in normalized:
+            owner_id = normalized.get("owner_id")
+            owner_name = normalized.get("owner_name")
+            if owner_id is not None or owner_name is not None:
+                normalized["owners"] = [{"open_id": owner_id, "name": owner_name}]
+        return normalized
+
     @model_validator(mode="after")
     def validate_schedule(self):
-        if self.planned_start is not None and self.planned_start > self.planned_end:
+        if (
+            self.planned_start is not None
+            and self.planned_end is not None
+            and self.planned_start > self.planned_end
+        ):
             raise ValueError("planned_start must not follow planned_end")
         return self
+
+    @property
+    def owner_id(self) -> str:
+        if not self.owners:
+            raise ValueError("owners must contain at least one owner")
+        return self.owners[0].open_id
+
+    @property
+    def owner_name(self) -> str:
+        if not self.owners:
+            raise ValueError("owners must contain at least one owner")
+        return self.owners[0].name
 
 
 class Blocker(BaseModel):
@@ -137,13 +264,11 @@ class ProjectConfig(BaseModel):
     record_id: NonEmptyStr
     project: NonEmptyStr
     duration_mode: Literal["workday", "natural"]
-    at_days: Optional[int] = Field(default=None, ge=0)
-    pv_days: Optional[int] = Field(default=None, ge=0)
-    bugfix_days: Optional[int] = Field(default=None, ge=0)
+    at1_days: Optional[int] = Field(default=None, ge=0)
+    at2_days: Optional[int] = Field(default=None, ge=0)
+    pv1_days: Optional[int] = Field(default=None, ge=0)
+    pv2_days: Optional[int] = Field(default=None, ge=0)
     regression_days: Optional[int] = Field(default=None, ge=0)
-    server_special_days: Optional[int] = Field(default=None, ge=0)
-    client_special_days: Optional[int] = Field(default=None, ge=0)
-    vehicle_special_days: Optional[int] = Field(default=None, ge=0)
     launch_weekdays: Optional[Set[int]] = None
     launch_cutoff: Optional[NonEmptyStr] = None
     llm_enabled: bool = False
@@ -177,11 +302,14 @@ class FixedRules(BaseModel):
     server_launch_weekdays: Set[int]
     server_launch_cutoff: NonEmptyStr
     checklist_days_before: int = Field(ge=0)
-    at_workdays: int = Field(ge=0)
-    at_natural_days: int = Field(ge=0)
-    pv_days: int = Field(ge=0)
-    bugfix_days: int = Field(ge=0)
-    regression_days: int = Field(ge=0)
+    at1_days: Optional[int] = Field(default=None, ge=0)
+    at2_days: Optional[int] = Field(default=None, ge=0)
+    pv1_days: Optional[int] = Field(default=None, ge=0)
+    pv2_days: Optional[int] = Field(default=None, ge=0)
+    regression_days: int = Field(default=2, ge=0)
+    at_workdays: int = Field(default=8, ge=0)
+    at_natural_days: int = Field(default=11, ge=0)
+    pv_days: int = Field(default=3, ge=0)
 
     @field_validator("server_launch_weekdays")
     @classmethod
@@ -265,16 +393,33 @@ class NodeRisk(BaseModel):
     domain: NonEmptyStr
     owner_id: NonEmptyStr
     owner_name: NonEmptyStr
-    planned_end: AwareDatetime
+    owners: List[Person] = Field(default_factory=list)
+    planned_end: Optional[AwareDatetime] = None
     status: NodeStatus
+    planned_start: Optional[AwareDatetime] = None
     level: RiskLevel = RiskLevel.NORMAL
     predicted_completion: Optional[AwareDatetime] = None
     safe_deadline: Optional[AwareDatetime] = None
     buffer_days: Optional[float] = None
     reasons: List[NonEmptyStr] = Field(default_factory=list)
+    findings: List[RiskFinding] = Field(default_factory=list)
     actions: List[NonEmptyStr] = Field(default_factory=list)
     progress_note: StrippedStr = ""
     planned_end_is_system_managed: bool = False
+
+
+class ScheduleFormulaTerm(BaseModel):
+    label: NonEmptyStr
+    days: int = Field(ge=0)
+    source: Optional[NonEmptyStr] = None
+
+
+class ScheduleFormula(BaseModel):
+    domain: NonEmptyStr
+    started_at: AwareDatetime
+    duration_mode: Literal["workday", "natural"]
+    terms: List[ScheduleFormulaTerm] = Field(min_length=1)
+    predicted_completion: AwareDatetime
 
 
 class LLMEnrichment(BaseModel):
@@ -293,16 +438,24 @@ class RequirementRisk(BaseModel):
     requirement_id: NonEmptyStr
     requirement_name: NonEmptyStr
     project: NonEmptyStr
+    current_stage: NonEmptyStr = "未提供"
     target_version: NonEmptyStr
+    requirement_doc_url: Optional[NonEmptyStr] = None
+    meego_url: Optional[NonEmptyStr] = None
+    translation_url: Optional[NonEmptyStr] = None
     merge_at: AwareDatetime
     launch_at: Optional[AwareDatetime] = None
     project_owner_id: NonEmptyStr
     project_owner_name: NonEmptyStr
     level: RiskLevel = RiskLevel.NORMAL
     predicted_completion: Optional[AwareDatetime] = None
+    schedule_formula: Optional[ScheduleFormula] = None
     buffer_days: Optional[float] = None
     affected_domains: List[NonEmptyStr] = Field(default_factory=list)
     reasons: List[NonEmptyStr] = Field(default_factory=list)
+    findings: List[RiskFinding] = Field(default_factory=list)
+    stage_order: Dict[NonEmptyStr, int] = Field(default_factory=dict)
+    process_reminders: List[NonEmptyStr] = Field(default_factory=list)
     actions: List[NonEmptyStr] = Field(default_factory=list)
     project_notes: StrippedStr = ""
     requirement_notes: StrippedStr = ""
@@ -311,11 +464,13 @@ class RequirementRisk(BaseModel):
     blockers: List[Blocker] = Field(default_factory=list)
     llm_enrichment: Optional[LLMEnrichment] = None
 
-    @model_validator(mode="after")
-    def validate_schedule(self):
-        if self.launch_at is not None and self.launch_at < self.merge_at:
-            raise ValueError("launch_at must not precede merge_at")
-        return self
+    @field_validator("launch_at")
+    @classmethod
+    def validate_launch_schedule(cls, value, info: ValidationInfo):
+        merge_at = info.data.get("merge_at")
+        if value is not None and merge_at is not None and value > merge_at:
+            raise ValueError("launch_at must not follow merge_at")
+        return value
 
 
 class SendResult(BaseModel):

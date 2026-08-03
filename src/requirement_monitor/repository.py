@@ -3,8 +3,9 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
@@ -16,6 +17,7 @@ from requirement_monitor.models import (
     DataSnapshot,
     DeliveryNode,
     NodeRisk,
+    Person,
     ProjectConfig,
     Requirement,
     RequirementRisk,
@@ -39,6 +41,14 @@ BATCH_SIZE = 500
 MIN_MILLISECONDS_TIMESTAMP = 1_000_000_000_000
 MAX_MILLISECONDS_TIMESTAMP = 99_999_999_999_999
 LOGGER = logging.getLogger(__name__)
+_URL_KEYS = ("link", "url", "href")
+_MAX_FIELD_TRAVERSAL_DEPTH = 32
+_URL_SCHEME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_HTTP_FTP_SCHEME_PATTERN = re.compile(r"^(?:https?|ftp):", re.IGNORECASE)
+_BARE_URL_PATTERN = re.compile(
+    r"^(?:(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|localhost|"
+    r"(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?(?:[/?#].*)?$"
+)
 
 
 class RepositorySchemaError(RuntimeError):
@@ -55,6 +65,101 @@ class _FieldParseError(ValueError):
         self.field_name = field_name
 
 
+_SYSTEM_MANAGED_BLANK_FIELDS = frozenset(
+    {
+        "最后更新时间",
+        "系统风险等级",
+        "系统风险原因",
+        "最晚安全DDL",
+        "当前风险等级",
+        "风险原因",
+        "预计完成时间",
+        "剩余缓冲天数",
+        "最近检查时间",
+        "最近通知时间",
+    }
+)
+
+
+def _is_blank_record(raw_record: Mapping[str, Any]) -> bool:
+    fields = raw_record.get("fields")
+    if not isinstance(fields, Mapping):
+        return False
+    return all(
+        _is_blank_value(value)
+        for name, value in fields.items()
+        if name not in _SYSTEM_MANAGED_BLANK_FIELDS
+    )
+
+
+def _is_blank_value(
+    value: Any, *, _seen: Optional[Set[int]] = None, _depth: int = 0
+) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, Mapping):
+        if _seen is None:
+            _seen = set()
+        marker = id(value)
+        if _depth >= _MAX_FIELD_TRAVERSAL_DEPTH or marker in _seen:
+            return False
+        _seen.add(marker)
+        try:
+            recognized_values = [
+                value[key]
+                for key in (
+                    "record_ids",
+                    "link_record_ids",
+                    "users",
+                    "text",
+                    "name",
+                    "value",
+                    "id",
+                    "record_id",
+                    "open_id",
+                    "user_id",
+                    *_URL_KEYS,
+                )
+                if key in value
+            ]
+            if recognized_values:
+                return all(
+                    _is_blank_value(item, _seen=_seen, _depth=_depth + 1)
+                    for item in recognized_values
+                )
+            return not value
+        finally:
+            _seen.remove(marker)
+    if isinstance(value, (list, tuple)):
+        if _seen is None:
+            _seen = set()
+        marker = id(value)
+        if _depth >= _MAX_FIELD_TRAVERSAL_DEPTH or marker in _seen:
+            return False
+        _seen.add(marker)
+        try:
+            return all(
+                _is_blank_value(item, _seen=_seen, _depth=_depth + 1)
+                for item in value
+            )
+        finally:
+            _seen.remove(marker)
+    return False
+
+
+def _skip_blank_row(table_name: str, raw_record: Mapping[str, Any]) -> bool:
+    if not _is_blank_record(raw_record):
+        return False
+    LOGGER.warning(
+        "Skipping blank row in %s: record %s",
+        table_name,
+        _best_effort_record_id(raw_record) or "<unknown>",
+    )
+    return True
+
+
 def parse_snapshot(
     raw_tables: Mapping[str, Sequence[Mapping[str, Any]]]
 ) -> Tuple[DataSnapshot, List[ValidationIssue]]:
@@ -64,6 +169,8 @@ def parse_snapshot(
     raw_requirement_ids: Dict[str, Optional[str]] = {}
 
     for raw_record in raw_tables.get("需求主表", []):
+        if _skip_blank_row("需求主表", raw_record):
+            continue
         record_id = _best_effort_record_id(raw_record)
         requirement_id = _best_effort_field_text(raw_record, "需求编号")
         if record_id is not None:
@@ -90,6 +197,8 @@ def parse_snapshot(
     )
     nodes: List[DeliveryNode] = []
     for raw_record in raw_tables.get("进展节点表", []):
+        if _skip_blank_row("进展节点表", raw_record):
+            continue
         relation = _best_effort_first_link(raw_record, "关联需求")
         if relation in invalid_requirement_record_ids:
             continue
@@ -117,6 +226,8 @@ def parse_snapshot(
 
     blockers: List[Blocker] = []
     for raw_record in raw_tables.get("阻塞项表", []):
+        if _skip_blank_row("阻塞项表", raw_record):
+            continue
         relation = _best_effort_first_link(raw_record, "关联需求")
         if relation in invalid_requirement_record_ids:
             continue
@@ -144,6 +255,8 @@ def parse_snapshot(
 
     project_configs: List[ProjectConfig] = []
     for raw_record in raw_tables.get("项目配置表", []):
+        if _skip_blank_row("项目配置表", raw_record):
+            continue
         try:
             project_configs.append(_parse_project_config(raw_record))
         except (ValidationError, _FieldParseError, TypeError, ValueError) as error:
@@ -159,6 +272,8 @@ def parse_snapshot(
 
     base_configs: List[BaseConfig] = []
     for raw_record in raw_tables.get("基础配置表", []):
+        if _skip_blank_row("基础配置表", raw_record):
+            continue
         try:
             base_configs.append(_parse_base_config(raw_record))
         except (ValidationError, _FieldParseError, TypeError, ValueError) as error:
@@ -255,8 +370,9 @@ class BitableRepository:
             {
                 "id": result.requirement_record_id,
                 "fields": {
+                    "当前环节": result.current_stage,
                     "当前风险等级": _risk_level_text(result.level),
-                    "风险原因": "\n".join(result.reasons),
+                    "风险原因": _format_requirement_risk_reasons(result),
                     "预计完成时间": _optional_datetime_to_milliseconds(
                         result.predicted_completion
                     ),
@@ -319,7 +435,7 @@ class BitableRepository:
                         )
                     )
                 actual_type = field.get("type", field.get("field_type"))
-                if actual_type != field_spec.field_type:
+                if not field_spec.accepts_type(actual_type):
                     raise RepositorySchemaError(
                         "Field {}.{} has type {}, expected {}".format(
                             table_spec.name,
@@ -551,6 +667,11 @@ class BitableRepository:
 
 def _parse_requirement(raw_record: Mapping[str, Any]) -> Requirement:
     fields = _record_fields(raw_record)
+    okr_target_field = (
+        "OKR目标"
+        if not _is_blank_value(fields.get("OKR目标"))
+        else "项目名称"
+    )
     project_owner_id, project_owner_name = _person(
         fields.get("项目负责人"), "项目负责人", required=True
     )
@@ -564,13 +685,20 @@ def _parse_requirement(raw_record: Mapping[str, Any]) -> Requirement:
         record_id=_record_id(raw_record),
         requirement_id=_required_text(fields, "需求编号"),
         name=_required_text(fields, "需求名称"),
-        project=_required_text(fields, "项目名称"),
+        okr_target=_required_text(fields, okr_target_field),
         current_stage=_single_select(fields.get("当前环节"), "当前环节"),
         project_owner_id=project_owner_id,
         project_owner_name=project_owner_name,
         product_owner_id=product_owner_id,
         product_owner_name=product_owner_name,
         target_version=_required_text(fields, "目标版本"),
+        requirement_doc_url=_optional_url(
+            fields.get("需求文档链接"), "需求文档链接"
+        ),
+        meego_url=_optional_url(fields.get("Meego链接"), "Meego链接"),
+        translation_url=_optional_url(
+            fields.get("多语言翻译链接"), "多语言翻译链接"
+        ),
         merge_at=_date_time(fields.get("合板时间"), "合板时间"),
         launch_at=_optional_date_time(fields.get("计划上线时间"), "计划上线时间"),
         briefing_completed=_checkbox(fields.get("需求宣讲是否完成"), "需求宣讲是否完成"),
@@ -587,31 +715,51 @@ def _parse_node(
     raw_record: Mapping[str, Any], requirement: Requirement
 ) -> DeliveryNode:
     fields = _record_fields(raw_record)
-    owner_id, owner_name = _person(fields.get("负责人"), "负责人", required=True)
+    status = _single_select(fields.get("当前状态"), "当前状态")
+    owners = _people(fields.get("负责人"), "负责人")
     domain = _single_select(fields.get("交付域"), "交付域")
     work_type = _single_select(fields.get("工作类型"), "工作类型")
     name = _required_text(fields, "节点名称")
-    checklist = domain == "服务端" and "checklist" in name.lower()
-    if checklist:
-        if requirement.launch_at is None:
+    manual_planned_end = _optional_date_time(
+        fields.get("计划完成时间"), "计划完成时间"
+    )
+    server_launch = domain == "服务端" and (
+        name == "服务端上线" or "checklist" in name.lower()
+    )
+    if manual_planned_end is not None:
+        planned_end = manual_planned_end
+    elif server_launch:
+        if requirement.launch_at is not None:
+            planned_end = requirement.launch_at
+        elif status in {"已完成", "已跳过"}:
+            planned_end = None
+        else:
             raise _FieldParseError(
-                "计划上线时间", "Checklist node requires requirement launch time"
+                "计划上线时间",
+                "server launch node requires requirement launch time",
             )
-        planned_end = requirement.launch_at - timedelta(days=1)
     else:
-        planned_end = _date_time(fields.get("计划完成时间"), "计划完成时间")
+        planned_end = None
+    if (
+        server_launch
+        and planned_end is not None
+        and planned_end > requirement.merge_at
+    ):
+        raise _FieldParseError(
+            "计划完成时间",
+            "server launch must not follow requirement merge time",
+        )
     return DeliveryNode(
         record_id=_record_id(raw_record),
         requirement_id=requirement.requirement_id,
         domain=domain,
         work_type=work_type,
         name=name,
-        owner_id=owner_id,
-        owner_name=owner_name,
+        owners=owners,
         planned_start=_optional_date_time(fields.get("计划开始时间"), "计划开始时间"),
         planned_end=planned_end,
         actual_end=_optional_date_time(fields.get("实际完成时间"), "实际完成时间"),
-        status=_single_select(fields.get("当前状态"), "当前状态"),
+        status=status,
         progress_note=_optional_text(fields, "进展说明"),
         updated_at=_optional_date_time(fields.get("最后更新时间"), "最后更新时间"),
         risk_level=_optional_risk_level(fields.get("系统风险等级")),
@@ -651,22 +799,20 @@ def _parse_project_config(raw_record: Mapping[str, Any]) -> ProjectConfig:
         record_id=_record_id(raw_record),
         project=_required_text(fields, "项目名称"),
         duration_mode=_duration_mode(fields.get("周期计算方式")),
-        at_days=_optional_number(fields.get("AT 最少测试天数"), "AT 最少测试天数"),
-        pv_days=_optional_number(fields.get("PV 最少测试天数"), "PV 最少测试天数"),
-        bugfix_days=_optional_number(
-            fields.get("Bug 修复预留天数"), "Bug 修复预留天数"
+        at1_days=_optional_number_alias(
+            fields, "AT 第一轮默认天数", "AT 第一轮最少测试天数"
         ),
-        regression_days=_optional_number(
-            fields.get("线上回归最少天数"), "线上回归最少天数"
+        at2_days=_optional_number_alias(
+            fields, "AT 第二轮默认天数", "AT 第二轮最少测试天数"
         ),
-        server_special_days=_optional_number(
-            fields.get("服务端专项测试天数"), "服务端专项测试天数"
+        pv1_days=_optional_number_alias(
+            fields, "PV 第一轮默认天数", "PV 第一轮最少测试天数"
         ),
-        client_special_days=_optional_number(
-            fields.get("客户端专项测试天数"), "客户端专项测试天数"
+        pv2_days=_optional_number_alias(
+            fields, "PV 第二轮默认天数", "PV 第二轮最少测试天数"
         ),
-        vehicle_special_days=_optional_number(
-            fields.get("车辆专项测试天数"), "车辆专项测试天数"
+        regression_days=_optional_number_alias(
+            fields, "线上回归默认天数", "线上回归最少天数"
         ),
         launch_weekdays=_launch_weekdays(fields.get("可上线日期")),
         launch_cutoff=_optional_text_value(fields.get("上线截止时间")),
@@ -846,7 +992,9 @@ def _optional_text(fields: Mapping[str, Any], field_name: str) -> str:
     return _optional_text_value(fields.get(field_name)) or ""
 
 
-def _optional_text_value(value: Any) -> Optional[str]:
+def _optional_text_value(
+    value: Any, *, _seen: Optional[Set[int]] = None, _depth: int = 0
+) -> Optional[str]:
     if value is None:
         return None
     if isinstance(value, str):
@@ -857,14 +1005,167 @@ def _optional_text_value(value: Any) -> Optional[str]:
             if isinstance(nested, str):
                 return nested.strip()
     if isinstance(value, list):
-        parts = [
-            text
-            for item in value
-            for text in [_optional_text_value(item)]
-            if text
-        ]
-        return "".join(parts) if parts else None
+        if _seen is None:
+            _seen = set()
+        marker = id(value)
+        if _depth >= _MAX_FIELD_TRAVERSAL_DEPTH or marker in _seen:
+            return None
+        _seen.add(marker)
+        try:
+            parts = [
+                text
+                for item in value
+                for text in [
+                    _optional_text_value(
+                        item, _seen=_seen, _depth=_depth + 1
+                    )
+                ]
+                if text
+            ]
+            return "".join(parts) if parts else None
+        finally:
+            _seen.remove(marker)
     return None
+
+
+def _optional_url(value: Any, field_name: str) -> Optional[str]:
+    return _real_url_candidate(value, field_name)
+
+
+def _real_url_candidate(
+    value: Any,
+    field_name: str,
+    *,
+    _seen: Optional[Set[int]] = None,
+    _depth: int = 0,
+) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        if not _looks_like_url_candidate(value):
+            return None
+        _validate_url(value, field_name)
+        return value
+    if isinstance(value, Mapping):
+        if _seen is None:
+            _seen = set()
+        marker = id(value)
+        if _depth >= _MAX_FIELD_TRAVERSAL_DEPTH or marker in _seen:
+            raise _FieldParseError(
+                field_name, "must be a valid http or https URL"
+            )
+        _seen.add(marker)
+        try:
+            for key in _URL_KEYS:
+                if key not in value:
+                    continue
+                candidate = _real_url_candidate(
+                    value[key],
+                    field_name,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                if candidate is not None:
+                    return candidate
+            raw_value = value.get("value")
+            if isinstance(raw_value, str):
+                if _looks_like_url_candidate(raw_value):
+                    _validate_url(raw_value, field_name)
+                    return raw_value
+            return None
+        finally:
+            _seen.remove(marker)
+    if isinstance(value, (list, tuple)):
+        if _seen is None:
+            _seen = set()
+        marker = id(value)
+        if _depth >= _MAX_FIELD_TRAVERSAL_DEPTH or marker in _seen:
+            raise _FieldParseError(
+                field_name, "must be a valid http or https URL"
+            )
+        _seen.add(marker)
+        try:
+            for item in value:
+                candidate = _real_url_candidate(
+                    item,
+                    field_name,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                if candidate is not None:
+                    return candidate
+        finally:
+            _seen.remove(marker)
+    return None
+
+
+def _validate_url(text: str, field_name: str) -> None:
+    if not _is_valid_url(text):
+        raise _FieldParseError(field_name, "must be a valid http or https URL")
+
+
+def _looks_like_url_candidate(text: str) -> bool:
+    candidate = text.strip()
+    if not candidate:
+        return False
+    return bool(
+        _URL_SCHEME_PATTERN.match(candidate)
+        or _HTTP_FTP_SCHEME_PATTERN.match(candidate)
+        or candidate.startswith("//")
+        or _BARE_URL_PATTERN.match(candidate)
+    )
+
+
+def _is_valid_url(text: str) -> bool:
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    if (
+        any(character.isspace() for character in text)
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+    ):
+        return False
+    return True
+
+
+def _people(value: Any, field_name: str) -> List[Person]:
+    if value in (None, [], ""):
+        raise _FieldParseError(field_name, "must include a person")
+    if isinstance(value, Mapping) and isinstance(value.get("users"), list):
+        value = value["users"]
+    people = value if isinstance(value, list) else [value]
+    valid_people: List[Person] = []
+    for person in people:
+        if not isinstance(person, Mapping):
+            continue
+        person_id = next(
+            (
+                person[key]
+                for key in ("open_id", "id", "user_id")
+                if isinstance(person.get(key), str) and person[key].strip()
+            ),
+            None,
+        )
+        person_name = next(
+            (
+                person[key]
+                for key in ("name", "display_name", "en_name")
+                if isinstance(person.get(key), str) and person[key].strip()
+            ),
+            None,
+        )
+        if person_id is None or person_name is None:
+            continue
+        valid_people.append(
+            Person(open_id=person_id.strip(), name=person_name.strip())
+        )
+    if not valid_people:
+        raise _FieldParseError(field_name, "must include a valid person")
+    return valid_people
 
 
 def _person(
@@ -1027,6 +1328,15 @@ def _required_integer(value: Any, field_name: str) -> int:
     return number
 
 
+def _optional_number_alias(
+    fields: Mapping[str, Any], field_name: str, *aliases: str
+) -> Optional[int]:
+    for candidate in (field_name, *aliases):
+        if candidate in fields:
+            return _optional_number(fields.get(candidate), candidate)
+    return None
+
+
 def _launch_weekdays(value: Any) -> Optional[set]:
     text = _optional_text_value(value)
     if not text:
@@ -1094,6 +1404,21 @@ def _risk_level_text(level: Any) -> str:
         RiskLevel.WARNING: "预警",
         RiskLevel.SEVERE: "严重",
     }[normalized]
+
+
+def _format_requirement_risk_reasons(result: RequirementRisk) -> str:
+    lines = []
+    for reason in result.reasons:
+        matching_levels = [
+            finding.level
+            for finding in result.findings
+            if finding.reason_text == reason
+            or finding.reason_text in reason
+            or reason in finding.reason_text
+        ]
+        level = max(matching_levels, default=result.level)
+        lines.append("【{}】{}".format(_risk_level_text(level), reason))
+    return "\n".join(lines)
 
 
 def _datetime_to_milliseconds(value: datetime) -> int:
@@ -1222,13 +1547,16 @@ _REQUIREMENT_FIELD_NAMES = {
     "record_id": "record_id",
     "requirement_id": "需求编号",
     "name": "需求名称",
-    "project": "项目名称",
+    "okr_target": "OKR目标",
     "current_stage": "当前环节",
     "project_owner_id": "项目负责人",
     "project_owner_name": "项目负责人",
     "product_owner_id": "产品负责人",
     "product_owner_name": "产品负责人",
     "target_version": "目标版本",
+    "requirement_doc_url": "需求文档链接",
+    "meego_url": "Meego链接",
+    "translation_url": "多语言翻译链接",
     "merge_at": "合板时间",
     "launch_at": "计划上线时间",
     "briefing_completed": "需求宣讲是否完成",
@@ -1273,13 +1601,11 @@ _PROJECT_CONFIG_FIELD_NAMES = {
     "record_id": "record_id",
     "project": "项目名称",
     "duration_mode": "周期计算方式",
-    "at_days": "AT 最少测试天数",
-    "pv_days": "PV 最少测试天数",
-    "bugfix_days": "Bug 修复预留天数",
-    "regression_days": "线上回归最少天数",
-    "server_special_days": "服务端专项测试天数",
-    "client_special_days": "客户端专项测试天数",
-    "vehicle_special_days": "车辆专项测试天数",
+    "at1_days": "AT 第一轮默认天数",
+    "at2_days": "AT 第二轮默认天数",
+    "pv1_days": "PV 第一轮默认天数",
+    "pv2_days": "PV 第二轮默认天数",
+    "regression_days": "线上回归默认天数",
     "launch_weekdays": "可上线日期",
     "launch_cutoff": "上线截止时间",
     "llm_enabled": "是否启用 LLM",

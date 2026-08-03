@@ -7,14 +7,28 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from requirement_monitor.models import BaseConfig, NodeRisk, RequirementRisk, RiskLevel
+from requirement_monitor.models import (
+    BaseConfig,
+    NodeRisk,
+    RequirementRisk,
+    RiskFinding,
+    RiskLevel,
+)
 from requirement_monitor.repository import (
     BitableRepository,
     RepositoryDataError,
     RepositorySchemaError,
+    _FieldParseError,
+    _is_blank_value,
+    _optional_url,
     parse_snapshot,
 )
-from requirement_monitor.schema import BASIC_CONFIG_SEEDS, SCHEMA, SINGLE_LINK
+from requirement_monitor.schema import (
+    BASIC_CONFIG_SEEDS,
+    SCHEMA,
+    SINGLE_LINK,
+    SINGLE_SELECT,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -39,7 +53,7 @@ def raw_tables():
                     "产品负责人": [{"id": "ou-product", "name": "产品负责人"}],
                     "目标版本": "10.2",
                     "合板时间": int(merge_at.timestamp() * 1000),
-                    "计划上线时间": "2026-07-30T18:00:00+08:00",
+                    "计划上线时间": "2026-07-27T18:00:00+08:00",
                     "需求宣讲是否完成": True,
                     "是否允许通知": True,
                     "是否归档": False,
@@ -89,13 +103,11 @@ def raw_tables():
                 "fields": {
                     "项目名称": "米家",
                     "周期计算方式": {"name": "工作日"},
-                    "AT 最少测试天数": 3,
-                    "PV 最少测试天数": 2,
-                    "Bug 修复预留天数": 1,
-                    "线上回归最少天数": 1,
-                    "服务端专项测试天数": 2,
-                    "客户端专项测试天数": 2,
-                    "车辆专项测试天数": 0,
+                    "AT 第一轮默认天数": 3,
+                    "AT 第二轮默认天数": 2,
+                    "PV 第一轮默认天数": 2,
+                    "PV 第二轮默认天数": 1,
+                    "线上回归默认天数": 1,
                     "可上线日期": "周一, 周三, 周五",
                     "上线截止时间": "18:30",
                     "是否启用 LLM": True,
@@ -125,7 +137,7 @@ def test_parses_people_dates_single_selects_and_link_record_ids(raw_tables):
     assert requirement.current_stage == "开发"
     assert requirement.project_config_record_id == "rec-config-1"
     assert requirement.merge_at == datetime(2026, 7, 28, 10, 0, tzinfo=SHANGHAI)
-    assert requirement.launch_at == datetime(2026, 7, 30, 18, 0, tzinfo=SHANGHAI)
+    assert requirement.launch_at == datetime(2026, 7, 27, 18, 0, tzinfo=SHANGHAI)
 
     node = snapshot.nodes[0]
     assert node.requirement_id == "REQ-1"
@@ -142,9 +154,419 @@ def test_parses_people_dates_single_selects_and_link_record_ids(raw_tables):
 
     project_config = snapshot.project_configs[0]
     assert project_config.duration_mode == "workday"
+    assert (
+        project_config.at1_days,
+        project_config.at2_days,
+        project_config.pv1_days,
+        project_config.pv2_days,
+        project_config.regression_days,
+    ) == (3, 2, 2, 1, 1)
     assert project_config.launch_weekdays == {0, 2, 4}
     assert snapshot.project_config_by_record_id["rec-config-1"] == project_config
     assert snapshot.project_config_by_project["米家"] == project_config
+
+
+def test_parses_date_only_and_timezone_less_iso_as_shanghai_dates(raw_tables):
+    fields = raw_tables["需求主表"][0]["fields"]
+    fields["合板时间"] = "2026-07-28"
+    fields["计划上线时间"] = "2026-07-27T18:00:00"
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    requirement = snapshot.requirements[0]
+    assert requirement.merge_at == datetime(2026, 7, 28, 0, 0, tzinfo=SHANGHAI)
+    assert requirement.launch_at == datetime(2026, 7, 27, 18, 0, tzinfo=SHANGHAI)
+
+
+def test_parses_okr_target_and_requirement_links(raw_tables):
+    fields = raw_tables["需求主表"][0]["fields"]
+    fields["OKR目标"] = "提升登录成功率"
+    fields["需求文档链接"] = "https://docs.example/requirement"
+    fields["Meego链接"] = "http://meego.example/123"
+    fields["多语言翻译链接"] = "   "
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    requirement = snapshot.requirements[0]
+    assert requirement.okr_target == "提升登录成功率"
+    assert requirement.requirement_doc_url == "https://docs.example/requirement"
+    assert requirement.meego_url == "http://meego.example/123"
+    assert requirement.translation_url is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            {"text": "需求文档", "link": "https://mi.feishu.cn/docx/abc"},
+            "https://mi.feishu.cn/docx/abc",
+        ),
+        (
+            {"name": "Meego", "url": "https://meego.example/123"},
+            "https://meego.example/123",
+        ),
+        (
+            {"title": "翻译", "href": "https://translate.example/1"},
+            "https://translate.example/1",
+        ),
+        (
+            {
+                "text": "嵌套链接",
+                "link": [
+                    {"text": "仅展示"},
+                    [{"href": "https://docs.example/nested"}],
+                ],
+            },
+            "https://docs.example/nested",
+        ),
+        (
+            (
+                {"text": "仅展示"},
+                ({"href": "https://docs.example/tuple"},),
+            ),
+            "https://docs.example/tuple",
+        ),
+        (
+            {
+                "href": "https://docs.example/href",
+                "url": "https://docs.example/url",
+                "link": "https://docs.example/link",
+            },
+            "https://docs.example/link",
+        ),
+        ({"text": "只有文档名称"}, None),
+        ({"name": "只有名称", "title": "只有标题"}, None),
+        ({"value": "只有展示值"}, None),
+        ({"value": "https://docs.example/value"}, "https://docs.example/value"),
+        ("https://docs.example/raw", "https://docs.example/raw"),
+        (None, None),
+        ("   ", None),
+        ({"link": "", "url": None, "href": []}, None),
+        (
+            {"link": "", "url": "https://docs.example/after-empty"},
+            "https://docs.example/after-empty",
+        ),
+        ([{"text": "仅展示"}, {"name": "仍然仅展示"}], None),
+    ],
+)
+def test_optional_url_extracts_real_link_without_using_display_text(value, expected):
+    assert _optional_url(value, "需求文档链接") == expected
+
+
+def test_optional_url_fails_closed_on_first_explicit_invalid_candidate():
+    value = {
+        "link": "docs.example/invalid",
+        "url": "https://docs.example/later-valid",
+    }
+
+    with pytest.raises(_FieldParseError, match="valid http or https URL"):
+        _optional_url(value, "需求文档链接")
+
+
+def test_optional_url_fails_closed_on_invalid_list_candidate_before_valid_url():
+    value = [
+        {"text": "仅展示"},
+        "docs.example/invalid",
+        {"href": "https://docs.example/later-valid"},
+    ]
+
+    with pytest.raises(_FieldParseError, match="valid http or https URL"):
+        _optional_url(value, "需求文档链接")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        " https://docs.example/raw",
+        "https://docs.example/raw ",
+        {"link": " https://docs.example/link"},
+        {"link": "https://docs.example/link "},
+        {"value": " https://docs.example/value"},
+        {"value": "https://docs.example/value "},
+        {"value": "https://docs.example/invalid path"},
+    ],
+)
+def test_optional_url_rejects_whitespace_in_supplied_url_candidates(value):
+    with pytest.raises(_FieldParseError, match="valid http or https URL"):
+        _optional_url(value, "需求文档链接")
+
+
+def test_optional_url_converts_urlparse_errors_to_field_parse_errors():
+    with pytest.raises(_FieldParseError, match="valid http or https URL") as error:
+        _optional_url("http://[", "Meego链接")
+
+    assert error.value.field_name == "Meego链接"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "【PRD】3.0引擎下自动化日志改造",
+        "需求文档",
+        {"text": "【PRD】3.0引擎下自动化日志改造"},
+        {"name": "Meego 事项", "value": "事项名称"},
+        [{"title": "翻译文档"}, {"text": "仍然只是展示信息"}],
+    ],
+)
+def test_optional_url_treats_display_only_strings_as_blank(value):
+    assert _optional_url(value, "需求文档链接") is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ftp://docs.example/file",
+        "docs.example/invalid",
+        "//docs.example/invalid",
+        {"value": "ftp://docs.example/file"},
+        {"link": "docs.example/invalid"},
+    ],
+)
+def test_optional_url_rejects_url_shaped_non_http_values(value):
+    with pytest.raises(_FieldParseError, match="valid http or https URL"):
+        _optional_url(value, "需求文档链接")
+
+
+def test_all_requirement_link_fields_extract_real_feishu_urls(raw_tables):
+    fields = raw_tables["需求主表"][0]["fields"]
+    fields["需求文档链接"] = {
+        "text": "需求文档",
+        "link": "https://mi.feishu.cn/docx/abc",
+    }
+    fields["Meego链接"] = {
+        "name": "Meego 事项",
+        "url": "https://meego.example/story/123",
+    }
+    fields["多语言翻译链接"] = [
+        {"title": "翻译文档"},
+        {"href": "https://translate.example/task/456"},
+    ]
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    requirement = snapshot.requirements[0]
+    assert requirement.requirement_doc_url == "https://mi.feishu.cn/docx/abc"
+    assert requirement.meego_url == "https://meego.example/story/123"
+    assert requirement.translation_url == "https://translate.example/task/456"
+
+
+def test_display_only_requirement_link_fields_are_absent_without_issue(raw_tables):
+    fields = raw_tables["需求主表"][0]["fields"]
+    fields["需求文档链接"] = {"text": "需求文档"}
+    fields["Meego链接"] = {"name": "Meego 事项", "value": "事项名称"}
+    fields["多语言翻译链接"] = [
+        {"title": "翻译文档"},
+        {"text": "仍然只是展示信息"},
+    ]
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    requirement = snapshot.requirements[0]
+    assert requirement.requirement_doc_url is None
+    assert requirement.meego_url is None
+    assert requirement.translation_url is None
+
+
+def test_explicit_invalid_mapping_link_isolates_only_affected_requirement(raw_tables):
+    invalid_requirement = deepcopy(raw_tables["需求主表"][0])
+    invalid_requirement["record_id"] = "rec-req-2"
+    invalid_requirement["fields"]["需求编号"] = "REQ-2"
+    invalid_requirement["fields"]["需求文档链接"] = {
+        "text": "需求文档",
+        "link": "docs.example/invalid",
+        "url": "https://docs.example/later-valid",
+    }
+    raw_tables["需求主表"].append(invalid_requirement)
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
+    assert [item.record_id for item in snapshot.nodes] == ["rec-node-1"]
+    assert len(issues) == 1
+    assert issues[0].field_name == "需求文档链接"
+    assert issues[0].record_id == "rec-req-2"
+    assert issues[0].skip_scope == "requirement"
+
+
+def test_blank_okr_target_falls_back_to_legacy_project_name(raw_tables):
+    fields = raw_tables["需求主表"][0]["fields"]
+    fields["OKR目标"] = "   "
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert snapshot.requirements[0].okr_target == "米家"
+
+
+def test_nonempty_unsupported_okr_target_reports_okr_field(raw_tables):
+    raw_tables["需求主表"][0]["fields"]["OKR目标"] = 123
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.requirements == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "OKR目标"
+    assert issues[0].record_id == "rec-req-1"
+    assert issues[0].skip_scope == "requirement"
+
+
+def test_recursive_okr_text_payload_isolated_to_requirement(raw_tables):
+    recursive_value = []
+    recursive_value.append(recursive_value)
+    raw_tables["需求主表"][0]["fields"]["OKR目标"] = recursive_value
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.requirements == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "OKR目标"
+    assert issues[0].record_id == "rec-req-1"
+    assert issues[0].skip_scope == "requirement"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "AT 第一轮默认天数",
+        "AT 第二轮默认天数",
+        "PV 第一轮默认天数",
+        "PV 第二轮默认天数",
+        "线上回归默认天数",
+    ],
+)
+def test_negative_project_duration_reports_exact_field(raw_tables, field_name):
+    raw_tables["项目配置表"][0]["fields"][field_name] = -1
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.project_configs == []
+    assert len(issues) == 1
+    assert issues[0].field_name == field_name
+    assert issues[0].record_id == "rec-config-1"
+    assert issues[0].skip_scope == "record"
+
+
+def test_requirement_url_with_real_link_is_not_blank_and_is_parsed(raw_tables):
+    value = {"text": "", "link": "https://docs.example/real"}
+    raw_tables["需求主表"][0]["fields"]["需求文档链接"] = value
+
+    assert not _is_blank_value(value)
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert snapshot.requirements[0].requirement_doc_url == value["link"]
+
+
+def test_recursive_requirement_url_payload_isolated_to_requirement(raw_tables):
+    recursive_value = {}
+    recursive_value["link"] = recursive_value
+    invalid_requirement = deepcopy(raw_tables["需求主表"][0])
+    invalid_requirement["record_id"] = "rec-req-2"
+    invalid_requirement["fields"]["需求编号"] = "REQ-2"
+    invalid_requirement["fields"]["需求文档链接"] = recursive_value
+    raw_tables["需求主表"].append(invalid_requirement)
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
+    assert [item.record_id for item in snapshot.nodes] == ["rec-node-1"]
+    assert len(issues) == 1
+    assert issues[0].field_name == "需求文档链接"
+    assert issues[0].record_id == "rec-req-2"
+    assert issues[0].skip_scope == "requirement"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["需求文档链接", "Meego链接", "多语言翻译链接"],
+)
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "docs.example/requirement",
+        "http://",
+        "http://[",
+        " https://docs.example/requirement",
+        "https://docs.example/requirement ",
+        "https://docs.example/invalid path",
+        "ftp://docs.example/requirement",
+    ],
+)
+def test_invalid_requirement_link_isolated_to_requirement(
+    raw_tables, field_name, invalid_url
+):
+    second_requirement = deepcopy(raw_tables["需求主表"][0])
+    second_requirement["record_id"] = "rec-req-2"
+    second_requirement["fields"]["需求编号"] = "REQ-2"
+    second_requirement["fields"][field_name] = invalid_url
+    raw_tables["需求主表"].append(second_requirement)
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
+    assert [item.record_id for item in snapshot.nodes] == ["rec-node-1"]
+    assert len(issues) == 1
+    assert issues[0].field_name == field_name
+    assert issues[0].record_id == "rec-req-2"
+    assert issues[0].skip_scope == "requirement"
+
+
+@pytest.mark.parametrize(
+    ("status", "node_name"),
+    [
+        ("已完成", "服务端开发"),
+        ("已跳过", "服务端开发"),
+        ("已跳过", "AT"),
+        ("已跳过", "PV"),
+    ],
+)
+def test_completed_or_skipped_node_allows_blank_planned_end(
+    raw_tables, status, node_name
+):
+    node_fields = raw_tables["进展节点表"][0]["fields"]
+    node_fields["节点名称"] = node_name
+    node_fields["当前状态"] = {"name": status}
+    node_fields["计划完成时间"] = None
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert len(snapshot.nodes) == 1
+    assert snapshot.nodes[0].planned_end is None
+    assert snapshot.nodes[0].status == status
+
+
+@pytest.mark.parametrize("status", ["未开始", "进行中", "已取消"])
+def test_unfinished_or_cancelled_node_allows_blank_planned_end(raw_tables, status):
+    node_fields = raw_tables["进展节点表"][0]["fields"]
+    node_fields["当前状态"] = {"name": status}
+    node_fields["计划完成时间"] = None
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert len(snapshot.nodes) == 1
+    assert snapshot.nodes[0].planned_end is None
+    assert snapshot.nodes[0].status == status
+
+
+def test_node_parses_multiple_owners(raw_tables):
+    raw_tables["进展节点表"][0]["fields"]["负责人"] = [
+        {"open_id": "ou-node", "name": "节点负责人"},
+        {"user_id": "ou-node-2", "display_name": "第二负责人"},
+    ]
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert [(owner.open_id, owner.name) for owner in snapshot.nodes[0].owners] == [
+        ("ou-node", "节点负责人"),
+        ("ou-node-2", "第二负责人"),
+    ]
 
 
 def test_invalid_node_date_isolated_from_valid_sibling(raw_tables):
@@ -167,6 +589,91 @@ def test_invalid_node_date_isolated_from_valid_sibling(raw_tables):
     assert issues[0].expected_format
     assert issues[0].fix_suggestion
     assert issues[0].skip_scope == "record"
+
+
+def test_blank_rows_are_skipped_with_warning(raw_tables, caplog):
+    for table_name in (
+        "需求主表",
+        "进展节点表",
+        "阻塞项表",
+        "项目配置表",
+        "基础配置表",
+    ):
+        source_fields = raw_tables[table_name][0]["fields"]
+        raw_tables[table_name].append(
+            {
+                "record_id": "rec-blank-{}".format(table_name),
+                "fields": {field_name: None for field_name in source_fields},
+            }
+        )
+
+    with caplog.at_level(logging.WARNING, logger="requirement_monitor.repository"):
+        snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert len(snapshot.requirements) == 1
+    assert len(snapshot.nodes) == 1
+    assert len(snapshot.blockers) == 1
+    assert len(snapshot.project_configs) == 1
+    assert len(snapshot.base_configs) == len(BASIC_CONFIG_SEEDS)
+    assert caplog.text.count("Skipping blank row") == 5
+
+
+def test_blank_progress_row_with_system_managed_timestamp_is_skipped(
+    raw_tables, caplog
+):
+    raw_tables["进展节点表"].append(
+        {
+            "record_id": "rec-blank-progress-with-timestamp",
+            "fields": {
+                "关联需求": [
+                    {
+                        "record_ids": None,
+                        "table_id": "tbl-requirements",
+                        "text": None,
+                        "text_arr": [],
+                        "type": "text",
+                    }
+                ],
+                "最后更新时间": 1785154160000,
+                "系统风险等级": "正常",
+                "系统风险原因": None,
+                "最晚安全DDL": None,
+            },
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="requirement_monitor.repository"):
+        snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert len(snapshot.nodes) == 1
+    assert "Skipping blank row in 进展节点表" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"name": "", "open_id": "ou_xxx"},
+        {"text": "", "record_id": "rec_x"},
+        {"users": [{"name": "", "open_id": "ou_xxx"}], "text": ""},
+        {"record_ids": [], "link_record_ids": ["rec_x"], "value": ""},
+    ],
+)
+def test_mixed_mapping_with_any_meaningful_value_is_not_blank(value):
+    assert _is_blank_value(value) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"name": "", "open_id": " "},
+        {"text": "", "record_id": None},
+        {"users": [{"name": "", "open_id": ""}], "link_record_ids": []},
+    ],
+)
+def test_mixed_mapping_is_blank_only_when_all_recognized_values_are_blank(value):
+    assert _is_blank_value(value) is True
 
 
 def test_requirement_missing_fields_isolated_while_valid_records_still_parse(
@@ -227,18 +734,17 @@ def test_single_owner_field_requires_exactly_one_person(raw_tables, people):
     assert issues[0].field_name == "项目负责人"
 
 
-def test_child_single_owner_field_rejects_multiple_people(raw_tables):
+def test_child_owner_field_requires_at_least_one_valid_person(raw_tables):
     raw_tables["进展节点表"][0]["fields"]["负责人"] = [
         {"open_id": "ou-one", "name": "一号负责人"},
-        {"open_id": "ou-two", "name": "二号负责人"},
+        {"open_id": "", "name": "无效负责人"},
     ]
 
     snapshot, issues = parse_snapshot(raw_tables)
 
     assert [item.requirement_id for item in snapshot.requirements] == ["REQ-1"]
-    assert snapshot.nodes == []
-    assert len(issues) == 1
-    assert issues[0].field_name == "负责人"
+    assert [item.record_id for item in snapshot.nodes] == ["rec-node-1"]
+    assert issues == []
 
 
 def test_invalid_requirement_excludes_only_it_and_its_children(raw_tables):
@@ -271,6 +777,19 @@ def test_invalid_requirement_excludes_only_it_and_its_children(raw_tables):
     assert issues[0].field_name == "合板时间"
     assert issues[0].current_value == "bad-date"
     assert issues[0].skip_scope == "requirement"
+
+
+def test_server_launch_after_merge_is_reported_on_launch_field(raw_tables):
+    raw_tables["需求主表"][0]["fields"]["计划上线时间"] = (
+        "2026-07-29T18:00:00+08:00"
+    )
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.requirements == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "计划上线时间"
+    assert "launch_at must not follow merge_at" in issues[0].message
 
 
 def test_invalid_blocker_excludes_only_that_blocker(raw_tables):
@@ -634,6 +1153,99 @@ def test_load_snapshot_rejects_wrong_single_link_target():
         ).load_snapshot()
 
 
+def test_load_snapshot_accepts_single_select_node_name(raw_tables):
+    table_names = tuple(table.name for table in SCHEMA)
+    meta = repository_meta(*table_names)
+    fields = repository_fields(meta)
+    table_ids = {
+        table["name"]: table["table_id"]
+        for table in meta["data"]["tables"]
+    }
+    progress_table = next(
+        table
+        for table in meta["data"]["tables"]
+        if table["name"] == "进展节点表"
+    )
+    node_name_field = next(
+        field
+        for field in fields[progress_table["table_id"]]["data"]["items"]
+        if field["field_name"] == "节点名称"
+    )
+    node_name_field["type"] = SINGLE_SELECT
+    node_name_field["property"] = {
+        "options": [{"name": "客户端开发"}]
+    }
+
+    raw_tables["进展节点表"][0]["fields"]["节点名称"] = {
+        "name": "客户端开发"
+    }
+
+    pages = {
+        (table_ids[table_name], None): {
+            "data": {
+                "records": raw_tables[table_name],
+                "has_more": False,
+            }
+        }
+        for table_name in (
+            "需求主表",
+            "进展节点表",
+            "阻塞项表",
+            "项目配置表",
+            "基础配置表",
+            "通知记录表",
+        )
+    }
+
+    snapshot, issues = BitableRepository(
+        "base-token",
+        client=FakeCLI(meta, pages=pages, field_responses=fields),
+    ).load_snapshot()
+
+    assert issues == []
+    assert snapshot.nodes[0].name == "客户端开发"
+
+
+def test_load_snapshot_accepts_modified_time_node_field(raw_tables):
+    table_names = tuple(table.name for table in SCHEMA)
+    meta = repository_meta(*table_names)
+    fields = repository_fields(meta)
+    table_ids = {
+        table["name"]: table["table_id"]
+        for table in meta["data"]["tables"]
+    }
+    progress_fields = fields[table_ids["进展节点表"]]["data"]["items"]
+    updated_field = next(
+        field for field in progress_fields if field["field_name"] == "最后更新时间"
+    )
+    updated_field["type"] = 1002
+    updated_field["property"] = {"date_formatter": "yyyy/MM/dd"}
+    pages = {
+        (table_ids[table_name], None): {
+            "data": {
+                "records": raw_tables[table_name],
+                "has_more": False,
+            }
+        }
+        for table_name in (
+            "需求主表",
+            "进展节点表",
+            "阻塞项表",
+            "项目配置表",
+            "基础配置表",
+            "通知记录表",
+        )
+    }
+
+    snapshot, issues = BitableRepository(
+        "base-token",
+        client=FakeCLI(meta, pages=pages, field_responses=fields),
+    ).load_snapshot()
+
+    assert issues == []
+    assert snapshot.nodes[0].name == "客户端开发"
+
+
 def test_parse_snapshot_loads_base_configuration(raw_tables):
     snapshot, issues = parse_snapshot(raw_tables)
 
@@ -690,7 +1302,67 @@ def test_dynamic_domains_work_types_and_test_roles_are_configuration_driven(
     assert "安全测试" in snapshot.enabled_config_names("测试角色")
 
 
-def test_checklist_planned_end_is_derived_from_launch_time(raw_tables):
+def test_server_launch_planned_end_defaults_to_requirement_launch_time(raw_tables):
+    node_fields = raw_tables["进展节点表"][0]["fields"]
+    node_fields.update(
+        {
+            "交付域": {"name": "服务端"},
+            "工作类型": {"name": "发布"},
+            "节点名称": "服务端上线",
+        }
+    )
+    node_fields.pop("计划完成时间")
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert len(snapshot.nodes) == 1
+    assert snapshot.nodes[0].planned_end == datetime(
+        2026, 7, 27, 18, 0, tzinfo=SHANGHAI
+    )
+
+
+def test_server_launch_node_cannot_be_scheduled_after_merge(raw_tables):
+    node_fields = raw_tables["进展节点表"][0]["fields"]
+    node_fields.update(
+        {
+            "交付域": {"name": "服务端"},
+            "工作类型": {"name": "发布"},
+            "节点名称": "服务端上线",
+            "计划完成时间": "2026-07-29T18:00:00+08:00",
+        }
+    )
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert snapshot.nodes == []
+    assert len(issues) == 1
+    assert issues[0].field_name == "计划完成时间"
+    assert "server launch must not follow requirement merge time" in issues[0].message
+
+
+def test_server_launch_manual_planned_end_overrides_requirement_launch_time(raw_tables):
+    raw_tables["需求主表"][0]["fields"]["计划上线时间"] = None
+    node_fields = raw_tables["进展节点表"][0]["fields"]
+    node_fields.update(
+        {
+            "交付域": {"name": "服务端"},
+            "工作类型": {"name": "发布"},
+            "节点名称": "服务端上线",
+            "计划完成时间": "2026-07-28T09:00:00+08:00",
+        }
+    )
+
+    snapshot, issues = parse_snapshot(raw_tables)
+
+    assert issues == []
+    assert len(snapshot.nodes) == 1
+    assert snapshot.nodes[0].planned_end == datetime(
+        2026, 7, 28, 9, 0, tzinfo=SHANGHAI
+    )
+
+
+def test_legacy_checklist_uses_same_requirement_launch_time(raw_tables):
     node_fields = raw_tables["进展节点表"][0]["fields"]
     node_fields.update(
         {
@@ -704,12 +1376,14 @@ def test_checklist_planned_end_is_derived_from_launch_time(raw_tables):
     snapshot, issues = parse_snapshot(raw_tables)
 
     assert issues == []
+    assert len(snapshot.nodes) == 1
+    assert snapshot.nodes[0].name == "上线 Checklist"
     assert snapshot.nodes[0].planned_end == datetime(
-        2026, 7, 29, 18, 0, tzinfo=SHANGHAI
+        2026, 7, 27, 18, 0, tzinfo=SHANGHAI
     )
 
 
-def test_checklist_without_launch_time_is_requirement_data_error(raw_tables):
+def test_server_launch_without_any_planned_end_is_requirement_data_error(raw_tables):
     raw_tables["需求主表"][0]["fields"]["计划上线时间"] = None
     node_fields = raw_tables["进展节点表"][0]["fields"]
     node_fields.update(
@@ -821,15 +1495,30 @@ def make_requirement_risk(index):
         requirement_id="REQ-{}".format(index),
         requirement_name="需求 {}".format(index),
         project="米家",
+        current_stage="各端开发",
         target_version="8.0",
         merge_at=datetime(2026, 8, 3, 18, 0, tzinfo=SHANGHAI),
-        launch_at=datetime(2026, 8, 5, 18, 0, tzinfo=SHANGHAI),
+        launch_at=datetime(2026, 8, 2, 18, 0, tzinfo=SHANGHAI),
         project_owner_id="ou-project",
         project_owner_name="项目负责人",
         level=RiskLevel.SEVERE,
         predicted_completion=datetime(2026, 7, 29, 12, 0, tzinfo=SHANGHAI),
         buffer_days=-1.5,
         reasons=["节点延期", "阻塞超期"],
+        findings=[
+            RiskFinding(
+                reason_code="node.delay",
+                reason_text="节点延期",
+                level=RiskLevel.SEVERE,
+                source="node_schedule",
+            ),
+            RiskFinding(
+                reason_code="blocker.warning",
+                reason_text="阻塞超期",
+                level=RiskLevel.WARNING,
+                source="blocker",
+            ),
+        ],
     )
 
 
@@ -887,8 +1576,9 @@ def test_batch_writers_chunk_at_500_and_use_schema_field_names():
     requirement_record = client.batch_updates[0][2][0]
     assert requirement_record["id"] == "rec-req-0"
     assert requirement_record["fields"] == {
+        "当前环节": "各端开发",
         "当前风险等级": "严重",
-        "风险原因": "节点延期\n阻塞超期",
+        "风险原因": "【严重】节点延期\n【预警】阻塞超期",
         "预计完成时间": 1785297600000,
         "剩余缓冲天数": -1.5,
         "最近检查时间": 1784889000000,

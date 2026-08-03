@@ -13,7 +13,6 @@ _NON_SERVER_DOMAIN_PATTERN = re.compile(
 )
 _AT_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z])AT(?![A-Za-z])", re.IGNORECASE)
 _PV_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z])PV(?![A-Za-z])", re.IGNORECASE)
-_BUG_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z])Bug(?![A-Za-z])", re.IGNORECASE)
 _WEEKDAY_MENTION_PATTERN = re.compile(r"周[一二三四五六日天]")
 _SERVER_WEEKDAYS_PATTERN = re.compile(
     r"服务端(?:的)?上线时间\s*固定为\s*每周二\s*(?:和|及|、)\s*"
@@ -36,14 +35,15 @@ _AT_DURATION_PATTERN = re.compile(
     r"|至少\s*(?:需要\s*)?)一\s*周\s*半\s*以上",
     re.IGNORECASE,
 )
+_AT1_PATTERN = re.compile(r"AT\s*(?:测试\s*)?(?:第一轮|第\s*一\s*轮|AT?1轮|1轮)", re.I)
+_AT2_PATTERN = re.compile(r"AT\s*(?:测试\s*)?(?:第二轮|第\s*二\s*轮|AT?2轮|2轮)", re.I)
+_PV1_PATTERN = re.compile(r"PV\s*(?:测试\s*)?(?:第一轮|第\s*一\s*轮|PV?1轮|1轮)", re.I)
+_PV2_PATTERN = re.compile(r"PV\s*(?:测试\s*)?(?:第二轮|第\s*二\s*轮|PV?2轮|2轮)", re.I)
+_EXPLICIT_DAYS_PATTERN = re.compile(r"(?P<days>\d+)\s*(?:个\s*)?(?:工作日|自然日|天)")
+_REVERSE_RULE_PATTERN = re.compile(r"(?:以下|以内|最多|不超过|小于|少于|不需要|无需|并非|不是)")
 _PV_DAYS_PATTERN = re.compile(
     r"PV\s*(?:测试\s*一般\s*在|测试周期\s*在)\s*"
     r"(?P<days>\d+)\s*天\s*左右",
-    re.IGNORECASE,
-)
-_BUGFIX_DAYS_PATTERN = re.compile(
-    r"(?:加上|预留)\s*(?P<days>\d+)\s*天\s*"
-    r"(?:(?:解|修复)\s*Bug|Bug\s*修复)(?:\s*的时间)?",
     re.IGNORECASE,
 )
 _REGRESSION_DAYS_PATTERN = re.compile(
@@ -86,21 +86,25 @@ def parse_fixed_rules(text: str) -> FixedRules:
     if not has_checklist:
         missing_rules.append("checklist_days_before")
 
-    has_at_duration = _has_single_valid_clause(
+    stage_days = _parse_explicit_stage_days(clauses)
+    legacy_at = _has_single_valid_clause(
         clauses, _is_at_candidate, _AT_DURATION_PATTERN
     )
-    if not has_at_duration:
-        missing_rules.extend(("at_workdays", "at_natural_days"))
+    if legacy_at:
+        if any(stage_days.values()):
+            stage_days = {}
+        else:
+            stage_days = {"at1_days": 4, "at2_days": 4}
+    for field_name in ("at1_days", "at2_days"):
+        if field_name not in stage_days:
+            missing_rules.append(field_name)
 
     pv_days = _single_matched_days(clauses, _is_pv_candidate, _PV_DAYS_PATTERN)
-    if pv_days is None:
-        missing_rules.append("pv_days")
-
-    bugfix_days = _single_matched_days(
-        clauses, _is_bugfix_candidate, _BUGFIX_DAYS_PATTERN
-    )
-    if bugfix_days is None:
-        missing_rules.append("bugfix_days")
+    if pv_days is not None:
+        stage_days.setdefault("pv1_days", pv_days)
+    for field_name in ("pv1_days", "pv2_days"):
+        if field_name not in stage_days:
+            missing_rules.append(field_name)
 
     regression_days = _single_matched_days(
         clauses, _is_regression_candidate, _REGRESSION_DAYS_PATTERN
@@ -115,10 +119,13 @@ def parse_fixed_rules(text: str) -> FixedRules:
         server_launch_weekdays={1, 3},
         server_launch_cutoff="17:30",
         checklist_days_before=1,
+        at1_days=stage_days["at1_days"],
+        at2_days=stage_days["at2_days"],
+        pv1_days=stage_days["pv1_days"],
+        pv2_days=stage_days["pv2_days"],
         at_workdays=8,
         at_natural_days=11,
-        pv_days=pv_days,
-        bugfix_days=bugfix_days,
+        pv_days=pv_days or stage_days["pv1_days"],
         regression_days=regression_days,
     )
 
@@ -218,16 +225,31 @@ def _is_at_candidate(clause: _Clause) -> bool:
     )
 
 
+def _parse_explicit_stage_days(clauses: List[_Clause]):
+    patterns = (
+        ("at1_days", _AT1_PATTERN),
+        ("at2_days", _AT2_PATTERN),
+        ("pv1_days", _PV1_PATTERN),
+        ("pv2_days", _PV2_PATTERN),
+    )
+    result = {}
+    for field_name, pattern in patterns:
+        candidates = [clause.text for clause in clauses if pattern.search(clause.text)]
+        if len(candidates) != 1:
+            continue
+        candidate = candidates[0]
+        if _REVERSE_RULE_PATTERN.search(candidate):
+            continue
+        matches = list(_EXPLICIT_DAYS_PATTERN.finditer(candidate))
+        if len(matches) == 1:
+            result[field_name] = int(matches[0].group("days"))
+    return result
+
+
 def _is_pv_candidate(clause: _Clause) -> bool:
     return (
         _PV_TOKEN_PATTERN.search(clause.text) is not None
         and "测试" in clause.text
-    )
-
-
-def _is_bugfix_candidate(clause: _Clause) -> bool:
-    return _BUG_TOKEN_PATTERN.search(clause.text) is not None and (
-        "加上" in clause.text or "预留" in clause.text
     )
 
 

@@ -18,10 +18,24 @@ from requirement_monitor.launchd import LaunchdError
 WEBHOOK_URL = (
     "https://open.feishu.cn/open-apis/bot/v2/hook/runtime-webhook-secret"
 )
+RUNTIME_ENVIRONMENT_KEYS = (
+    "REQUIREMENT_MONITOR_CONFIG",
+    "REQUIREMENT_MONITOR_ENV",
+    "REQUIREMENT_MONITOR_TEST_WEBHOOK_URL",
+    "REQUIREMENT_MONITOR_PROD_WEBHOOK_URL",
+    "REQUIREMENT_MONITOR_WEBHOOK_URL",
+    "REQUIREMENT_MONITOR_BOT_KEYWORD",
+    "REQUIREMENT_MONITOR_LLM_API_KEY",
+    "REQUIREMENT_MONITOR_LLM_BASE_URL",
+    "REQUIREMENT_MONITOR_LLM_MODEL",
+)
 
 
 @pytest.fixture(autouse=True)
 def forbid_unstubbed_launchctl_status(monkeypatch):
+    for key in RUNTIME_ENVIRONMENT_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
     def fail():
         raise AssertionError("launchctl status must be explicitly stubbed")
 
@@ -53,12 +67,14 @@ def write_operational_config(path: Path) -> None:
 
 def start_settings(
     *,
+    runtime_environment: str = "test",
     state_dir: Path = Path(".state"),
     log_dir: Path = Path("logs"),
     fixed_rules_path: Path = Path("固定业务规则"),
 ):
     return SimpleNamespace(
         bitable_url="https://mi.feishu.cn/wiki/base",
+        runtime_environment=runtime_environment,
         webhook_url=WEBHOOK_URL,
         bot_keyword=None,
         timezone="Asia/Shanghai",
@@ -125,6 +141,45 @@ def test_build_parser_exposes_public_commands():
         parser.parse_args(["unknown"])
     assert exc_info.value.code == 2
     assert "scheduled-run" not in parser.format_help()
+
+
+@pytest.mark.parametrize("command", ("run-once", "start", "restart"))
+def test_operational_command_help_exposes_runtime_environment(
+    command, capsys
+):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args([command, "--help"])
+
+    assert exc_info.value.code == 0
+    assert "--env {test,prod}" in capsys.readouterr().out
+
+
+def test_run_once_parser_accepts_force():
+    args = cli.build_parser().parse_args(["run-once", "--force"])
+
+    assert args.force is True
+
+
+@pytest.mark.parametrize("command", ("start", "restart", "scheduled-run"))
+def test_non_manual_commands_reject_force(command):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args([command, "--force"])
+
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("status", "logs", "stop", "version", "init-table", "scheduled-run"),
+)
+def test_environment_independent_command_help_does_not_expose_env(
+    command, capsys
+):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args([command, "--help"])
+
+    assert exc_info.value.code == 0
+    assert "--env" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -292,7 +347,7 @@ def test_dry_run_does_not_require_or_construct_real_webhook(
     class FakeRunner:
         webhook = None
 
-        def run(self, *, trigger, dry_run=False):
+        def run(self, *, trigger, dry_run=False, force=False):
             return SimpleNamespace(
                 payloads=[], errors=[], failed_sends=0, sent_cards=0
             )
@@ -309,6 +364,433 @@ def test_dry_run_does_not_require_or_construct_real_webhook(
 
     assert exit_code == cli.EXIT_OK
     assert captured == {"webhook": None, "dry_run": True}
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_dry_run"),
+    ((["--force"], False), (["--force", "--dry-run"], True)),
+)
+def test_run_once_force_is_forwarded_to_runner(
+    tmp_path, extra_args, expected_dry_run
+):
+    calls = []
+    settings = start_settings(
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+
+    class FakeRunner:
+        def run(self, *, trigger, dry_run=False, force=False):
+            calls.append(
+                {
+                    "trigger": trigger,
+                    "dry_run": dry_run,
+                    "force": force,
+                }
+            )
+            return SimpleNamespace(
+                payloads=[], errors=[], failed_sends=0, sent_cards=0
+            )
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--env",
+            "test",
+            *extra_args,
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda loaded, path: FakeRunner(),
+    )
+
+    assert exit_code == cli.EXIT_OK
+    assert calls == [
+        {
+            "trigger": "manual",
+            "dry_run": expected_dry_run,
+            "force": True,
+        }
+    ]
+
+
+def test_force_fails_when_runner_does_not_accept_force(tmp_path, capsys):
+    calls = []
+    settings = start_settings(
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+
+    class LegacyRunner:
+        def run(self, *, trigger, dry_run=False):
+            calls.append((trigger, dry_run))
+            return SimpleNamespace(
+                payloads=[], errors=[], failed_sends=0, sent_cards=0
+            )
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--env",
+            "test",
+            "--force",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda loaded, path: LegacyRunner(),
+    )
+
+    assert exit_code == cli.EXIT_UNEXPECTED
+    assert calls == []
+    assert "unexpected internal error" in capsys.readouterr().err.lower()
+
+
+def test_explicit_prod_force_is_rejected_before_loading_configuration(capsys):
+    side_effects = []
+
+    exit_code = cli.main(
+        ["run-once", "--env", "prod", "--force"],
+        load_settings_fn=lambda path: side_effects.append("load-settings"),
+        runner_factory_fn=lambda *args, **kwargs: side_effects.append("runner"),
+    )
+
+    rendered = capsys.readouterr().err.lower()
+    assert exit_code == cli.EXIT_CONFIG
+    assert side_effects == []
+    assert "--force" in rendered
+    assert "test" in rendered
+
+
+def test_force_is_rejected_when_loaded_environment_defaults_to_prod(
+    tmp_path, monkeypatch, capsys
+):
+    settings = start_settings(
+        runtime_environment="prod",
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(
+        cli,
+        "current_git_branch",
+        lambda repository: (_ for _ in ()).throw(
+            AssertionError("force validation must run before Git lookup")
+        ),
+    )
+    side_effects = []
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--force",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda *args, **kwargs: side_effects.append("runner"),
+    )
+
+    rendered = capsys.readouterr().err.lower()
+    assert exit_code == cli.EXIT_CONFIG
+    assert side_effects == []
+    assert not (tmp_path / ".state").exists()
+    assert not (tmp_path / "logs").exists()
+    assert "--force" in rendered
+    assert "test" in rendered
+
+
+def test_cli_passes_environment_override_to_new_loader(tmp_path, monkeypatch):
+    calls = []
+    settings = start_settings(
+        runtime_environment="prod",
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(cli, "current_git_branch", lambda repository: "main")
+
+    def load_settings_fn(
+        path, *, require_webhook=True, runtime_environment=None
+    ):
+        calls.append((path, require_webhook, runtime_environment))
+        return settings
+
+    class FakeRunner:
+        webhook = None
+
+        def run(self, *, trigger, dry_run=False, force=False):
+            return SimpleNamespace(
+                payloads=[], errors=[], failed_sends=0, sent_cards=0
+            )
+
+    config_path = tmp_path / "config.json"
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--dry-run",
+            "--env",
+            "prod",
+            "--config",
+            str(config_path),
+        ],
+        load_settings_fn=load_settings_fn,
+        runner_factory_fn=lambda loaded, path: FakeRunner(),
+    )
+
+    assert exit_code == cli.EXIT_OK
+    assert calls == [(config_path.resolve(), False, "prod")]
+
+
+def test_cli_environment_override_supports_old_loader_signature(
+    tmp_path, monkeypatch
+):
+    settings = start_settings(
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(
+        cli,
+        "current_git_branch",
+        lambda repository: (_ for _ in ()).throw(
+            AssertionError("test environment must not inspect Git")
+        ),
+    )
+
+    class FakeRunner:
+        webhook = None
+
+        def run(self, *, trigger, dry_run=False, force=False):
+            return SimpleNamespace(
+                payloads=[], errors=[], failed_sends=0, sent_cards=0
+            )
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--dry-run",
+            "--env",
+            "test",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda loaded, path: FakeRunner(),
+    )
+
+    assert exit_code == cli.EXIT_OK
+
+
+@pytest.mark.parametrize(
+    "command_args",
+    (
+        ["run-once", "--env", "prod"],
+        ["run-once", "--dry-run", "--env", "prod"],
+        ["start", "--env", "prod"],
+        ["restart", "--env", "prod"],
+    ),
+)
+def test_rejected_prod_branch_has_no_runner_launch_or_file_side_effects(
+    tmp_path, monkeypatch, capsys, command_args
+):
+    settings = start_settings(
+        runtime_environment="prod",
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(
+        cli, "current_git_branch", lambda repository: "feature/secret-token"
+    )
+    side_effects = []
+
+    def record(name):
+        return lambda *args, **kwargs: side_effects.append(name)
+
+    plist_path = tmp_path / "monitor.plist"
+    exit_code = cli.main(
+        [*command_args, "--config", str(tmp_path / "config.json")],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=record("runner"),
+        plist_path=plist_path,
+        write_plist_fn=record("write-plist"),
+        enable_fn=record("enable"),
+        bootstrap_fn=record("bootstrap"),
+        bootout_fn=record("bootout"),
+        disable_fn=record("disable"),
+        status_fn=record("status"),
+        disabled_status_fn=record("disabled-status"),
+        system_timezone_fn=record("timezone"),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert exit_code == cli.EXIT_CONFIG
+    assert side_effects == []
+    assert not plist_path.exists()
+    assert not (tmp_path / ".state").exists()
+    assert not (tmp_path / "logs").exists()
+    assert "secret-token" not in rendered
+
+
+@pytest.mark.parametrize("branch", ["feature/x", None])
+def test_prod_rejects_feature_and_unknown_git_branch(
+    tmp_path, monkeypatch, capsys, branch
+):
+    settings = start_settings(
+        runtime_environment="prod",
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(cli, "current_git_branch", lambda repository: branch)
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--dry-run",
+            "--env",
+            "prod",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda *args, **kwargs: pytest.fail(
+            "runner must not be constructed"
+        ),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert exit_code == cli.EXIT_CONFIG
+    assert "main" in rendered.lower()
+
+
+def test_main_branch_allows_prod_run_once(tmp_path, monkeypatch):
+    calls = []
+    settings = start_settings(
+        runtime_environment="prod",
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(cli, "current_git_branch", lambda repository: "main")
+
+    class FakeRunner:
+        webhook = None
+
+        def run(self, *, trigger, dry_run=False, force=False):
+            calls.append((trigger, dry_run, force))
+            return SimpleNamespace(
+                payloads=[], errors=[], failed_sends=0, sent_cards=0
+            )
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--dry-run",
+            "--env",
+            "prod",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda loaded, path: FakeRunner(),
+    )
+
+    assert exit_code == cli.EXIT_OK
+    assert calls == [("manual", True, False)]
+
+
+@pytest.mark.parametrize(
+    ("requested_environment", "loaded_environment"),
+    (("prod", "test"), ("test", "prod")),
+)
+def test_explicit_environment_mismatch_is_rejected_before_side_effects(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    requested_environment,
+    loaded_environment,
+):
+    settings = start_settings(
+        runtime_environment=loaded_environment,
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+    monkeypatch.setattr(
+        cli,
+        "current_git_branch",
+        lambda repository: (_ for _ in ()).throw(
+            AssertionError("mismatch must fail before Git lookup")
+        ),
+    )
+    side_effects = []
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--dry-run",
+            "--env",
+            requested_environment,
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda *args, **kwargs: side_effects.append("runner"),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert exit_code == cli.EXIT_CONFIG
+    assert side_effects == []
+    assert not (tmp_path / ".state").exists()
+    assert not (tmp_path / "logs").exists()
+    assert "runtime-webhook-secret" not in rendered
+
+
+def test_prod_validation_uses_source_repository_not_current_directory(
+    tmp_path, monkeypatch, capsys
+):
+    unrelated_main_repository = tmp_path / "unrelated-main-repository"
+    unrelated_main_repository.mkdir()
+    monkeypatch.chdir(unrelated_main_repository)
+    source_repository = Path(cli.__file__).resolve().parents[2]
+    inspected_repositories = []
+
+    def branch_for(repository):
+        repository = Path(repository).resolve()
+        inspected_repositories.append(repository)
+        if repository == unrelated_main_repository.resolve():
+            return "main"
+        if repository == source_repository:
+            return "feature/requirement-monitor"
+        raise AssertionError(f"unexpected repository: {repository}")
+
+    monkeypatch.setattr(cli, "current_git_branch", branch_for)
+    settings = start_settings(
+        runtime_environment="prod",
+        state_dir=tmp_path / ".state",
+        log_dir=tmp_path / "logs",
+    )
+
+    exit_code = cli.main(
+        [
+            "run-once",
+            "--dry-run",
+            "--env",
+            "prod",
+            "--config",
+            str(tmp_path / "config.json"),
+        ],
+        load_settings_fn=lambda path: settings,
+        runner_factory_fn=lambda *args, **kwargs: pytest.fail(
+            "runner must not be constructed"
+        ),
+    )
+
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err
+    assert exit_code == cli.EXIT_CONFIG
+    assert inspected_repositories == [source_repository]
+    assert str(source_repository) not in rendered
+    assert "requirement-monitor" not in rendered
 
 
 def test_invalid_webhook_url_is_configuration_exit_two(
@@ -342,8 +824,8 @@ def test_run_once_dry_run_renders_payload_without_sending(capsys, tmp_path):
     calls = []
 
     class FakeRunner:
-        def run(self, *, trigger, dry_run=False):
-            calls.append((trigger, dry_run))
+        def run(self, *, trigger, dry_run=False, force=False):
+            calls.append((trigger, dry_run, force))
             return SimpleNamespace(
                 payloads=[{"msg_type": "text", "content": {"text": "preview"}}],
                 errors=[],
@@ -366,7 +848,7 @@ def test_run_once_dry_run_renders_payload_without_sending(capsys, tmp_path):
     )
 
     assert exit_code == 0
-    assert calls == [("manual", True)]
+    assert calls == [("manual", True, False)]
     assert '"preview"' in capsys.readouterr().out
 
 
@@ -396,8 +878,8 @@ def test_scheduled_run_runs_inside_local_window(tmp_path):
     calls = []
 
     class FakeRunner:
-        def run(self, *, trigger, dry_run=False):
-            calls.append((trigger, dry_run))
+        def run(self, *, trigger, dry_run=False, force=False):
+            calls.append((trigger, dry_run, force))
             return SimpleNamespace(
                 payloads=[],
                 errors=[],
@@ -421,7 +903,7 @@ def test_scheduled_run_runs_inside_local_window(tmp_path):
     )
 
     assert exit_code == 0
-    assert calls == [("scheduled", False)]
+    assert calls == [("scheduled", False, False)]
 
 
 def test_scheduled_run_rejects_naive_clock_without_running(tmp_path, capsys):
@@ -467,7 +949,7 @@ def test_report_exit_codes_are_explicit(report, expected):
 
 def test_mixed_webhook_failure_returns_four_and_reports_partial(capsys, tmp_path):
     class FakeRunner:
-        def run(self, *, trigger, dry_run=False):
+        def run(self, *, trigger, dry_run=False, force=False):
             return SimpleNamespace(
                 payloads=[],
                 errors=[],
@@ -571,6 +1053,7 @@ def test_start_snapshots_environment_secrets_for_launchagent_scheduled_run(
     plist = plistlib.loads(plist_path.read_bytes())
     assert exit_code == 0
     assert stat.S_IMODE(runtime_path.stat().st_mode) == 0o600
+    assert runtime_data["runtime_environment"] == "test"
     assert runtime_data["webhook_url"] == WEBHOOK_URL
     assert runtime_data["bot_keyword"] == "需求机器人"
     assert runtime_data["llm"]["api_key"] == llm_api_key
@@ -583,15 +1066,38 @@ def test_start_snapshots_environment_secrets_for_launchagent_scheduled_run(
     assert b"runtime-webhook-secret" not in plist_path.read_bytes()
     assert llm_api_key.encode("utf-8") not in plist_path.read_bytes()
 
-    monkeypatch.delenv("REQUIREMENT_MONITOR_WEBHOOK_URL")
-    monkeypatch.delenv("REQUIREMENT_MONITOR_LLM_API_KEY")
-    monkeypatch.delenv("REQUIREMENT_MONITOR_BOT_KEYWORD")
+    monkeypatch.setenv("REQUIREMENT_MONITOR_ENV", "prod")
+    monkeypatch.setenv(
+        "REQUIREMENT_MONITOR_TEST_WEBHOOK_URL",
+        "https://open.feishu.cn/open-apis/bot/v2/hook/ambient-test-secret",
+    )
+    monkeypatch.setenv(
+        "REQUIREMENT_MONITOR_PROD_WEBHOOK_URL",
+        "https://open.feishu.cn/open-apis/bot/v2/hook/ambient-prod-secret",
+    )
+    monkeypatch.setenv(
+        "REQUIREMENT_MONITOR_WEBHOOK_URL",
+        "https://open.feishu.cn/open-apis/bot/v2/hook/ambient-legacy-secret",
+    )
+    monkeypatch.setenv("REQUIREMENT_MONITOR_BOT_KEYWORD", "ambient-keyword")
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_API_KEY", "ambient-llm-secret")
+    monkeypatch.setenv(
+        "REQUIREMENT_MONITOR_LLM_BASE_URL", "https://ambient-llm.example/v1"
+    )
+    monkeypatch.setenv("REQUIREMENT_MONITOR_LLM_MODEL", "ambient-model")
+    monkeypatch.setattr(
+        cli,
+        "current_git_branch",
+        lambda repository: (_ for _ in ()).throw(
+            AssertionError("scheduled-run must remain branch-independent")
+        ),
+    )
     loaded = {}
 
     class FakeRunner:
         webhook = None
 
-        def run(self, *, trigger, dry_run=False):
+        def run(self, *, trigger, dry_run=False, force=False):
             return SimpleNamespace(
                 finished_at="2026-07-27T20:02:00+08:00",
                 trigger=trigger,
@@ -605,8 +1111,11 @@ def test_start_snapshots_environment_secrets_for_launchagent_scheduled_run(
 
     def runner_factory(settings, loaded_config_path):
         loaded["webhook_url"] = settings.webhook_url.get_secret_value()
+        loaded["runtime_environment"] = settings.runtime_environment
         loaded["bot_keyword"] = settings.bot_keyword
         loaded["llm_api_key"] = settings.llm.api_key.get_secret_value()
+        loaded["llm_base_url"] = settings.llm.base_url
+        loaded["llm_model"] = settings.llm.model
         loaded["config_path"] = loaded_config_path
         return FakeRunner()
 
@@ -623,12 +1132,53 @@ def test_start_snapshots_environment_secrets_for_launchagent_scheduled_run(
     assert scheduled_exit == 0
     assert loaded == {
         "webhook_url": WEBHOOK_URL,
+        "runtime_environment": "test",
         "bot_keyword": "需求机器人",
         "llm_api_key": llm_api_key,
+        "llm_base_url": "https://llm.example/v1",
+        "llm_model": "test-model",
         "config_path": runtime_path,
     }
     assert "runtime-webhook-secret" not in rendered
     assert llm_api_key not in rendered
+    assert "ambient-test-secret" not in rendered
+    assert "ambient-prod-secret" not in rendered
+    assert "ambient-legacy-secret" not in rendered
+    assert "ambient-llm-secret" not in rendered
+
+
+def test_prod_start_snapshot_keeps_selected_environment_and_webhook(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "config.json"
+    write_operational_config(config_path)
+    test_url = (
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test-only-secret"
+    )
+    prod_url = (
+        "https://open.feishu.cn/open-apis/bot/v2/hook/prod-only-secret"
+    )
+    monkeypatch.setenv("REQUIREMENT_MONITOR_TEST_WEBHOOK_URL", test_url)
+    monkeypatch.setenv("REQUIREMENT_MONITOR_PROD_WEBHOOK_URL", prod_url)
+    monkeypatch.setattr(cli, "current_git_branch", lambda repository: "main")
+    plist_path = tmp_path / "monitor.plist"
+
+    exit_code = cli.main(
+        ["start", "--env", "prod", "--config", str(config_path)],
+        plist_path=plist_path,
+        status_fn=lambda: False,
+        enable_fn=lambda: None,
+        bootstrap_fn=lambda path: None,
+        system_timezone_fn=lambda: ZoneInfo("Asia/Shanghai"),
+    )
+
+    runtime_path = tmp_path / ".state" / "runtime-config.json"
+    runtime_content = runtime_path.read_text(encoding="utf-8")
+    runtime_data = json.loads(runtime_content)
+    assert exit_code == cli.EXIT_OK
+    assert runtime_data["runtime_environment"] == "prod"
+    assert runtime_data["webhook_url"] == prod_url
+    assert "test-only-secret" not in runtime_content
 
 
 def test_runtime_config_commands_do_not_echo_secrets(tmp_path, capsys):
@@ -660,7 +1210,7 @@ def test_runtime_config_commands_do_not_echo_secrets(tmp_path, capsys):
     class FakeRunner:
         webhook = None
 
-        def run(self, *, trigger, dry_run=False):
+        def run(self, *, trigger, dry_run=False, force=False):
             return SimpleNamespace(
                 finished_at="2026-07-25T12:00:00+08:00",
                 trigger=trigger,

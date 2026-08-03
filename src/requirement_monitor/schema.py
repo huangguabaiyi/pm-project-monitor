@@ -11,6 +11,7 @@ TEXT = 1
 NUMBER = 2
 SINGLE_SELECT = 3
 DATE_TIME = 5
+MODIFIED_TIME = 1002
 CHECKBOX = 7
 USER = 11
 SINGLE_LINK = 18
@@ -25,6 +26,11 @@ class FieldSpec:
     name: str
     field_type: int
     target_table: Optional[str] = None
+    compatible_types: Tuple[int, ...] = ()
+    property: Optional[Mapping[str, Any]] = None
+
+    def accepts_type(self, field_type: int) -> bool:
+        return field_type in (self.field_type, *self.compatible_types)
 
 
 @dataclass(frozen=True)
@@ -55,11 +61,14 @@ SCHEMA = (
         (
             FieldSpec("需求编号", TEXT),
             FieldSpec("需求名称", TEXT),
-            FieldSpec("项目名称", TEXT),
+            FieldSpec("OKR目标", TEXT),
             FieldSpec("当前环节", SINGLE_SELECT),
             FieldSpec("项目负责人", USER),
             FieldSpec("产品负责人", USER),
             FieldSpec("目标版本", TEXT),
+            FieldSpec("需求文档链接", TEXT),
+            FieldSpec("Meego链接", TEXT),
+            FieldSpec("多语言翻译链接", TEXT),
             FieldSpec("合板时间", DATE_TIME),
             FieldSpec("计划上线时间", DATE_TIME),
             FieldSpec("需求宣讲是否完成", CHECKBOX),
@@ -79,17 +88,17 @@ SCHEMA = (
     TableSpec(
         "进展节点表",
         (
-            FieldSpec("节点名称", TEXT),
+            FieldSpec("节点名称", SINGLE_SELECT),
             FieldSpec("关联需求", SINGLE_LINK, "需求主表"),
             FieldSpec("交付域", SINGLE_SELECT),
             FieldSpec("工作类型", SINGLE_SELECT),
-            FieldSpec("负责人", USER),
+            FieldSpec("负责人", USER, property={"multiple": True}),
             FieldSpec("计划开始时间", DATE_TIME),
             FieldSpec("计划完成时间", DATE_TIME),
             FieldSpec("实际完成时间", DATE_TIME),
             FieldSpec("当前状态", SINGLE_SELECT),
             FieldSpec("进展说明", TEXT),
-            FieldSpec("最后更新时间", DATE_TIME),
+            FieldSpec("最后更新时间", DATE_TIME, compatible_types=(MODIFIED_TIME,)),
             FieldSpec("系统风险等级", SINGLE_SELECT),
             FieldSpec("系统风险原因", TEXT),
             FieldSpec("最晚安全DDL", DATE_TIME),
@@ -115,13 +124,11 @@ SCHEMA = (
         (
             FieldSpec("项目名称", TEXT),
             FieldSpec("周期计算方式", SINGLE_SELECT),
-            FieldSpec("AT 最少测试天数", NUMBER),
-            FieldSpec("PV 最少测试天数", NUMBER),
-            FieldSpec("Bug 修复预留天数", NUMBER),
-            FieldSpec("线上回归最少天数", NUMBER),
-            FieldSpec("服务端专项测试天数", NUMBER),
-            FieldSpec("客户端专项测试天数", NUMBER),
-            FieldSpec("车辆专项测试天数", NUMBER),
+            FieldSpec("AT 第一轮默认天数", NUMBER),
+            FieldSpec("AT 第二轮默认天数", NUMBER),
+            FieldSpec("PV 第一轮默认天数", NUMBER),
+            FieldSpec("PV 第二轮默认天数", NUMBER),
+            FieldSpec("线上回归默认天数", NUMBER),
             FieldSpec("可上线日期", TEXT),
             FieldSpec("上线截止时间", TEXT),
             FieldSpec("是否启用 LLM", CHECKBOX),
@@ -146,7 +153,7 @@ SCHEMA = (
             FieldSpec("通知类型", SINGLE_SELECT),
             FieldSpec("风险等级", SINGLE_SELECT),
             FieldSpec("消息摘要", TEXT),
-            FieldSpec("通知对象", USER),
+            FieldSpec("通知对象", USER, property={"multiple": True}),
             FieldSpec("发送时间", DATE_TIME),
             FieldSpec("发送结果", SINGLE_SELECT),
             FieldSpec("错误信息", TEXT),
@@ -172,11 +179,13 @@ DEFAULT_PROCESS_NODES = (
     "AT 测试第二轮",
     "PV 测试第一轮",
     "PV 测试第二轮",
+    "服务端上线",
     "线上回归",
+    "多语言翻译",
     "版本合入",
 )
 DELIVERY_DOMAINS = (
-    "公共流程",
+    "平台",
     "客户端",
     "服务端",
     "车辆",
@@ -186,7 +195,7 @@ DELIVERY_DOMAINS = (
     "助手",
     "其他",
 )
-WORK_TYPES = ("公共环节", "研发", "测试", "联调", "发布")
+WORK_TYPES = ("研发", "测试", "联调", "发布", "设计")
 TEST_ROLES = ("客户端测试", "服务端测试", "车辆测试", "专项测试", "其他测试")
 
 
@@ -236,6 +245,23 @@ def build_schema_plan(
         main_table_id = _table_id(main_table)
         main_fields = _field_items(fields_by_table.get(main_table_id, []))
         fields_by_name = {_field_name(field): field for field in main_fields}
+        if "OKR目标" not in fields_by_name and "项目名称" in fields_by_name:
+            legacy_field = fields_by_name["项目名称"]
+            if legacy_field.get("type", legacy_field.get("field_type")) != TEXT:
+                raise SchemaError("Legacy field 需求主表.项目名称 must have type 1")
+            field_id = _field_id(legacy_field)
+            if field_id:
+                operations.append(
+                    Operation(
+                        "rename_field",
+                        {
+                            "table_id": main_table_id,
+                            "field_id": field_id,
+                            "name": "OKR目标",
+                        },
+                    )
+                )
+                renamed_fields.add((main_table_id, "OKR目标"))
         if "需求编号" not in fields_by_name and "文本" in fields_by_name:
             primary_field = fields_by_name["文本"]
             if primary_field.get("type") != TEXT:
@@ -253,7 +279,6 @@ def build_schema_plan(
                     )
                 )
                 renamed_fields.add((main_table_id, "需求编号"))
-
     table_ids = {
         name: _table_id(table) for name, table in tables_by_name.items()
     }
@@ -267,7 +292,11 @@ def build_schema_plan(
                 {
                     "name": table_spec.name,
                     "fields": [
-                        {"field_name": field.name, "type": field.field_type}
+                        {
+                            "field_name": field.name,
+                            "type": field.field_type,
+                            **({"property": dict(field.property)} if field.property else {}),
+                        }
                         for field in table_spec.fields
                         if field.field_type != SINGLE_LINK
                     ],
@@ -299,6 +328,8 @@ def build_schema_plan(
                 "name": field_spec.name,
                 "field_type": field_spec.field_type,
             }
+            if field_spec.property:
+                payload["property"] = dict(field_spec.property)
             if field_spec.field_type == SINGLE_LINK:
                 target_id = table_ids.get(field_spec.target_table or "")
                 if target_id is None:
@@ -309,6 +340,8 @@ def build_schema_plan(
                 }
                 link_operations.append(Operation("create_field", payload))
             else:
+                if field_spec.property is not None:
+                    payload["property"] = dict(field_spec.property)
                 field_operations.append(Operation("create_field", payload))
 
     operations.extend(field_operations)
@@ -543,7 +576,7 @@ def _validate_existing_field(
     table_ids: Mapping[str, str],
 ) -> None:
     existing_type = existing_field.get("type", existing_field.get("field_type"))
-    if existing_type != field_spec.field_type:
+    if not field_spec.accepts_type(existing_type):
         raise SchemaError(
             "Field {}.{} has type {}, expected {}".format(
                 table_spec.name,
@@ -552,6 +585,35 @@ def _validate_existing_field(
                 field_spec.field_type,
             )
         )
+    if field_spec.property:
+        actual_property = existing_field.get("property")
+        if not isinstance(actual_property, Mapping):
+            raise SchemaError(
+                "Field {}.{} is missing required property settings".format(
+                    table_spec.name, field_spec.name
+                )
+            )
+        for key, expected_value in field_spec.property.items():
+            if actual_property.get(key) != expected_value:
+                raise SchemaError(
+                    "Field {}.{} property {} is {}, expected {}".format(
+                        table_spec.name,
+                        field_spec.name,
+                        key,
+                        actual_property.get(key),
+                        expected_value,
+                    )
+                )
+    elif field_spec.field_type == USER:
+        actual_property = existing_field.get("property")
+        if isinstance(actual_property, Mapping) and actual_property.get(
+            "multiple", False
+        ):
+            raise SchemaError(
+                "Field {}.{} property multiple is True, expected False".format(
+                    table_spec.name, field_spec.name
+                )
+            )
     if field_spec.field_type != SINGLE_LINK:
         return
     target_id = table_ids.get(field_spec.target_table or "")

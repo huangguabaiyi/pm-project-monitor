@@ -11,9 +11,10 @@ from zoneinfo import ZoneInfo
 from pydantic import Field
 
 from requirement_monitor.cards import (
-    build_daily_card,
+    _node_is_current,
+    build_daily_cards,
     build_data_error_card,
-    build_severe_card,
+    build_severe_cards,
     interactive_card,
 )
 from requirement_monitor.fixed_rules import parse_fixed_rules
@@ -21,6 +22,7 @@ from requirement_monitor.models import (
     DataSnapshot,
     FixedRules,
     LLMEnrichment,
+    NodeRisk,
     Person,
     ProjectConfig,
     Requirement,
@@ -97,11 +99,13 @@ class MonitorRunner:
         self._timezone = ZoneInfo(timezone_name)
         self._now = now or (lambda: datetime.now(self._timezone))
 
-    def run(self, trigger: str, dry_run: bool = False) -> MonitorRunReport:
+    def run(
+        self, trigger: str, dry_run: bool = False, force: bool = False
+    ) -> MonitorRunReport:
         started_at = self._current_time()
         try:
             with self.state_store.run_lock():
-                return self._run_locked(trigger, dry_run, started_at)
+                return self._run_locked(trigger, dry_run, force, started_at)
         except RunLockUnavailable:
             return MonitorRunReport(
                 trigger=trigger,
@@ -128,6 +132,7 @@ class MonitorRunner:
         self,
         trigger: str,
         dry_run: bool,
+        force: bool,
         started_at: datetime,
     ) -> MonitorRunReport:
         report = MonitorRunReport(
@@ -258,7 +263,7 @@ class MonitorRunner:
                 )
 
         pending, severe_by_fingerprint = self._build_notifications(
-            report, state, trigger
+            report, state, trigger, force
         )
         report.payloads = [item.payload for item in pending]
         if dry_run:
@@ -273,7 +278,7 @@ class MonitorRunner:
         scheduled_daily_results = dict(state.scheduled_daily_results)
         recovery_cursor = state.recovery_cursor
         recovery_write_failed = False
-        successfully_notified_requirement_ids = set()
+        item_results: List[Tuple[_PendingNotification, SendResult]] = []
         for item in pending:
             scheduled_key = None
             if (
@@ -281,7 +286,7 @@ class MonitorRunner:
                 and item.notification_type == "项目日报"
                 and item.project is not None
             ):
-                scheduled_key = scheduled_daily_key(started_at, item.project)
+                scheduled_key = _scheduled_daily_state_key(item, started_at)
                 attempted = ScheduledDailyResult(
                     scheduled_date=started_at.date(),
                     project=item.project,
@@ -302,11 +307,9 @@ class MonitorRunner:
                 scheduled_daily_results[scheduled_key] = attempted
             result = self._safe_send(item.payload)
             report.send_results.append(result)
+            item_results.append((item, result))
             if result.success:
                 report.sent_cards += 1
-                successfully_notified_requirement_ids.update(
-                    item.requirement_record_ids
-                )
                 if item.notification_type == "严重风险" and item.fingerprint:
                     report.severe_cards += 1
                     successful_severe.add(item.fingerprint)
@@ -350,6 +353,13 @@ class MonitorRunner:
             send_records.append(self._notification_record(item, result, started_at))
             recent_sends.append(self._recent_send(item, result, started_at))
 
+        successfully_notified_requirement_ids = self._fully_notified_requirement_ids(
+            item_results,
+            state,
+            trigger,
+            started_at,
+            successful_severe,
+        )
         if successfully_notified_requirement_ids:
             try:
                 self.repository.write_requirement_notification_times(
@@ -600,6 +610,25 @@ class MonitorRunner:
                 effective_level=risk.level,
                 failure_reason="runner_error",
             )
+        if not isinstance(enrichment, LLMEnrichment):
+            enrichment = LLMEnrichment(
+                available=False,
+                rule_level=risk.level,
+                effective_level=risk.level,
+                failure_reason="invalid_response",
+            )
+        else:
+            try:
+                enrichment = LLMEnrichment.model_validate(
+                    enrichment.model_dump()
+                )
+            except Exception:
+                enrichment = LLMEnrichment(
+                    available=False,
+                    rule_level=risk.level,
+                    effective_level=risk.level,
+                    failure_reason="invalid_response",
+                )
         if not enrichment.available:
             report.llm_degraded = True
             if enrichment.failure_reason:
@@ -620,16 +649,11 @@ class MonitorRunner:
         report: MonitorRunReport,
         state: MonitorState,
         trigger: str,
+        force: bool,
     ) -> Tuple[List[_PendingNotification], Dict[str, RequirementRisk]]:
         pending: List[_PendingNotification] = []
         groups = self._project_groups(report.requirement_risks)
         for project, risks in groups.items():
-            if (
-                trigger != "manual"
-                and scheduled_daily_key(report.started_at, project)
-                in state.scheduled_daily_results
-            ):
-                continue
             if trigger in {"manual", "scheduled"}:
                 project_report = report.model_copy(
                     update={
@@ -645,74 +669,103 @@ class MonitorRunner:
                         ),
                     }
                 )
-                pending.append(
-                    _PendingNotification(
-                        notification_type="项目日报",
-                        payload=build_daily_card(project_report),
-                        fingerprint="daily:{}:{}".format(
-                            report.started_at.date().isoformat(), project
-                        ),
-                        risk_level=max(
-                            (risk.level for risk in risks),
-                            default=RiskLevel.NORMAL,
-                        ),
-                        project=project,
-                        requirement_record_ids=tuple(
-                            risk.requirement_record_id for risk in risks
-                        ),
-                        recipient_ids=tuple(
-                            self._deduplicate(
-                                [
-                                    person_id
-                                    for risk in risks
-                                    for person_id in (
-                                        risk.project_owner_id,
-                                        *(
-                                            node.owner_id
-                                            for node in risk.node_risks
-                                        ),
-                                    )
-                                ]
-                            )
-                        ),
-                        llm_used=any(
-                            risk.llm_enrichment is not None
-                            and risk.llm_enrichment.available
+                daily_payloads = build_daily_cards(project_report)
+                daily_fingerprint = "daily:{}:{}".format(
+                    report.started_at.date().isoformat(), project
+                )
+                daily_recipient_ids = tuple(
+                    self._deduplicate(
+                        [
+                            person_id
                             for risk in risks
-                        ),
-                        llm_degradation_reason=self._llm_failure_text(risks),
+                            for node in _current_stage_nodes(risk)
+                            for person_id in _node_owner_ids(node)
+                        ]
                     )
                 )
+                for part_index, payload in enumerate(daily_payloads, start=1):
+                    part_fingerprint = _part_fingerprint(
+                        daily_fingerprint, part_index, len(daily_payloads)
+                    )
+                    if not force and self._daily_part_already_succeeded(
+                        state,
+                        part_fingerprint,
+                        project,
+                        report.started_at,
+                        len(daily_payloads),
+                        trigger,
+                    ):
+                        continue
+                    pending.append(
+                        _PendingNotification(
+                            notification_type="项目日报",
+                            payload=payload,
+                            fingerprint=part_fingerprint,
+                            risk_level=max(
+                                (risk.level for risk in risks),
+                                default=RiskLevel.NORMAL,
+                            ),
+                            project=project,
+                            requirement_record_ids=tuple(
+                                risk.requirement_record_id for risk in risks
+                            ),
+                            recipient_ids=daily_recipient_ids,
+                            llm_used=any(
+                                risk.llm_enrichment is not None
+                                and risk.llm_enrichment.available
+                                for risk in risks
+                            ),
+                            llm_degradation_reason=self._llm_failure_text(risks),
+                        )
+                    )
 
         severe_by_fingerprint: Dict[str, RequirementRisk] = OrderedDict()
+        severe_parts_by_business_fingerprint: Dict[
+            str, List[Tuple[str, Dict[str, object]]]
+        ] = OrderedDict()
         for risk in report.requirement_risks:
             if risk.level != RiskLevel.SEVERE:
                 continue
-            fingerprint = severe_fingerprint(risk)
-            severe_by_fingerprint.setdefault(fingerprint, risk)
-        for fingerprint, risk in severe_by_fingerprint.items():
-            if fingerprint in state.active_fingerprints:
+            business_fingerprint = severe_fingerprint(risk)
+            if business_fingerprint in severe_parts_by_business_fingerprint:
                 continue
-            pending.append(
-                _PendingNotification(
-                    notification_type="严重风险",
-                    payload=build_severe_card(risk),
-                    fingerprint=fingerprint,
-                    risk_level=RiskLevel.SEVERE,
-                    project=risk.project,
-                    requirement_record_id=risk.requirement_record_id,
-                    requirement_id=risk.requirement_id,
-                    requirement_record_ids=(risk.requirement_record_id,),
-                    recipient_ids=tuple(
-                        [risk.project_owner_id]
-                    ),
-                    llm_used=(
-                        risk.llm_enrichment is not None
-                        and risk.llm_enrichment.available
-                    ),
-                    llm_degradation_reason=self._llm_failure_text([risk]),
+            severe_parts_by_business_fingerprint[business_fingerprint] = [
+                ("", payload) for payload in build_severe_cards(risk)
+            ]
+            severe_parts = severe_parts_by_business_fingerprint[business_fingerprint]
+            for part_index, (_, payload) in enumerate(severe_parts, start=1):
+                part_fingerprint = _part_fingerprint(
+                    business_fingerprint, part_index, len(severe_parts)
                 )
-            )
+                severe_by_fingerprint[part_fingerprint] = risk
+                if not force and part_fingerprint in state.active_fingerprints:
+                    continue
+                pending.append(
+                    _PendingNotification(
+                        notification_type="严重风险",
+                        payload=payload,
+                        fingerprint=part_fingerprint,
+                        risk_level=RiskLevel.SEVERE,
+                        project=risk.project,
+                        requirement_record_id=risk.requirement_record_id,
+                        requirement_id=risk.requirement_id,
+                        requirement_record_ids=(risk.requirement_record_id,),
+                        recipient_ids=tuple(
+                            self._deduplicate(
+                                _risk_recipient_ids(
+                                    risk,
+                                    include_project_owner=True,
+                                    nodes=_risk_related_nodes(risk),
+                                )
+                            )
+                        ),
+                        llm_used=(
+                            risk.llm_enrichment is not None
+                            and risk.llm_enrichment.available
+                        ),
+                        llm_degradation_reason=self._llm_failure_text([risk]),
+                    )
+                )
 
         if report.validation_issues:
             pending.append(
@@ -739,10 +792,6 @@ class MonitorRunner:
                 raise ProjectConfigConsistencyError(
                     "project config link does not resolve"
                 )
-            if config.project != requirement.project:
-                raise ProjectConfigConsistencyError(
-                    "project config link crosses project boundary"
-                )
             return config
 
         config = snapshot.project_config_by_project.get(requirement.project)
@@ -765,6 +814,101 @@ class MonitorRunner:
         for risk in risks:
             groups.setdefault(risk.project, []).append(risk)
         return OrderedDict((project, groups[project]) for project in sorted(groups))
+
+    @staticmethod
+    def _daily_part_already_succeeded(
+        state: MonitorState,
+        fingerprint: str,
+        project: str,
+        started_at: datetime,
+        total_parts: int,
+        trigger: str,
+    ) -> bool:
+        if trigger == "scheduled":
+            result = state.scheduled_daily_results.get(fingerprint)
+            if result is not None and result.result == "success":
+                return True
+            if total_parts == 1:
+                legacy_key = scheduled_daily_key(started_at, project)
+                legacy_result = state.scheduled_daily_results.get(legacy_key)
+                return (
+                    legacy_result is not None
+                    and legacy_result.result == "success"
+                )
+            return False
+        if fingerprint in state.active_fingerprints:
+            return True
+        for recent_send in reversed(state.recent_sends):
+            if (
+                recent_send.notification_type == "项目日报"
+                and recent_send.fingerprint == fingerprint
+            ):
+                return recent_send.success
+        return False
+
+    def _fully_notified_requirement_ids(
+        self,
+        item_results: Sequence[Tuple[_PendingNotification, SendResult]],
+        state: MonitorState,
+        trigger: str,
+        started_at: datetime,
+        successful_severe: set,
+    ) -> set:
+        grouped: "OrderedDict[str, List[Tuple[_PendingNotification, SendResult]]]" = (
+            OrderedDict()
+        )
+        for item, result in item_results:
+            if item.notification_type not in {"项目日报", "严重风险"}:
+                continue
+            if not item.fingerprint:
+                continue
+            grouped.setdefault(_business_fingerprint(item.fingerprint), []).append(
+                (item, result)
+            )
+
+        requirement_outcomes: Dict[str, List[bool]] = {}
+        for group_fingerprint, group_items in grouped.items():
+            first_item = group_items[0][0]
+            total_parts = _part_total(first_item.fingerprint or "")
+            part_results = {
+                item.fingerprint: result.success
+                for item, result in group_items
+                if item.fingerprint
+            }
+            all_parts_successful = True
+            for part_index in range(1, total_parts + 1):
+                part_fingerprint = _part_fingerprint(
+                    group_fingerprint, part_index, total_parts
+                )
+                part_success = part_results.get(part_fingerprint)
+                if part_success is None:
+                    if first_item.notification_type == "项目日报":
+                        part_success = self._daily_part_already_succeeded(
+                            state,
+                            part_fingerprint,
+                            first_item.project or "",
+                            started_at,
+                            total_parts,
+                            trigger,
+                        )
+                    else:
+                        part_success = (
+                            part_fingerprint in state.active_fingerprints
+                            or part_fingerprint in successful_severe
+                        )
+                all_parts_successful = all_parts_successful and bool(part_success)
+
+            for item, _ in group_items:
+                for requirement_id in item.requirement_record_ids:
+                    requirement_outcomes.setdefault(requirement_id, []).append(
+                        all_parts_successful
+                    )
+
+        return {
+            requirement_id
+            for requirement_id, outcomes in requirement_outcomes.items()
+            if outcomes and all(outcomes)
+        }
 
     @staticmethod
     def _set_level_counts(report: MonitorRunReport) -> None:
@@ -865,7 +1009,7 @@ def severe_fingerprint(risk: RequirementRisk) -> str:
                 {
                     "node_record_id": node.node_record_id,
                     "domain": node.domain,
-                    "owner_id": node.owner_id,
+                    "owner_ids": sorted(set(_node_owner_ids(node))),
                     "risk_level": int(node.level),
                     "planned_end": _datetime_text(node.planned_end),
                     "predicted_completion": _datetime_text(
@@ -904,8 +1048,73 @@ def severe_fingerprint(risk: RequirementRisk) -> str:
     return "severe:{}".format(hashlib.sha256(encoded).hexdigest())
 
 
+def _part_fingerprint(base: str, part_index: int, total_parts: int) -> str:
+    if total_parts == 1:
+        return base
+    return "{}:part:{}/{}".format(base, part_index, total_parts)
+
+
+def _business_fingerprint(fingerprint: str) -> str:
+    return fingerprint.split(":part:", 1)[0]
+
+
+def _scheduled_daily_state_key(item: _PendingNotification, started_at: datetime) -> str:
+    if item.fingerprint and ":part:" in item.fingerprint:
+        return item.fingerprint
+    if item.project is not None:
+        return scheduled_daily_key(started_at, item.project)
+    return item.fingerprint or scheduled_daily_key(started_at, "unknown_project")
+
+
+def _part_total(fingerprint: str) -> int:
+    if ":part:" not in fingerprint:
+        return 1
+    try:
+        return int(fingerprint.rsplit("/", 1)[1])
+    except (ValueError, IndexError):
+        return 1
+
+
 def _datetime_text(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value is not None else None
+
+
+def _risk_recipient_ids(
+    risk: RequirementRisk,
+    *,
+    include_project_owner: bool,
+    nodes: Optional[Sequence[NodeRisk]] = None,
+) -> List[str]:
+    values = [risk.project_owner_id] if include_project_owner else []
+    for node in nodes if nodes is not None else risk.node_risks:
+        values.extend(_node_owner_ids(node))
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _current_stage_nodes(risk: RequirementRisk) -> List[NodeRisk]:
+    nodes = [
+        node
+        for node in risk.node_risks
+        if _node_is_current(node, risk.current_stage)
+    ]
+    if not nodes and risk.current_stage == "未提供":
+        return list(risk.node_risks)
+    return nodes
+
+
+def _risk_related_nodes(risk: RequirementRisk) -> List[NodeRisk]:
+    related = [
+        node
+        for node in risk.node_risks
+        if node.level >= RiskLevel.WARNING or node.reasons
+    ]
+    return related or list(risk.node_risks)
+
+
+def _node_owner_ids(node: NodeRisk) -> List[str]:
+    if node.owners:
+        return [person.open_id for person in node.owners]
+    return [node.owner_id]
 
 
 def scheduled_daily_key(value: datetime, project: str) -> str:

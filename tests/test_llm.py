@@ -41,7 +41,7 @@ def make_risk(level=RiskLevel.NORMAL):
         project="车机项目",
         target_version="8.0",
         merge_at=datetime(2026, 8, 3, 18, tzinfo=TZ),
-        launch_at=datetime(2026, 8, 5, 18, tzinfo=TZ),
+        launch_at=datetime(2026, 8, 2, 18, tzinfo=TZ),
         project_owner_id="ou-project",
         project_owner_name="项目负责人",
         level=level,
@@ -192,6 +192,34 @@ def test_llm_request_body_excludes_all_person_pii(httpx_mock, llm_settings):
         "project_owner_name",
     ):
         assert forbidden not in body
+
+
+def test_llm_request_allows_node_without_planned_end(httpx_mock, llm_settings):
+    httpx_mock.add_response(json=response_content())
+    risk = make_risk().model_copy(
+        update={
+            "node_risks": [
+                NodeRisk(
+                    node_record_id="node-unscheduled",
+                    requirement_id="REQ-1",
+                    node_name="PV 测试第二轮",
+                    domain="客户端",
+                    owner_id="ou-node",
+                    owner_name="节点负责人",
+                    planned_end=None,
+                    status=NodeStatus.IN_PROGRESS,
+                )
+            ]
+        }
+    )
+
+    enrichment = LLMClient(llm_settings).enrich(risk, "固定规则", "项目说明")
+
+    payload = json.loads(httpx_mock.get_request().content)
+    assert payload["messages"]
+    user_input = json.loads(payload["messages"][1]["content"])
+    assert user_input["risk"]["nodes"][0]["planned_end"] is None
+    assert enrichment.available is True
 
 
 def test_llm_request_uses_anonymous_refs_and_sanitized_business_context(

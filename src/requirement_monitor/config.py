@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -52,11 +52,25 @@ class LLMSettings(BaseModel):
         return value
 
 
+class WebhookSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    test: Optional[SecretStr] = None
+    prod: Optional[SecretStr] = None
+
+    @field_validator("test", "prod", mode="before")
+    @classmethod
+    def validate_webhook_url(cls, value):
+        return _validated_webhook_url(value)
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     bitable_url: NonEmptyStr
+    runtime_environment: Literal["test", "prod"] = "test"
     webhook_url: Optional[SecretStr] = None
+    webhooks: WebhookSettings = Field(default_factory=WebhookSettings)
     bot_keyword: Optional[NonEmptyStr] = None
     fixed_rules_path: Path
     timezone: NonEmptyStr = "Asia/Shanghai"
@@ -78,21 +92,7 @@ class Settings(BaseModel):
     @field_validator("webhook_url", mode="before")
     @classmethod
     def validate_webhook_url(cls, value):
-        if value is None:
-            return None
-        if isinstance(value, SecretStr):
-            raw_value = value.get_secret_value()
-        elif isinstance(value, str):
-            raw_value = value.strip()
-        else:
-            return value
-        if not raw_value:
-            raise ValueError("webhook_url must not be empty")
-        if not is_allowed_webhook_url(raw_value):
-            raise ValueError(
-                "webhook_url must use an official Feishu/Lark endpoint"
-            )
-        return raw_value
+        return _validated_webhook_url(value)
 
     @field_validator("timezone")
     @classmethod
@@ -105,23 +105,40 @@ class Settings(BaseModel):
 
 
 def load_settings(
-    path: Optional[Path] = None, *, require_webhook: bool = True
+    path: Optional[Path] = None,
+    *,
+    require_webhook: bool = True,
+    runtime_environment: Optional[str] = None,
+    use_environment_overrides: bool = True,
 ) -> Settings:
     config_path = _resolve_config_path(path)
+    _tighten_local_config_permissions(config_path)
     config_data = _read_config(config_path)
-    _apply_environment_overrides(config_data)
-
-    webhook_url = config_data.get("webhook_url")
-    if require_webhook and (
-        not isinstance(webhook_url, str) or not webhook_url.strip()
-    ):
-        raise ConfigError(
-            "Webhook URL is missing; set webhook_url in the configuration file "
-            "or REQUIREMENT_MONITOR_WEBHOOK_URL."
+    if use_environment_overrides:
+        resolved_environment = _resolve_runtime_environment(
+            runtime_environment,
+            config_data.get("runtime_environment"),
+        )
+        configured_webhooks = config_data.get("webhooks")
+        legacy_webhook_url = config_data.pop("webhook_url", None)
+        resolved_webhook_url = _resolve_webhook_url(
+            resolved_environment,
+            configured_webhooks,
+            legacy_webhook_url,
         )
 
+        config_data["runtime_environment"] = resolved_environment
+        if resolved_webhook_url is not None:
+            config_data["webhook_url"] = resolved_webhook_url
+        _apply_environment_overrides(config_data)
+    else:
+        resolved_environment = _validate_runtime_environment_value(
+            config_data.get("runtime_environment", "test")
+        )
+        config_data["runtime_environment"] = resolved_environment
+
     try:
-        return Settings.model_validate(config_data)
+        settings = Settings.model_validate(config_data)
     except ValidationError as exc:
         errors = exc.errors(include_input=False)
         raise ConfigError(
@@ -129,6 +146,19 @@ def load_settings(
                 config_path, _format_validation_errors(errors)
             )
         ) from None
+
+    if require_webhook and settings.webhook_url is None:
+        if resolved_environment == "prod":
+            raise ConfigError(
+                "Webhook URL is missing for prod runtime environment; set "
+                "webhooks.prod or REQUIREMENT_MONITOR_PROD_WEBHOOK_URL."
+            )
+        raise ConfigError(
+            "Webhook URL is missing for test runtime environment; set "
+            "webhooks.test, REQUIREMENT_MONITOR_TEST_WEBHOOK_URL, "
+            "REQUIREMENT_MONITOR_WEBHOOK_URL, or legacy webhook_url."
+        )
+    return settings
 
 
 def _resolve_config_path(path: Optional[Path]) -> Path:
@@ -160,11 +190,68 @@ def _read_config(path: Path) -> Dict[str, Any]:
     return raw_data
 
 
-def _apply_environment_overrides(config_data: Dict[str, Any]) -> None:
-    webhook_url = os.getenv("REQUIREMENT_MONITOR_WEBHOOK_URL")
-    if webhook_url:
-        config_data["webhook_url"] = webhook_url
+def _tighten_local_config_permissions(path: Path) -> None:
+    if path.name != "config.local.json" or not path.exists():
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise ConfigError(
+            "Unable to secure local configuration file {}: {}; run "
+            "chmod 600 {} and retry.".format(path, exc, path)
+        ) from exc
 
+
+def _resolve_runtime_environment(
+    command_override: Optional[str], configured_environment: Any = None
+) -> str:
+    if command_override is not None:
+        resolved_environment = command_override
+    else:
+        environment_override = os.getenv("REQUIREMENT_MONITOR_ENV")
+        if environment_override is not None:
+            resolved_environment = environment_override
+        elif configured_environment is not None:
+            resolved_environment = configured_environment
+        else:
+            resolved_environment = "test"
+
+    return _validate_runtime_environment_value(resolved_environment)
+
+
+def _validate_runtime_environment_value(value: Any) -> str:
+    if value not in ("test", "prod"):
+        raise ConfigError(
+            "Invalid runtime environment; expected one of: test, prod."
+        )
+    return value
+
+
+def _resolve_webhook_url(
+    runtime_environment: str,
+    configured_webhooks: Any,
+    legacy_webhook_url: Any,
+) -> Any:
+    configured_webhook_url = None
+    if isinstance(configured_webhooks, dict):
+        configured_webhook_url = configured_webhooks.get(runtime_environment)
+
+    if runtime_environment == "prod":
+        return (
+            os.getenv("REQUIREMENT_MONITOR_PROD_WEBHOOK_URL")
+            or configured_webhook_url
+            or None
+        )
+
+    return (
+        os.getenv("REQUIREMENT_MONITOR_TEST_WEBHOOK_URL")
+        or os.getenv("REQUIREMENT_MONITOR_WEBHOOK_URL")
+        or configured_webhook_url
+        or legacy_webhook_url
+    )
+
+
+def _apply_environment_overrides(config_data: Dict[str, Any]) -> None:
     bot_keyword = os.getenv("REQUIREMENT_MONITOR_BOT_KEYWORD")
     if bot_keyword:
         config_data["bot_keyword"] = bot_keyword
@@ -195,6 +282,24 @@ def _validate_http_url(value: str, field_name: str):
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("{} must be an HTTP(S) URL".format(field_name))
     return parsed
+
+
+def _validated_webhook_url(value):
+    if value is None:
+        return None
+    if isinstance(value, SecretStr):
+        raw_value = value.get_secret_value()
+    elif isinstance(value, str):
+        raw_value = value.strip()
+    else:
+        return value
+    if not raw_value:
+        raise ValueError("Webhook URL must not be empty")
+    if not is_allowed_webhook_url(raw_value):
+        raise ValueError(
+            "Webhook URL must use an official Feishu/Lark endpoint"
+        )
+    return raw_value
 
 
 def _format_validation_errors(errors: List[Dict[str, Any]]) -> str:
