@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{start,stop,restart,status,logs,run-once,version,init-table}",
+        metavar="{start,stop,restart,status,logs,run-once,version,init-table,db-init,db-import-feishu,api,worker,create-person,create-project,create-requirement,create-node,create-blocker,create-job}",
     )
 
     for command in ("start", "stop", "restart", "status", "logs"):
@@ -105,6 +105,77 @@ def build_parser() -> argparse.ArgumentParser:
     mode = init_table_parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_false", dest="apply")
     mode.add_argument("--apply", action="store_true", dest="apply")
+
+    db_init_parser = subparsers.add_parser(
+        "db-init", help="Create the standalone database schema."
+    )
+    db_init_parser.add_argument("--database-url", required=True)
+    db_init_parser.add_argument("--echo", action="store_true")
+
+    db_import_parser = subparsers.add_parser(
+        "db-import-feishu",
+        help="Import the current Feishu snapshot into the standalone database.",
+    )
+    _add_config_argument(db_import_parser)
+    db_import_parser.add_argument("--database-url", required=True)
+    db_import_parser.add_argument("--dry-run", action="store_true")
+
+    api_parser = subparsers.add_parser("api", help="Start the management API.")
+    api_parser.add_argument("--database-url", required=True)
+    api_parser.add_argument("--host", default="127.0.0.1")
+    api_parser.add_argument("--port", type=int, default=8000)
+
+    worker_parser = subparsers.add_parser("worker", help="Start the scheduler and notification worker.")
+    worker_parser.add_argument("--config", type=Path, required=True)
+    worker_parser.add_argument("--database-url", required=True)
+    worker_parser.add_argument("--poll-seconds", type=int, default=30)
+    worker_parser.add_argument("--once", action="store_true")
+
+    person_parser = subparsers.add_parser("create-person")
+    person_parser.add_argument("--database-url", required=True)
+    person_parser.add_argument("--name", required=True, dest="display_name")
+    person_parser.add_argument("--feishu-open-id")
+    person_parser.add_argument("--description", default="")
+
+    project_parser = subparsers.add_parser("create-project")
+    project_parser.add_argument("--database-url", required=True)
+    project_parser.add_argument("--name", required=True)
+    project_parser.add_argument("--description", default="")
+
+    requirement_parser = subparsers.add_parser("create-requirement")
+    requirement_parser.add_argument("--database-url", required=True)
+    requirement_parser.add_argument("--project-id", required=True)
+    requirement_parser.add_argument("--key", required=True, dest="requirement_key")
+    requirement_parser.add_argument("--name", required=True)
+    requirement_parser.add_argument("--project-owner-id", required=True)
+    requirement_parser.add_argument("--merge-at", required=True)
+    requirement_parser.add_argument("--target-version", default="未提供")
+    requirement_parser.add_argument("--briefing-completed", action="store_true")
+
+    node_parser = subparsers.add_parser("create-node")
+    node_parser.add_argument("--database-url", required=True)
+    node_parser.add_argument("--requirement-id", required=True)
+    node_parser.add_argument("--name", required=True)
+    node_parser.add_argument("--owner-ids", required=True, help="Comma-separated person IDs")
+    node_parser.add_argument("--domain", default="其他")
+    node_parser.add_argument("--work-type", default="研发")
+    node_parser.add_argument("--planned-start")
+    node_parser.add_argument("--planned-end")
+
+    blocker_parser = subparsers.add_parser("create-blocker")
+    blocker_parser.add_argument("--database-url", required=True)
+    blocker_parser.add_argument("--requirement-id", required=True)
+    blocker_parser.add_argument("--owner-id", required=True)
+    blocker_parser.add_argument("--title", required=True)
+    blocker_parser.add_argument("--planned-resolution-at")
+    blocker_parser.add_argument("--affects-merge", action="store_true")
+
+    job_parser = subparsers.add_parser("create-job")
+    job_parser.add_argument("--database-url", required=True)
+    job_parser.add_argument("--name", required=True)
+    job_parser.add_argument("--job-type", default="risk_scan")
+    job_parser.add_argument("--interval-seconds", type=int, default=86400)
+    return parser
     return parser
 
 
@@ -230,19 +301,32 @@ class _NullWebhookSender:
         return None
 
 
+class _DatabaseRuntime:
+    def auth_status(self):
+        return {"authenticated": True}
+
+
 def _build_runner(settings: Any, config_path: Path, *, dry_run: bool = False):
-    from requirement_monitor.feishu_cli import FeishuCLI
     from requirement_monitor.llm import LLMClient
-    from requirement_monitor.repository import BitableRepository
     from requirement_monitor.runner import MonitorRunner
     from requirement_monitor.state import StateStore
     from requirement_monitor.webhook import WebhookSender
 
     state_dir, _, fixed_rules_path = _settings_paths(settings, config_path)
-    feishu = FeishuCLI()
+    if settings.data_source == "database":
+        from requirement_monitor.database import DatabaseRepository
+
+        runtime = _DatabaseRuntime()
+        repository = DatabaseRepository(settings.database_url)
+    else:
+        from requirement_monitor.feishu_cli import FeishuCLI
+        from requirement_monitor.repository import BitableRepository
+
+        runtime = FeishuCLI()
+        repository = BitableRepository(settings.bitable_url, client=runtime)
     return MonitorRunner(
-        feishu=feishu,
-        repository=BitableRepository(settings.bitable_url, client=feishu),
+        feishu=runtime,
+        repository=repository,
         webhook=(
             _NullWebhookSender()
             if dry_run
@@ -974,6 +1058,68 @@ def main(
         print(f"requirement-monitor {__version__}")
         return EXIT_OK
 
+    if args.command == "db-init":
+        try:
+            from requirement_monitor.database import initialize_database
+
+            initialize_database(args.database_url, echo=args.echo)
+            print("Database schema is ready.")
+            return EXIT_OK
+        except Exception as error:
+            print(f"Database initialization failed: {error}", file=sys.stderr)
+            return EXIT_UNEXPECTED
+
+    if args.command in {
+        "api",
+        "worker",
+        "create-person",
+        "create-project",
+        "create-requirement",
+        "create-node",
+        "create-blocker",
+        "create-job",
+    }:
+        try:
+            from requirement_monitor.database import initialize_database
+            from requirement_monitor.service import (
+                create_blocker,
+                create_job,
+                create_node,
+                create_person,
+                create_project,
+                create_requirement,
+            )
+
+            initialize_database(args.database_url)
+            if args.command == "api":
+                import uvicorn
+                from requirement_monitor.api import create_app
+
+                uvicorn.run(create_app(args.database_url), host=args.host, port=args.port)
+                return EXIT_OK
+            if args.command == "worker":
+                from requirement_monitor.worker import worker_loop
+
+                worker_loop(args.database_url, args.config.resolve(), poll_seconds=args.poll_seconds, once=args.once)
+                return EXIT_OK
+            if args.command == "create-person":
+                payload = create_person(args.database_url, vars(args))
+            elif args.command == "create-project":
+                payload = create_project(args.database_url, vars(args))
+            elif args.command == "create-requirement":
+                payload = create_requirement(args.database_url, vars(args))
+            elif args.command == "create-node":
+                payload = create_node(args.database_url, {**vars(args), "owner_ids": args.owner_ids.split(",")})
+            elif args.command == "create-blocker":
+                payload = create_blocker(args.database_url, vars(args))
+            else:
+                payload = create_job(args.database_url, vars(args))
+            print(json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True))
+            return EXIT_OK
+        except Exception as error:
+            print(f"Database command failed: {error}", file=sys.stderr)
+            return EXIT_UNEXPECTED
+
     try:
         _validate_force_environment(args)
         if args.command == "stop":
@@ -988,7 +1134,12 @@ def main(
             config_path,
             load_settings_fn,
             require_webhook=(
-                args.command not in {"init-table", "status", "logs"}
+                args.command not in {
+                    "init-table",
+                    "status",
+                    "logs",
+                    "db-import-feishu",
+                }
                 and not (args.command == "run-once" and args.dry_run)
             ),
             runtime_environment=getattr(args, "env", None),
@@ -996,6 +1147,44 @@ def main(
         )
         _validate_force_environment(args, settings)
         _validate_runtime_environment(args, settings)
+
+        if args.command == "db-import-feishu":
+            from requirement_monitor.database import SnapshotImporter, initialize_database
+            from requirement_monitor.feishu_cli import FeishuCLI
+            from requirement_monitor.repository import BitableRepository
+
+            initialize_database(args.database_url)
+            snapshot, issues = BitableRepository(
+                settings.bitable_url, client=FeishuCLI()
+            ).load_snapshot()
+            issue_payloads = [
+                issue.model_dump(mode="json") for issue in issues
+            ]
+            if args.dry_run:
+                print(
+                    json.dumps(
+                        {
+                            "dry_run": True,
+                            "counts": {
+                                "requirements": len(snapshot.requirements),
+                                "nodes": len(snapshot.nodes),
+                                "blockers": len(snapshot.blockers),
+                                "project_configs": len(snapshot.project_configs),
+                                "base_configs": len(snapshot.base_configs),
+                            },
+                            "validation_issues": issue_payloads,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return EXIT_OK
+            counts = SnapshotImporter(args.database_url).import_snapshot(
+                snapshot,
+                validation_issues=issue_payloads,
+            )
+            print(json.dumps(counts, ensure_ascii=False, sort_keys=True))
+            return EXIT_OK
 
         if args.command == "init-table":
             if initialize_schema_fn is None:

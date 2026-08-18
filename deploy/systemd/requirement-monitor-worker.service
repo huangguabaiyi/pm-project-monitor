@@ -1,0 +1,17 @@
+[Unit]
+Description=Requirement Monitor Scheduler and Webhook Worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/requirement-monitor
+EnvironmentFile=/etc/requirement-monitor.env
+ExecStart=/bin/sh -c '/opt/requirement-monitor/.venv/bin/requirement-monitor worker --config /opt/requirement-monitor/config.database.json --database-url "$REQUIREMENT_MONITOR_DATABASE_URL" --poll-seconds 30'
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

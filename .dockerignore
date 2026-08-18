@@ -1,0 +1,9 @@
+.git
+.venv
+.pytest_cache
+.state
+logs
+config.local.json
+config.database.local.json
+__pycache__
+*.pyc

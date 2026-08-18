@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: requirement_monitor
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - monitor-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d requirement_monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      REQUIREMENT_MONITOR_DATABASE_URL: postgresql+psycopg://monitor:${POSTGRES_PASSWORD:-change-me}@db:5432/requirement_monitor
+    command: ["requirement-monitor", "api", "--database-url", "postgresql+psycopg://monitor:${POSTGRES_PASSWORD:-change-me}@db:5432/requirement_monitor", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${MONITOR_PORT:-8000}:8000"
+
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      REQUIREMENT_MONITOR_DATABASE_URL: postgresql+psycopg://monitor:${POSTGRES_PASSWORD:-change-me}@db:5432/requirement_monitor
+      REQUIREMENT_MONITOR_TEST_WEBHOOK_URL: ${REQUIREMENT_MONITOR_TEST_WEBHOOK_URL:-}
+      REQUIREMENT_MONITOR_PROD_WEBHOOK_URL: ${REQUIREMENT_MONITOR_PROD_WEBHOOK_URL:-}
+      REQUIREMENT_MONITOR_BOT_KEYWORD: ${REQUIREMENT_MONITOR_BOT_KEYWORD:-}
+    volumes:
+      - monitor-state:/app/.state
+      - monitor-logs:/app/logs
+      - ./deploy/config.database.json:/app/config.database.json:ro
+    command:
+      - sh
+      - -c
+      - >-
+        requirement-monitor db-init --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" &&
+        requirement-monitor create-job --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" --name "风险扫描" --job-type risk_scan --interval-seconds 86400 &&
+        requirement-monitor create-job --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" --name "通知投递" --job-type outbox_delivery --interval-seconds 30 &&
+        exec requirement-monitor worker --config /app/config.database.json --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" --poll-seconds 30
+
+volumes:
+  monitor-db:
+  monitor-state:
+  monitor-logs:

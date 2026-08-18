@@ -1,0 +1,17 @@
+[Unit]
+Description=Requirement Monitor API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/requirement-monitor
+EnvironmentFile=/etc/requirement-monitor.env
+ExecStart=/bin/sh -c '/opt/requirement-monitor/.venv/bin/requirement-monitor api --database-url "$REQUIREMENT_MONITOR_DATABASE_URL" --host 0.0.0.0 --port 8000'
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>需求进展监控</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; background:#f5f7fb; color:#1f2937; }
+    * { box-sizing: border-box; }
+    body { margin:0; }
+    header { background:#152238; color:white; padding:24px 32px; display:flex; justify-content:space-between; align-items:center; }
+    header h1 { margin:0; font-size:22px; }
+    header small { color:#b8c4d8; }
+    main { max-width:1400px; margin:24px auto; padding:0 20px 48px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+    .panel { background:white; border:1px solid #e3e8f0; border-radius:12px; padding:18px; box-shadow:0 2px 8px rgba(21,34,56,.04); }
+    .panel h2 { margin:0 0 14px; font-size:17px; }
+    label { display:block; font-size:13px; color:#5d6b82; margin:10px 0 5px; }
+    input, textarea, select, button { width:100%; border:1px solid #cbd5e1; border-radius:7px; padding:9px 10px; font:inherit; background:white; }
+    textarea { min-height:64px; resize:vertical; }
+    button { background:#2563eb; color:white; border:0; cursor:pointer; margin-top:12px; }
+    button.secondary { background:#64748b; }
+    button:hover { filter:brightness(.95); }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .list { display:flex; flex-direction:column; gap:8px; max-height:440px; overflow:auto; }
+    .item { border:1px solid #e3e8f0; border-radius:8px; padding:10px 12px; background:#fbfcfe; }
+    .item strong { display:block; margin-bottom:4px; }
+    .muted { color:#64748b; font-size:12px; }
+    .status { margin:12px 0; padding:10px 12px; border-radius:7px; background:#eef5ff; color:#1d4ed8; display:none; }
+    .status.error { background:#fff1f2; color:#be123c; }
+    .wide { grid-column:1/-1; }
+    @media (max-width:700px) { header { padding:18px; } main { padding:0 12px 36px; } .row { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header><div><h1>需求进展监控</h1><small>独立数据库管理台</small></div><small id="health">检查服务中…</small></header>
+  <main>
+    <div id="status" class="status"></div>
+    <section class="grid">
+      <div class="panel"><h2>人员目录</h2><form id="person-form"><label>姓名<input name="display_name" required></label><label>飞书 Open ID<input name="feishu_open_id"></label><label>描述<textarea name="description"></textarea></label><button>新增人员</button></form></div>
+      <div class="panel"><h2>项目</h2><form id="project-form"><label>项目名称<input name="name" required></label><label>项目说明<textarea name="description"></textarea></label><button>新增项目</button></form></div>
+      <div class="panel"><h2>需求</h2><form id="requirement-form"><label>项目<select name="project_id" id="requirement-project" required></select></label><div class="row"><div><label>需求编号<input name="requirement_key" required></label></div><div><label>目标版本<input name="target_version" value="未提供"></label></div></div><label>需求名称<input name="name" required></label><label>项目负责人<select name="project_owner_id" id="requirement-owner" required></select></label><label>合板时间<input type="datetime-local" name="merge_at" required></label><label><input type="checkbox" name="briefing_completed" style="width:auto"> 宣讲已完成</label><button>新增需求</button></form></div>
+      <div class="panel"><h2>交付节点</h2><form id="node-form"><label>需求<select name="requirement_id" id="node-requirement" required></select></label><label>节点名称<input name="name" required></label><div class="row"><div><label>交付域<input name="domain" value="客户端"></label></div><div><label>工作类型<input name="work_type" value="研发"></label></div></div><label>负责人（可多选）<select name="owner_ids" id="node-owners" multiple required></select></label><div class="row"><div><label>计划开始<input type="datetime-local" name="planned_start"></label></div><div><label>计划完成<input type="datetime-local" name="planned_end"></label></div></div><button>新增节点</button></form></div>
+      <div class="panel"><h2>阻塞项</h2><form id="blocker-form"><label>需求<select name="requirement_id" id="blocker-requirement" required></select></label><label>阻塞事项<input name="title" required></label><label>责任人<select name="owner_id" id="blocker-owner" required></select></label><label><input type="checkbox" name="affects_merge" style="width:auto"> 影响合板</label><button>新增阻塞项</button></form></div>
+      <div class="panel"><h2>定时任务</h2><form id="job-form"><label>任务名称<input name="name" value="每日风险检查" required></label><label>任务类型<select name="job_type"><option value="risk_scan">风险扫描</option><option value="outbox_delivery">通知投递</option></select></label><label>间隔秒数<input name="interval_seconds" type="number" min="10" value="86400"></label><button>保存任务</button></form></div>
+      <div class="panel wide"><h2>项目列表</h2><div id="projects" class="list"></div></div>
+      <div class="panel wide"><h2>需求列表</h2><div id="requirements" class="list"></div></div>
+      <div class="panel wide"><h2>最近通知</h2><div id="notifications" class="list"></div></div>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const state = { people: [], projects: [], requirements: [] };
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    function message(text, error=false) { const node=$('status'); node.textContent=text; node.className='status'+(error?' error':''); node.style.display='block'; setTimeout(()=>node.style.display='none',3500); }
+    async function api(path, options={}) { const response=await fetch(path,{headers:{'Content-Type':'application/json'},...options}); const data=await response.json().catch(()=>({})); if(!response.ok) throw new Error(data.detail || response.statusText); return data; }
+    function fillSelect(id, rows, label, value='id', multiple=false) { const node=$(id); node.innerHTML=rows.map(row=>`<option value="${esc(row[value])}">${esc(label(row))}</option>`).join(''); node.multiple=multiple; }
+    function refreshForms() { fillSelect('requirement-project', state.projects, row=>row.name); fillSelect('requirement-owner', state.people, row=>row.display_name); fillSelect('node-requirement', state.requirements, row=>`${row.requirement_key}｜${row.name}`); fillSelect('blocker-requirement', state.requirements, row=>`${row.requirement_key}｜${row.name}`); fillSelect('node-owners', state.people, row=>row.display_name, 'id', true); fillSelect('blocker-owner', state.people, row=>row.display_name); }
+    function render() { $('projects').innerHTML=state.projects.length?state.projects.map(row=>`<div class="item"><strong>${esc(row.name)}</strong><span class="muted">${esc(row.description||'暂无说明')} · ID ${esc(row.id)}</span></div>`).join(''):'<div class="muted">暂无项目</div>'; $('requirements').innerHTML=state.requirements.length?state.requirements.map(row=>`<div class="item"><strong>${esc(row.requirement_key)}｜${esc(row.name)}</strong><span class="muted">${esc(row.okr_target)} · 当前环节：${esc(row.current_stage)} · 风险级别：${esc(row.system_risk_level)}</span></div>`).join(''):'<div class="muted">暂无需求</div>'; }
+    async function load() { try { await api('/api/health'); $('health').textContent='服务正常'; state.people=await api('/api/people'); state.projects=await api('/api/projects'); state.requirements=await api('/api/requirements'); const notifications=await api('/api/notifications'); $('notifications').innerHTML=notifications.length?notifications.map(row=>`<div class="item"><strong>${esc(row.status)} · ${esc(row.channel)}</strong><span class="muted">尝试 ${esc(row.attempt_count)} 次 · ${esc(row.last_error||'无错误')}</span></div>`).join(''):'<div class="muted">暂无通知</div>'; refreshForms(); render(); } catch(error) { $('health').textContent='服务异常'; message(error.message,true); } }
+    async function submit(form, path, transform=Object.fromEntries) { try { const data=transform(new FormData(form)); await api(path,{method:'POST',body:JSON.stringify(data)}); form.reset(); message('保存成功'); await load(); } catch(error) { message(error.message,true); } }
+    $('person-form').onsubmit=e=>{e.preventDefault();submit(e.target,'/api/people',fd=>({display_name:fd.get('display_name'),feishu_open_id:fd.get('feishu_open_id')||null,description:fd.get('description')||''}))};
+    $('project-form').onsubmit=e=>{e.preventDefault();submit(e.target,'/api/projects')};
+    $('requirement-form').onsubmit=e=>{e.preventDefault();submit(e.target,'/api/requirements',fd=>({project_id:fd.get('project_id'),requirement_key:fd.get('requirement_key'),name:fd.get('name'),project_owner_id:fd.get('project_owner_id'),target_version:fd.get('target_version'),merge_at:fd.get('merge_at'),briefing_completed:fd.get('briefing_completed')==='on'}))};
+    $('node-form').onsubmit=e=>{e.preventDefault();submit(e.target,'/api/nodes',fd=>({requirement_id:fd.get('requirement_id'),name:fd.get('name'),domain:fd.get('domain'),work_type:fd.get('work_type'),owner_ids:[...$('node-owners').selectedOptions].map(o=>o.value),planned_start:fd.get('planned_start')||null,planned_end:fd.get('planned_end')||null}))};
+    $('blocker-form').onsubmit=e=>{e.preventDefault();submit(e.target,'/api/blockers',fd=>({requirement_id:fd.get('requirement_id'),title:fd.get('title'),owner_id:fd.get('owner_id'),affects_merge:fd.get('affects_merge')==='on'}))};
+    $('job-form').onsubmit=e=>{e.preventDefault();submit(e.target,'/api/jobs',fd=>({name:fd.get('name'),job_type:fd.get('job_type'),interval_seconds:Number(fd.get('interval_seconds'))}))};
+    load();
+  </script>
+</body>
+</html>

@@ -1,6 +1,6 @@
 # 需求进展提醒机器人
 
-本工具运行在本机 Mac 上，从飞书多维表格读取需求、项目配置、进展节点和阻塞项，按固定业务规则计算风险，并通过飞书 Webhook 发送日报卡片。第一版不提供对外 Web 服务，也不启动 HTTP 上行接口；飞书表格读写使用本机已经认证的 `feishu` CLI。
+本工具当前兼容两种数据源：迁移阶段可从飞书多维表格读取需求、项目配置、进展节点和阻塞项；迁移完成后可切换到独立数据库。两种模式都按固定业务规则计算风险，并通过飞书 Webhook 发送日报卡片。数据库迁移说明请查看 [`docs/database-migration.md`](docs/database-migration.md)。
 
 面向需求负责人、研发测试成员和管理员的逐表填写说明，请查看 [`使用说明.md`](使用说明.md)。
 
@@ -49,6 +49,8 @@ chmod 600 config.local.json
 配置至少应确认以下字段：
 
 - `bitable_url`：目标飞书多维表格或知识库表格 URL。
+- `data_source`：数据源，`bitable`（兼容模式）或 `database`（独立数据库模式）。
+- `database_url`：独立数据库连接串，使用 `data_source: "database"` 时必填。
 - `runtime_environment`：运行环境，默认 `test`，只允许 `test` 或 `prod`。
 - `webhooks.test` / `webhooks.prod`：测试和正式机器人 Webhook，互不回退和混用。
 - `bot_keyword`：飞书自定义机器人安全关键词；当前机器人使用 `需求进展推送` 时应保持一致。
@@ -286,3 +288,47 @@ export REQUIREMENT_MONITOR_BOT_KEYWORD='需求进展推送'
 ```
 
 不要在 CI、提交钩子或默认测试命令中设置 `REQUIREMENT_MONITOR_LIVE_TEST=1`。不要在未经确认的线上表格执行 `init-table --apply`，不要运行会发送真实 Webhook 的 `run-once` 来代替 dry-run 验证。
+
+## 独立数据库服务
+
+当前系统已经支持从空数据库启动，不依赖飞书多维表格。数据库模型、录入命令和迁移说明请查看 [`docs/database-migration.md`](docs/database-migration.md)。
+
+### 本地启动管理台
+
+```bash
+.venv/bin/requirement-monitor db-init \
+  --database-url sqlite+pysqlite:///./.state/requirement-monitor.db
+.venv/bin/requirement-monitor api \
+  --database-url sqlite+pysqlite:///./.state/requirement-monitor.db \
+  --host 127.0.0.1 --port 8000
+```
+
+浏览器打开 `http://127.0.0.1:8000/`。页面可以维护人员、项目、需求、节点、阻塞项和定时任务。
+
+### 空库录入命令
+
+```bash
+.venv/bin/requirement-monitor create-person \\
+  --database-url sqlite+pysqlite:///./.state/requirement-monitor.db \\
+  --name "项目负责人" --feishu-open-id "ou_xxx"
+.venv/bin/requirement-monitor create-project \\
+  --database-url sqlite+pysqlite:///./.state/requirement-monitor.db \\
+  --name "示例项目"
+.venv/bin/requirement-monitor create-job \\
+  --database-url sqlite+pysqlite:///./.state/requirement-monitor.db \\
+  --name "每日风险扫描" --job-type risk_scan --interval-seconds 86400
+```
+
+需求和节点可以通过管理页面或对应的 `create-requirement`、`create-node` 命令录入。
+
+### Worker
+
+Worker 会持续扫描到期任务，并把风险卡片先写入 `notification_outbox`，再由通知投递逻辑发送；失败会按退避策略重试，超过最大次数进入 `dead` 状态。
+
+```bash
+.venv/bin/requirement-monitor worker \\
+  --config config.database.local.json \\
+  --database-url sqlite+pysqlite:///./.state/requirement-monitor.db
+```
+
+Linux Docker 和 systemd 部署见 [`deploy/README.md`](deploy/README.md)。

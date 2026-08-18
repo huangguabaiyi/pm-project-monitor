@@ -497,6 +497,25 @@ def test_schema_configuration_can_skip_webhook_requirement(tmp_path, monkeypatch
     assert settings.webhook_url is None
 
 
+def test_database_data_source_accepts_database_only_configuration(
+    tmp_path, monkeypatch
+):
+    clear_environment(monkeypatch)
+    config_path = tmp_path / "database-config.json"
+    write_config(
+        config_path,
+        data_source="database",
+        bitable_url=None,
+        database_url="sqlite+pysqlite:///./database.db",
+    )
+
+    settings = load_settings(config_path, require_webhook=False)
+
+    assert settings.data_source == "database"
+    assert settings.bitable_url is None
+    assert settings.database_url == "sqlite+pysqlite:///./database.db"
+
+
 def test_blank_webhook_has_clear_configuration_error(tmp_path, monkeypatch):
     clear_environment(monkeypatch)
     config_path = tmp_path / "config.json"

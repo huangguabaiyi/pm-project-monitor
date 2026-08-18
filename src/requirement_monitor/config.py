@@ -13,6 +13,7 @@ from pydantic import (
     StringConstraints,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from .webhook_url import is_allowed_webhook_url
@@ -67,7 +68,9 @@ class WebhookSettings(BaseModel):
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    bitable_url: NonEmptyStr
+    data_source: Literal["bitable", "database"] = "bitable"
+    bitable_url: Optional[NonEmptyStr] = None
+    database_url: Optional[NonEmptyStr] = None
     runtime_environment: Literal["test", "prod"] = "test"
     webhook_url: Optional[SecretStr] = None
     webhooks: WebhookSettings = Field(default_factory=WebhookSettings)
@@ -82,12 +85,34 @@ class Settings(BaseModel):
 
     @field_validator("bitable_url")
     @classmethod
-    def validate_bitable_url(cls, value: str) -> str:
+    def validate_bitable_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
         parsed = _validate_http_url(value, "bitable_url")
         hostname = parsed.hostname or ""
         if hostname != "feishu.cn" and not hostname.endswith(".feishu.cn"):
             raise ValueError("bitable_url must be a Feishu URL")
         return value
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized.startswith(("sqlite://", "sqlite+", "postgresql://", "postgresql+psycopg://", "postgres://")):
+            raise ValueError(
+                "database_url must use sqlite:// or postgresql://"
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_data_source(self):
+        if self.data_source == "bitable" and self.bitable_url is None:
+            raise ValueError("bitable_url is required when data_source=bitable")
+        if self.data_source == "database" and self.database_url is None:
+            raise ValueError("database_url is required when data_source=database")
+        return self
 
     @field_validator("webhook_url", mode="before")
     @classmethod

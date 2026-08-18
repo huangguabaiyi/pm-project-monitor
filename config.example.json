@@ -1,5 +1,7 @@
 {
+  "data_source": "bitable",
   "bitable_url": "https://mi.feishu.cn/wiki/TA6nwzFi0i4fdOkIamzcxj34nRd?fromScene=spaceOverview&table=tblQlOtlW0xmcKBE&view=vewCeVIyDY",
+  "database_url": null,
   "runtime_environment": "test",
   "webhooks": {
     "test": null,
