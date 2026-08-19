@@ -91,7 +91,6 @@ def _risk_card(requirement: Dict[str, object], *, include_ai: bool = True) -> Di
 def run_risk_scan(database_url: str) -> Dict[str, int]:
     logger.info("risk_scan.start")
     counts = evaluate_all_requirements(database_url)
-    ai_counts = analyze_all_requirements(database_url)
     ai_settings = get_ai_settings(database_url)
     enqueued = 0
     for summary in list_requirements(database_url):
@@ -104,8 +103,15 @@ def run_risk_scan(database_url: str) -> Dict[str, int]:
         if not result.get("duplicate"):
             enqueued += 1
         logger.info("risk_scan.notification requirement_id=%s risk_level=%s status=%s duplicate=%s", requirement["id"], requirement["risk_level"], result["status"], result.get("duplicate"))
-    summary = {**counts, "enqueued": enqueued, **{f"ai_{key}": value for key, value in ai_counts.items()}}
+    summary = {**counts, "enqueued": enqueued}
     logger.info("risk_scan.finish summary=%s", summary)
+    return summary
+
+
+def run_ai_analysis(database_url: str) -> Dict[str, int]:
+    logger.info("ai_analysis.start")
+    summary = analyze_all_requirements(database_url)
+    logger.info("ai_analysis.finish summary=%s", summary)
     return summary
 
 
@@ -218,7 +224,12 @@ def execute_due_jobs(database_url: str, config_path: Path) -> int:
         logger.info("jobs.execute count=%s", len(claimed))
     for run_id, job_type in claimed:
         try:
-            summary = run_risk_scan(database_url) if job_type == "risk_scan" else deliver_outbox(database_url, config_path)
+            if job_type == "risk_scan":
+                summary = run_risk_scan(database_url)
+            elif job_type == "ai_analysis":
+                summary = run_ai_analysis(database_url)
+            else:
+                summary = deliver_outbox(database_url, config_path)
             _finish(database_url, run_id, "succeeded", summary=summary)
         except Exception as error:
             _finish(database_url, run_id, "failed", error=str(error))
@@ -233,6 +244,8 @@ def worker_loop(database_url: str, config_path: Path, *, poll_seconds: int = 30,
         create_job(database_url, {"name": "风险扫描", "job_type": "risk_scan", "interval_seconds": 3600})
     if "outbox_delivery" not in existing_types:
         create_job(database_url, {"name": "通知投递", "job_type": "outbox_delivery", "interval_seconds": 30})
+    if "ai_analysis" not in existing_types:
+        create_job(database_url, {"name": "AI 自动总结", "job_type": "ai_analysis", "interval_seconds": 3600})
     while True:
         execute_due_jobs(database_url, config_path)
         if once:

@@ -48,6 +48,7 @@ from .service import (
     update_definition,
     update_ai_settings,
     update_domain,
+    update_job,
     update_person,
     update_requirement,
     update_requirement_node,
@@ -174,6 +175,13 @@ class JobInput(BaseModel):
     job_type: str = "risk_scan"
     interval_seconds: int = Field(default=86400, ge=10)
     enabled: bool = True
+    next_run_at: Optional[str] = None
+
+
+class JobPatch(BaseModel):
+    name: Optional[str] = None
+    interval_seconds: Optional[int] = Field(default=None, ge=10)
+    enabled: Optional[bool] = None
     next_run_at: Optional[str] = None
 
 
@@ -421,6 +429,16 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
     @app.post("/api/jobs", status_code=201)
     def jobs_create(payload: JobInput):
         return create_job(db(), payload.model_dump())
+
+    @app.patch("/api/jobs/{job_id}")
+    def jobs_update(job_id: str, payload: JobPatch):
+        try:
+            result = update_job(db(), job_id, payload.model_dump(exclude_unset=True))
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        if result is None:
+            raise HTTPException(404, "job not found")
+        return result
 
     @app.post("/api/jobs/{job_id}/run")
     def jobs_run(job_id: str):

@@ -1,4 +1,4 @@
-import { Activity, BellRing, GitBranch, LayoutDashboard, Menu, Plus, Send, Sparkles, Users, X } from 'lucide-react'
+import { Activity, BellRing, GitBranch, LayoutDashboard, Menu, Plus, Send, Settings, Sparkles, Users, X } from 'lucide-react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { useState } from 'react'
 import Overview from './pages/Overview'
@@ -10,6 +10,7 @@ import WorkflowConfig from './pages/WorkflowConfig'
 import Automation from './pages/Automation'
 import WebhookSettings from './pages/WebhookSettings'
 import AISettings from './pages/AISettings'
+import SystemMaintenance from './pages/SystemMaintenance'
 
 const nav = [
   ['/', '总览', LayoutDashboard],
@@ -19,6 +20,7 @@ const nav = [
   ['/webhook', 'Webhook 配置', Send],
   ['/ai-settings', 'AI 分析', Sparkles],
   ['/automation', '自动化', BellRing],
+  ['/maintenance', '系统维护', Settings],
 ] as const
 
 export default function App(){
@@ -41,6 +43,7 @@ export default function App(){
         <Route path="/webhook" element={<WebhookSettings/>}/>
         <Route path="/ai-settings" element={<AISettings/>}/>
         <Route path="/automation" element={<Automation/>}/>
+        <Route path="/maintenance" element={<SystemMaintenance/>}/>
         <Route path="*" element={<Navigate to="/"/>}/>
       </Routes></div>
     </main>

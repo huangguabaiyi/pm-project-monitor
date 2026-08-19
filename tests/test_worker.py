@@ -1,4 +1,8 @@
-from requirement_monitor.worker import _risk_card
+from pathlib import Path
+
+from requirement_monitor.database import initialize_database
+from requirement_monitor.service import list_jobs
+from requirement_monitor.worker import _risk_card, worker_loop
 
 
 def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
@@ -52,3 +56,13 @@ def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
         "https://www.figma.com/design/example",
         "https://docs.example.com/requirement/7",
     ]
+
+
+def test_worker_creates_default_automation_jobs(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'worker-jobs.db'}"
+    initialize_database(database_url)
+
+    worker_loop(database_url, tmp_path / "missing-config.json", once=True)
+
+    job_types = {job["job_type"] for job in list_jobs(database_url)}
+    assert {"risk_scan", "outbox_delivery", "ai_analysis"} <= job_types

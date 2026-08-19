@@ -116,6 +116,34 @@ def test_trigger_outbox_delivery_revives_dead_notifications(tmp_path: Path):
         assert notification.available_at.replace(tzinfo=timezone.utc) < future
 
 
+def test_job_timer_can_be_updated(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'jobs.db'}"))
+    created = client.post(
+        "/api/jobs",
+        json={"name": "AI 自动总结", "job_type": "ai_analysis", "interval_seconds": 3600},
+    )
+    assert created.status_code == 201
+    job_id = created.json()["id"]
+
+    updated = client.patch(
+        f"/api/jobs/{job_id}",
+        json={
+            "name": "AI 总结",
+            "interval_seconds": 7200,
+            "enabled": False,
+            "next_run_at": "2026-08-20T09:30:00+08:00",
+        },
+    )
+
+    assert updated.status_code == 200
+    payload = updated.json()
+    assert payload["name"] == "AI 总结"
+    assert payload["job_type"] == "ai_analysis"
+    assert payload["interval_seconds"] == 7200
+    assert payload["enabled"] is False
+    assert payload["next_run_at"].startswith("2026-08-20T09:30:00")
+
+
 def test_person_domain_open_id_and_masked_webhook_settings(tmp_path: Path):
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'settings.db'}"))
     domain = client.post("/api/domains", json={"name": "服务端", "color": "#248052"}).json()

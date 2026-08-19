@@ -42,6 +42,7 @@ from .webhook_url import is_allowed_webhook_url
 
 
 NODE_STATUSES = {"not_started", "in_progress", "blocked", "completed", "skipped"}
+JOB_TYPES = {"risk_scan", "outbox_delivery", "ai_analysis"}
 BACKUP_FORMAT_VERSION = 1
 SETTINGS_TABLES = {"webhook_settings", "ai_settings", "scheduled_jobs"}
 
@@ -640,7 +641,7 @@ def list_jobs(database_url: str) -> List[Dict[str, object]]:
 def create_job(database_url: str, data: Mapping[str, object]) -> Dict[str, object]:
     name = str(data.get("name") or "").strip()
     job_type = str(data.get("job_type") or "risk_scan")
-    if not name or job_type not in {"risk_scan", "outbox_delivery"}:
+    if not name or job_type not in JOB_TYPES:
         raise ValueError("invalid job")
     with session_scope(database_url) as session:
         row = session.scalar(select(ScheduledJobRow).where(ScheduledJobRow.name == name))
@@ -651,6 +652,31 @@ def create_job(database_url: str, data: Mapping[str, object]) -> Dict[str, objec
         row.interval_seconds = max(10, int(data.get("interval_seconds") or 86400))
         row.enabled = bool(data.get("enabled", True))
         row.next_run_at = _datetime(data.get("next_run_at")) or _utc_now()
+        session.flush()
+        return _job(row)
+
+
+def update_job(database_url: str, job_id: str, data: Mapping[str, object]) -> Optional[Dict[str, object]]:
+    with session_scope(database_url) as session:
+        row = session.get(ScheduledJobRow, job_id)
+        if row is None:
+            return None
+        if "name" in data and data["name"] is not None:
+            name = str(data["name"]).strip()
+            if not name:
+                raise ValueError("job name is required")
+            row.name = name
+        if "job_type" in data and data["job_type"] is not None:
+            job_type = str(data["job_type"])
+            if job_type not in JOB_TYPES:
+                raise ValueError("invalid job")
+            row.job_type = job_type
+        if "interval_seconds" in data and data["interval_seconds"] is not None:
+            row.interval_seconds = max(10, int(data["interval_seconds"]))
+        if "enabled" in data and data["enabled"] is not None:
+            row.enabled = bool(data["enabled"])
+        if "next_run_at" in data:
+            row.next_run_at = _datetime(data["next_run_at"]) or _utc_now()
         session.flush()
         return _job(row)
 
