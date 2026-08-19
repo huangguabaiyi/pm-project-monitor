@@ -369,10 +369,8 @@ def run_job_now(database_url: str, job_id: str, *, config_path: Optional[Path] =
         job = session.get(ScheduledJobRow, job_id)
         if job is None:
             return None
-        job.enabled = True
         job.last_run_at = now
         job.last_status = "running"
-        job.next_run_at = now + timedelta(seconds=max(10, job.interval_seconds))
         job_type = job.job_type
         notification_scope = job.notification_scope or "risk_only"
         session.flush()

@@ -220,7 +220,8 @@ def test_manual_notification_run_refreshes_generates_and_delivers(monkeypatch, t
     template = client.post("/api/templates", json={"name": "通知模板"}).json()
     client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition["id"]})
     client.post("/api/requirements", json={"name": "待投递需求", "owner_id": owner["id"], "template_id": template["id"]})
-    job = client.post("/api/jobs", json={"name": "通知投递", "job_type": "outbox_delivery", "notification_scope": "all", "interval_seconds": 30}).json()
+    job = client.post("/api/jobs", json={"name": "通知投递", "job_type": "outbox_delivery", "notification_scope": "all", "schedule_kind": "cron", "cron_expression": "42 18 * * 1-5", "timezone": "Asia/Shanghai"}).json()
+    scheduled_next_run = job["next_run_at"]
     settings = client.patch("/api/webhook-settings", json={"enabled": True, "test_webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token"})
     assert settings.status_code == 200
 
@@ -244,6 +245,8 @@ def test_manual_notification_run_refreshes_generates_and_delivers(monkeypatch, t
     assert response.json()["summary"]["enqueued"] == 1
     assert response.json()["summary"]["delivered"] == 1
     assert client.get("/api/notifications").json()[0]["status"] == "sent"
+    refreshed_job = next(item for item in client.get("/api/jobs").json() if item["id"] == job["id"])
+    assert refreshed_job["next_run_at"] == scheduled_next_run
 
 
 def test_deployment_update_is_enabled_by_default(tmp_path: Path, monkeypatch):
