@@ -1,4 +1,4 @@
-import { KeyRound, Pencil, Plus, UserRoundCheck } from 'lucide-react'
+import { KeyRound, Pencil, Plus, Trash2, UserRoundCheck } from 'lucide-react'
 import { FormEvent, useEffect, useState } from 'react'
 import { api } from '../api'
 import { Field, Loading, PageHead, Toast } from '../components'
@@ -33,12 +33,18 @@ export default function People(){
       setEditing(null);setMessage('人员配置已保存');load()
     }catch(err){setError((err as Error).message)}
   }
+  async function deactivate(person:Person){
+    if(!window.confirm(`停用人员「${person.display_name}」？历史需求不会被删除。`))return
+    setError('')
+    try{await api.del(`/people/${person.id}`);setMessage('人员已停用');await load()}
+    catch(err){setError((err as Error).message)}
+  }
   return <>
     <PageHead eyebrow="配置中心" title="人员配置" description="统一维护成员的交付领域、角色与飞书身份；需求和节点只选择这里已有的人员。" action={<button className="button primary" onClick={()=>open()}><Plus size={16}/>新增人员</button>}/>
     <div className="people-grid">{items.map(p=><article className={p.active?'person-card':'person-card inactive'} key={p.id}>
       <div className="avatar" style={p.domain?{background:`${p.domain.color}20`,color:p.domain.color}:undefined}>{p.display_name.slice(-2)}</div>
       <div><div className="person-title"><h3>{p.display_name}</h3>{p.domain&&<b style={{color:p.domain.color}}>{p.domain.name}</b>}</div><p>{p.role_name||'未设置角色'}</p><span className="open-id"><KeyRound size={11}/>{p.feishu_open_id||'未配置飞书 Open ID'}</span></div>
-      <button className="icon" onClick={()=>open(p)} aria-label="编辑"><Pencil size={16}/></button>
+      <div className="person-actions"><button className="icon" onClick={()=>open(p)} aria-label="编辑"><Pencil size={16}/></button><button className="icon" onClick={()=>deactivate(p)} disabled={!p.active} aria-label="停用"><Trash2 size={16}/></button></div>
     </article>)}</div>
     {editing&&<div className="drawer-backdrop" onMouseDown={()=>setEditing(null)}><form className="drawer" onSubmit={save} onMouseDown={e=>e.stopPropagation()}>
       <div className="drawer-head"><div><UserRoundCheck/><span><strong>{editing.id?'编辑人员':'新增人员'}</strong><small>领域和 Open ID 会用于节点分工与飞书提醒</small></span></div><button type="button" className="icon" onClick={()=>setEditing(null)}>×</button></div>

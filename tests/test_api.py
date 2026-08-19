@@ -1,8 +1,10 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from requirement_monitor.api import create_app
+from requirement_monitor.database import NotificationOutboxRow, ScheduledJobRow, session_scope
 
 
 def test_full_configuration_and_requirement_flow(tmp_path: Path):
@@ -50,14 +52,68 @@ def test_removed_project_and_blocker_routes_do_not_exist(tmp_path: Path):
     assert client.get("/api/nodes").status_code == 404
 
 
-def test_deployment_update_is_disabled_by_default(tmp_path: Path, monkeypatch):
+def test_node_definition_supports_multiple_domains(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'multi-domain.db'}"))
+    product = client.post("/api/domains", json={"name": "产品", "color": "#7c5ce5"}).json()
+    client_domain = client.post("/api/domains", json={"name": "客户端", "color": "#3478c7"}).json()
+    definition = client.post(
+        "/api/node-definitions",
+        json={"name": "体验验收", "domain_ids": [product["id"], client_domain["id"]]},
+    )
+    assert definition.status_code == 201
+    payload = definition.json()
+    assert payload["domain_id"] == product["id"]
+    assert payload["domain_ids"] == [product["id"], client_domain["id"]]
+    assert [domain["name"] for domain in payload["domains"]] == ["产品", "客户端"]
+
+
+def test_deployment_update_is_enabled_by_default(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("REQUIREMENT_MONITOR_DEPLOY_UPDATE_ENABLED", raising=False)
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'deploy.db'}"))
     status = client.get("/api/deployment/update-status")
     assert status.status_code == 200
-    assert status.json()["enabled"] is False
-    assert client.post("/api/deployment/check-updates", json={}).status_code == 400
-    assert client.post("/api/deployment/apply-update", json={}).status_code == 400
+    assert status.json()["enabled"] is True
+
+
+def test_trigger_outbox_delivery_makes_pending_notifications_due(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'outbox-trigger.db'}"
+    client = TestClient(create_app(database_url))
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    with session_scope(database_url) as session:
+        job = ScheduledJobRow(name="通知投递", job_type="outbox_delivery", interval_seconds=30, next_run_at=future)
+        notification = NotificationOutboxRow(deduplication_key="manual-retry", payload={"msg_type": "text", "content": {"text": "hello"}}, available_at=future)
+        session.add_all([job, notification])
+        session.flush()
+        job_id = job.id
+        notification_id = notification.id
+
+    assert client.post(f"/api/jobs/{job_id}/run", json={}).status_code == 200
+    with session_scope(database_url) as session:
+        notification = session.get(NotificationOutboxRow, notification_id)
+        assert notification is not None
+        assert notification.available_at.replace(tzinfo=timezone.utc) < future
+
+
+def test_trigger_outbox_delivery_revives_dead_notifications(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'outbox-dead-trigger.db'}"
+    client = TestClient(create_app(database_url))
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    with session_scope(database_url) as session:
+        job = ScheduledJobRow(name="通知投递", job_type="outbox_delivery", interval_seconds=30, next_run_at=future)
+        notification = NotificationOutboxRow(deduplication_key="manual-revive", payload={"msg_type": "text", "content": {"text": "hello"}}, status="dead", attempt_count=6, last_error="feishu_error_19024", available_at=future)
+        session.add_all([job, notification])
+        session.flush()
+        job_id = job.id
+        notification_id = notification.id
+
+    assert client.post(f"/api/jobs/{job_id}/run", json={}).status_code == 200
+    with session_scope(database_url) as session:
+        notification = session.get(NotificationOutboxRow, notification_id)
+        assert notification is not None
+        assert notification.status == "pending"
+        assert notification.attempt_count == 0
+        assert notification.last_error is None
+        assert notification.available_at.replace(tzinfo=timezone.utc) < future
 
 
 def test_person_domain_open_id_and_masked_webhook_settings(tmp_path: Path):

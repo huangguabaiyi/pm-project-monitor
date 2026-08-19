@@ -69,6 +69,14 @@ class NodeDefinitionRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, onupdate=_utc_now)
 
     domain: Mapped[DeliveryDomainRow] = relationship(back_populates="definitions")
+    domains: Mapped[List[DeliveryDomainRow]] = relationship(secondary="node_definition_domains")
+
+
+class NodeDefinitionDomainRow(Base):
+    __tablename__ = "node_definition_domains"
+
+    definition_id: Mapped[str] = mapped_column(String(32), ForeignKey("node_definitions.id", ondelete="CASCADE"), primary_key=True)
+    domain_id: Mapped[str] = mapped_column(String(32), ForeignKey("delivery_domains.id", ondelete="RESTRICT"), primary_key=True)
 
 
 class WorkflowTemplateRow(Base):
@@ -338,6 +346,7 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
         for column, sql_type in ai_columns.items():
             if column not in requirement_columns:
                 connection.execute(text(f"ALTER TABLE requirements ADD COLUMN {column} {sql_type}"))
+        connection.execute(text("INSERT OR IGNORE INTO node_definition_domains (definition_id, domain_id) SELECT id, domain_id FROM node_definitions WHERE domain_id IS NOT NULL")) if engine.dialect.name == "sqlite" else connection.execute(text("INSERT INTO node_definition_domains (definition_id, domain_id) SELECT id, domain_id FROM node_definitions WHERE domain_id IS NOT NULL ON CONFLICT DO NOTHING"))
 
 
 @contextmanager

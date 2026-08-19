@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
+FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 class DeploymentUpdateManager:
@@ -23,7 +24,8 @@ class DeploymentUpdateManager:
         self._last_output = ""
 
     def enabled(self) -> bool:
-        return os.getenv("REQUIREMENT_MONITOR_DEPLOY_UPDATE_ENABLED", "").lower() in TRUE_VALUES
+        value = os.getenv("REQUIREMENT_MONITOR_DEPLOY_UPDATE_ENABLED", "").lower()
+        return value not in FALSE_VALUES
 
     def status(self) -> Dict[str, object]:
         return {

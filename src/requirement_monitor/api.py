@@ -90,7 +90,8 @@ class DomainPatch(BaseModel):
 
 class DefinitionInput(BaseModel):
     name: str = Field(min_length=1)
-    domain_id: str
+    domain_id: Optional[str] = None
+    domain_ids: Optional[List[str]] = None
     description: str = ""
     completion_criteria: str = ""
     active: bool = True
@@ -99,6 +100,7 @@ class DefinitionInput(BaseModel):
 class DefinitionPatch(BaseModel):
     name: Optional[str] = None
     domain_id: Optional[str] = None
+    domain_ids: Optional[List[str]] = None
     description: Optional[str] = None
     completion_criteria: Optional[str] = None
     active: Optional[bool] = None

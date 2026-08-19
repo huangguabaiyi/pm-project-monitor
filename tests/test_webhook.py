@@ -423,6 +423,12 @@ def test_keyword_is_injected_into_system_error_card_without_secret_leak(
             "msg": "required keyword not found at {}".format(webhook_url),
         }
     )
+    httpx_mock.add_response(
+        json={
+            "code": 19024,
+            "msg": "required keyword not found at {}".format(webhook_url),
+        }
+    )
     payload = {
         "msg_type": "interactive",
         "card": {
@@ -445,12 +451,48 @@ def test_keyword_is_injected_into_system_error_card_without_secret_leak(
         bot_keyword="需求机器人",
     ).send(payload)
 
-    sent = json.loads(httpx_mock.get_request().content)
+    sent = json.loads(httpx_mock.get_requests()[0].content)
+    fallback = json.loads(httpx_mock.get_requests()[1].content)
     assert result.success is False
     assert result.feishu_code == 19024
+    assert result.attempts == 2
     assert json.dumps(sent, ensure_ascii=False).count("需求机器人") == 1
+    assert fallback["msg_type"] == "text"
+    assert fallback["content"]["text"].startswith("需求机器人")
     assert WEBHOOK_TOKEN not in repr(result)
     assert webhook_url not in repr(result)
+
+
+def test_keyword_rejection_card_degrades_to_plain_text(httpx_mock, webhook_url):
+    httpx_mock.add_response(json={"code": 19024, "msg": "Key Words Not Found"})
+    httpx_mock.add_response(json={"code": 0})
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "template": "red",
+                "title": {"tag": "plain_text", "content": "需求进展风险提醒"},
+            },
+            "elements": [
+                {"tag": "markdown", "content": "**#1 · 体验升级**\n风险等级：严重"}
+            ],
+        },
+    }
+
+    result = WebhookSender(
+        webhook_url,
+        sleep=lambda seconds: None,
+        bot_keyword="需求交付提醒",
+    ).send(payload)
+
+    requests = httpx_mock.get_requests()
+    fallback = json.loads(requests[1].content)
+    assert result.success is True
+    assert result.attempts == 2
+    assert result.format_used == "text"
+    assert len(requests) == 2
+    assert fallback["msg_type"] == "text"
+    assert fallback["content"]["text"].startswith("需求交付提醒")
 
 
 def test_http_400_card_schema_message_degrades_to_plain_text(

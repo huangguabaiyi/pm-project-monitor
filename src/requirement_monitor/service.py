@@ -149,29 +149,46 @@ def deactivate_domain(database_url: str, domain_id: str) -> bool:
 
 
 def _definition(row: NodeDefinitionRow) -> Dict[str, object]:
-    return {"id": row.id, "name": row.name, "domain_id": row.domain_id, "domain": _domain(row.domain), "description": row.description, "completion_criteria": row.completion_criteria, "active": row.active}
+    domain_rows = list(row.domains or [])
+    if row.domain and all(domain.id != row.domain_id for domain in domain_rows):
+        domain_rows.insert(0, row.domain)
+    domain_rows.sort(key=lambda domain: (0 if domain.id == row.domain_id else 1, domain.sort_order, domain.name))
+    domains = [_domain(domain) for domain in (domain_rows or [row.domain])]
+    return {"id": row.id, "name": row.name, "domain_id": row.domain_id, "domain_ids": [domain["id"] for domain in domains], "domain": _domain(row.domain), "domains": domains, "description": row.description, "completion_criteria": row.completion_criteria, "active": row.active}
 
 
 def list_definitions(database_url: str) -> List[Dict[str, object]]:
     with session_scope(database_url) as session:
-        rows = session.scalars(select(NodeDefinitionRow).options(selectinload(NodeDefinitionRow.domain)).order_by(NodeDefinitionRow.active.desc(), NodeDefinitionRow.name))
+        rows = session.scalars(select(NodeDefinitionRow).options(selectinload(NodeDefinitionRow.domain), selectinload(NodeDefinitionRow.domains)).order_by(NodeDefinitionRow.active.desc(), NodeDefinitionRow.name))
         return [_definition(row) for row in rows]
+
+
+def _definition_domain_ids(data: Mapping[str, object]) -> List[str]:
+    raw_ids = data.get("domain_ids")
+    if raw_ids is None:
+        raw_ids = [data.get("domain_id")]
+    if isinstance(raw_ids, str):
+        values = [raw_ids]
+    else:
+        values = list(raw_ids or [])
+    return list(dict.fromkeys(str(value) for value in values if str(value or "").strip()))
 
 
 def create_definition(database_url: str, data: Mapping[str, object]) -> Dict[str, object]:
     name = str(data.get("name") or "").strip()
-    domain_id = str(data.get("domain_id") or "")
-    if not name or not domain_id:
-        raise ValueError("name and domain_id are required")
+    domain_ids = _definition_domain_ids(data)
+    if not name or not domain_ids:
+        raise ValueError("name and domain_ids are required")
     with session_scope(database_url) as session:
-        if session.get(DeliveryDomainRow, domain_id) is None:
+        domains = [session.get(DeliveryDomainRow, domain_id) for domain_id in domain_ids]
+        if any(domain is None for domain in domains):
             raise ValueError("delivery domain not found")
         if session.scalar(select(NodeDefinitionRow).where(NodeDefinitionRow.name == name)):
             raise ValueError("node name already exists")
-        row = NodeDefinitionRow(name=name, domain_id=domain_id, description=str(data.get("description") or ""), completion_criteria=str(data.get("completion_criteria") or ""))
+        row = NodeDefinitionRow(name=name, domain_id=domain_ids[0], description=str(data.get("description") or ""), completion_criteria=str(data.get("completion_criteria") or ""), domains=[domain for domain in domains if domain])
         session.add(row)
         session.flush()
-        session.refresh(row, ["domain"])
+        session.refresh(row, ["domain", "domains"])
         return _definition(row)
 
 
@@ -183,14 +200,19 @@ def update_definition(database_url: str, definition_id: str, data: Mapping[str, 
         for field in ("name", "description", "completion_criteria"):
             if field in data and data[field] is not None:
                 setattr(row, field, str(data[field]).strip())
-        if "domain_id" in data:
-            if session.get(DeliveryDomainRow, str(data["domain_id"])) is None:
+        if "domain_id" in data or "domain_ids" in data:
+            domain_ids = _definition_domain_ids(data)
+            if not domain_ids:
+                raise ValueError("domain_ids are required")
+            domains = [session.get(DeliveryDomainRow, domain_id) for domain_id in domain_ids]
+            if any(domain is None for domain in domains):
                 raise ValueError("delivery domain not found")
-            row.domain_id = str(data["domain_id"])
+            row.domain_id = domain_ids[0]
+            row.domains = [domain for domain in domains if domain]
         if "active" in data:
             row.active = bool(data["active"])
         session.flush()
-        session.refresh(row, ["domain"])
+        session.refresh(row, ["domain", "domains"])
         return _definition(row)
 
 
@@ -236,12 +258,13 @@ def update_template(database_url: str, template_id: str, data: Mapping[str, obje
 
 
 def _template_node(row: WorkflowTemplateNodeRow) -> Dict[str, object]:
-    return {"id": row.id, "definition_id": row.definition_id, "name": row.definition.name, "description": row.definition.description, "completion_criteria": row.definition.completion_criteria, "domain": _domain(row.definition.domain), "position": {"x": row.position_x, "y": row.position_y}}
+    domains = [_domain(domain) for domain in (row.definition.domains or [row.definition.domain])]
+    return {"id": row.id, "definition_id": row.definition_id, "name": row.definition.name, "description": row.definition.description, "completion_criteria": row.definition.completion_criteria, "domain": _domain(row.definition.domain), "domains": domains, "position": {"x": row.position_x, "y": row.position_y}}
 
 
 def get_template(database_url: str, template_id: str) -> Optional[Dict[str, object]]:
     with session_scope(database_url) as session:
-        row = session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.id == template_id).options(selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domain), selectinload(WorkflowTemplateRow.edges)))
+        row = session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.id == template_id).options(selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domain), selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domains), selectinload(WorkflowTemplateRow.edges)))
         if row is None:
             return None
         return {**_template_summary(row), "nodes": [_template_node(node) for node in row.nodes], "edges": [{"id": edge.id, "source": edge.source_node_id, "target": edge.target_node_id} for edge in row.edges]}
@@ -263,6 +286,7 @@ def add_template_node(database_url: str, template_id: str, data: Mapping[str, ob
         session.flush()
         session.refresh(row, ["definition"])
         _ = row.definition.domain
+        _ = row.definition.domains
         return _template_node(row)
 
 
@@ -276,6 +300,7 @@ def move_template_node(database_url: str, node_id: str, data: Mapping[str, objec
         session.flush()
         session.refresh(row, ["definition"])
         _ = row.definition.domain
+        _ = row.definition.domains
         return _template_node(row)
 
 
@@ -538,8 +563,17 @@ def trigger_job(database_url: str, job_id: str) -> Optional[Dict[str, object]]:
         row = session.get(ScheduledJobRow, job_id)
         if row is None:
             return None
+        now = _utc_now()
         row.enabled = True
-        row.next_run_at = _utc_now()
+        row.next_run_at = now
+        if row.job_type == "outbox_delivery":
+            retryable = session.scalars(select(NotificationOutboxRow).where(NotificationOutboxRow.status.in_(["pending", "dead"])))
+            for notification in retryable:
+                if notification.status == "dead":
+                    notification.status = "pending"
+                    notification.attempt_count = 0
+                    notification.last_error = None
+                notification.available_at = now
         session.flush()
         return _job(row)
 
@@ -559,7 +593,7 @@ def enqueue_notification(database_url: str, payload: Mapping[str, object], *, de
 def list_notifications(database_url: str, limit: int = 100) -> List[Dict[str, object]]:
     with session_scope(database_url) as session:
         rows = session.scalars(select(NotificationOutboxRow).order_by(NotificationOutboxRow.created_at.desc()).limit(limit))
-        return [{"id": row.id, "status": row.status, "attempt_count": row.attempt_count, "last_error": row.last_error, "sent_at": row.sent_at, "created_at": row.created_at} for row in rows]
+        return [{"id": row.id, "status": row.status, "attempt_count": row.attempt_count, "last_error": row.last_error, "available_at": row.available_at, "sent_at": row.sent_at, "created_at": row.created_at} for row in rows]
 
 
 def _masked_url(value: Optional[str]) -> Optional[str]:

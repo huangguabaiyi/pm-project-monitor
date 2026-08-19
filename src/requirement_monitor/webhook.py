@@ -116,7 +116,10 @@ class WebhookSender:
                 format_used=format_used,
                 retry=True,
             )
-            if result.error != "card_format_rejected":
+            should_fallback_to_text = result.error == "card_format_rejected" or (
+                format_used == "card" and result.feishu_code == 19024
+            )
+            if not should_fallback_to_text:
                 return result
 
             fallback_payload = self._with_bot_keyword(
@@ -159,20 +162,24 @@ class WebhookSender:
             return payload
 
         prepared = copy.deepcopy(dict(payload))
-        if self._keyword_is_visible(prepared, keyword):
-            return prepared
-
         if prepared.get("msg_type") == "text":
             content = prepared.get("content")
             if isinstance(content, dict) and isinstance(content.get("text"), str):
                 text = content["text"]
-                content["text"] = "{} {}".format(keyword, text).rstrip()
+                if not text.startswith(keyword):
+                    text_without_keyword = text.replace(keyword, "").strip()
+                    content["text"] = "{} {}".format(keyword, text_without_keyword).rstrip()
+            return prepared
+
+        if self._keyword_is_visible(prepared, keyword):
             return prepared
 
         if prepared.get("msg_type") != "interactive":
             return prepared
         card = prepared.get("card")
         if not isinstance(card, dict):
+            return prepared
+        if self._prepend_keyword_to_card_body(card, keyword):
             return prepared
         header = card.get("header")
         if not isinstance(header, dict):
@@ -185,6 +192,19 @@ class WebhookSender:
             return prepared
         header["title"] = {"tag": "plain_text", "content": keyword}
         return prepared
+
+    @staticmethod
+    def _prepend_keyword_to_card_body(card: Dict[str, Any], keyword: str) -> bool:
+        elements = card.get("elements")
+        if not isinstance(elements, list):
+            return False
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            if element.get("tag") == "markdown" and isinstance(element.get("content"), str):
+                element["content"] = "{}\n{}".format(keyword, element["content"]).rstrip()
+                return True
+        return False
 
     @staticmethod
     def _keyword_is_visible(payload: Mapping[str, Any], keyword: str) -> bool:
@@ -391,8 +411,8 @@ class WebhookSender:
         lines = []
         card = payload.get("card")
         if isinstance(card, Mapping):
-            WebhookSender._collect_text(card.get("header"), lines)
             WebhookSender._collect_text(card.get("elements"), lines)
+            WebhookSender._collect_text(card.get("header"), lines)
         text = "\n".join(line for line in lines if line.strip()) or "通知"
         text = WebhookSender._truncate_text_payload(text)
         return {"msg_type": "text", "content": {"text": text}}

@@ -6,7 +6,8 @@ import { Empty,Field,Loading,PageHead,Toast } from '../components'
 import type { Definition,Domain,Template,TemplateNode } from '../types'
 
 type Tab='domains'|'definitions'|'templates'
-function PaletteNode({data}:{data:{node:TemplateNode}}){const n=data.node;return <div className="template-node" style={{'--domain':n.domain.color} as React.CSSProperties}><Handle type="target" position={Position.Left}/><span>{n.domain.name}</span><strong>{n.name}</strong><small>{n.completion_criteria||'未设置完成标准'}</small><Handle type="source" position={Position.Right}/></div>}
+const domainNames=(domains?:Domain[],fallback?:Domain)=>domains?.length?domains.map(domain=>domain.name).join('、'):fallback?.name||'未分组'
+function PaletteNode({data}:{data:{node:TemplateNode}}){const n=data.node;return <div className="template-node" style={{'--domain':n.domain.color} as React.CSSProperties}><Handle type="target" position={Position.Left}/><span>{domainNames(n.domains,n.domain)}</span><strong>{n.name}</strong><small>{n.completion_criteria||'未设置完成标准'}</small><Handle type="source" position={Position.Right}/></div>}
 const nodeTypes={template:PaletteNode}
 
 export default function WorkflowConfig(){const [tab,setTab]=useState<Tab>('templates');return <><PageHead eyebrow="配置中心" title="通用交付配置" description="先定义交付领域和节点，再通过拖动与连线组成可复用的串并行模板。"/><div className="tabs"><button className={tab==='domains'?'active':''} onClick={()=>setTab('domains')}><Layers3/>交付领域</button><button className={tab==='definitions'?'active':''} onClick={()=>setTab('definitions')}><Link2/>通用节点</button><button className={tab==='templates'?'active':''} onClick={()=>setTab('templates')}><GitFork/>可视化模板</button></div>{tab==='domains'?<Domains/>:tab==='definitions'?<Definitions/>:<Templates/>}</>}
@@ -32,14 +33,20 @@ function Domains(){
     try{await api.patch(`/domains/${editing.id}`,body);setEditing(undefined);setMessage('交付领域已更新');setError('');await load()}
     catch(err){setError((err as Error).message)}
   }
+  async function deactivate(domain:Domain){
+    if(!window.confirm(`停用领域「${domain.name}」？已有需求和节点快照不会被删除。`))return
+    try{await api.del(`/domains/${domain.id}`);setEditing(undefined);setMessage('交付领域已停用');setError('');await load()}
+    catch(err){setError((err as Error).message)}
+  }
   if(!items)return <Loading/>
-  return <div className="config-split"><form className="panel config-form" onSubmit={editing?save:add}><div className="form-title-row"><div><h2>{editing?'编辑交付领域':'新建交付领域'}</h2><p>领域用于为节点分类和着色。</p></div>{editing&&<button type="button" className="icon" onClick={()=>setEditing(undefined)}><X size={16}/></button>}</div><Field label="领域名称"><input name="name" required placeholder="例如：设计" defaultValue={editing?.name||''} key={`domain-name-${editing?.id||'new'}`}/></Field><Field label="标识颜色"><input name="color" type="color" defaultValue={editing?.color||'#2f7d57'} key={`domain-color-${editing?.id||'new'}`}/></Field><Field label="说明"><textarea name="description" defaultValue={editing?.description||''} key={`domain-desc-${editing?.id||'new'}`}/></Field>{editing&&<label className="check"><input name="active" type="checkbox" defaultChecked={editing.active}/>使用中</label>}<button className="button primary">{editing?<><Save size={16}/>保存修改</>:<><Plus size={16}/>创建领域</>}</button></form><div className="panel config-list"><div className="section-head"><div><h2>已有领域</h2><p>{items.length} 个领域</p></div></div>{items.map(d=><div className="domain-row editable" key={d.id}><i style={{background:d.color}}/><div><strong>{d.name}</strong><span>{d.description||'暂无说明'}</span></div><b>{d.active?'使用中':'已停用'}</b><button className="icon" onClick={()=>setEditing(d)}><Edit3 size={15}/></button></div>)}</div>{message&&<Toast text={message}/>} {error&&<Toast text={error} type="error"/>}</div>
+  return <div className="config-split"><form className="panel config-form" onSubmit={editing?save:add}><div className="form-title-row"><div><h2>{editing?'编辑交付领域':'新建交付领域'}</h2><p>领域用于为节点分类和着色。</p></div>{editing&&<button type="button" className="icon" onClick={()=>setEditing(undefined)}><X size={16}/></button>}</div><Field label="领域名称"><input name="name" required placeholder="例如：设计" defaultValue={editing?.name||''} key={`domain-name-${editing?.id||'new'}`}/></Field><Field label="标识颜色"><input name="color" type="color" defaultValue={editing?.color||'#2f7d57'} key={`domain-color-${editing?.id||'new'}`}/></Field><Field label="说明"><textarea name="description" defaultValue={editing?.description||''} key={`domain-desc-${editing?.id||'new'}`}/></Field>{editing&&<label className="check"><input name="active" type="checkbox" defaultChecked={editing.active}/>使用中</label>}<button className="button primary">{editing?<><Save size={16}/>保存修改</>:<><Plus size={16}/>创建领域</>}</button></form><div className="panel config-list"><div className="section-head"><div><h2>已有领域</h2><p>{items.length} 个领域</p></div></div>{items.map(d=><div className="domain-row editable" key={d.id}><i style={{background:d.color}}/><div><strong>{d.name}</strong><span>{d.description||'暂无说明'}</span></div><b>{d.active?'使用中':'已停用'}</b><div className="row-actions"><button className="icon" onClick={()=>setEditing(d)}><Edit3 size={15}/></button><button className="icon" onClick={()=>deactivate(d)} disabled={!d.active}><Trash2 size={15}/></button></div></div>)}</div>{message&&<Toast text={message}/>} {error&&<Toast text={error} type="error"/>}</div>
 }
 
 function Definitions(){
   const [items,setItems]=useState<Definition[]>()
   const [domains,setDomains]=useState<Domain[]>([])
   const [editing,setEditing]=useState<Definition>()
+  const [domainTab,setDomainTab]=useState<string>('all')
   const [message,setMessage]=useState('')
   const [error,setError]=useState('')
   const load=()=>Promise.all([api.get<Definition[]>('/node-definitions'),api.get<Domain[]>('/domains')]).then(([d,ds])=>{setItems(d);setDomains(ds)})
@@ -47,19 +54,30 @@ function Definitions(){
   async function add(e:FormEvent<HTMLFormElement>){
     e.preventDefault()
     const fd=new FormData(e.currentTarget)
-    try{await api.post('/node-definitions',Object.fromEntries(fd));e.currentTarget.reset();setMessage('通用节点已创建');setError('');await load()}
+    const body={...Object.fromEntries(fd),domain_ids:fd.getAll('domain_ids').map(String)}
+    if(!body.domain_ids.length){setError('请至少选择一个所属领域');return}
+    try{await api.post('/node-definitions',body);e.currentTarget.reset();setMessage('通用节点已创建');setError('');await load()}
     catch(err){setError((err as Error).message)}
   }
   async function save(e:FormEvent<HTMLFormElement>){
     e.preventDefault()
     if(!editing)return
     const fd=new FormData(e.currentTarget)
-    const body={...Object.fromEntries(fd),active:fd.get('active')==='on'}
+    const body={...Object.fromEntries(fd),domain_ids:fd.getAll('domain_ids').map(String),active:fd.get('active')==='on'}
+    if(!body.domain_ids.length){setError('请至少选择一个所属领域');return}
     try{await api.patch(`/node-definitions/${editing.id}`,body);setEditing(undefined);setMessage('通用节点已更新');setError('');await load()}
     catch(err){setError((err as Error).message)}
   }
+  async function deactivate(definition:Definition){
+    if(!window.confirm(`停用环节「${definition.name}」？已有需求快照不会被删除。`))return
+    try{await api.del(`/node-definitions/${definition.id}`);setEditing(undefined);setMessage('通用节点已停用');setError('');await load()}
+    catch(err){setError((err as Error).message)}
+  }
   if(!items)return <Loading/>
-  return <div className="config-split"><form className="panel config-form" onSubmit={editing?save:add}><div className="form-title-row"><div><h2>{editing?'编辑通用节点':'新建通用节点'}</h2><p>节点只描述交付动作与完成标准，不预设耗时。</p></div>{editing&&<button type="button" className="icon" onClick={()=>setEditing(undefined)}><X size={16}/></button>}</div><Field label="节点名称"><input name="name" required placeholder="例如：视觉验收" defaultValue={editing?.name||''} key={`def-name-${editing?.id||'new'}`}/></Field><Field label="所属领域"><select name="domain_id" required defaultValue={editing?.domain_id||''} key={`def-domain-${editing?.id||'new'}`}><option value="" disabled>选择领域</option>{domains.filter(d=>d.active||d.id===editing?.domain_id).map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field><Field label="说明"><textarea name="description" defaultValue={editing?.description||''} key={`def-desc-${editing?.id||'new'}`}/></Field><Field label="完成标准"><textarea name="completion_criteria" placeholder="怎样算这个节点完成" defaultValue={editing?.completion_criteria||''} key={`def-criteria-${editing?.id||'new'}`}/></Field>{editing&&<label className="check"><input name="active" type="checkbox" defaultChecked={editing.active}/>使用中</label>}<button className="button primary">{editing?<><Save size={16}/>保存修改</>:<><Plus size={16}/>创建节点</>}</button></form><div className="panel config-list"><div className="section-head"><div><h2>节点库</h2><p>拖入模板后才能形成交付流程</p></div></div>{items.map(n=><div className="definition-row editable" key={n.id}><i style={{background:n.domain.color}}/><div><span>{n.domain.name}{n.active?'':' · 已停用'}</span><strong>{n.name}</strong><small>{n.completion_criteria||'未设置完成标准'}</small></div><button className="icon" onClick={()=>setEditing(n)}><Edit3 size={15}/></button></div>)}</div>{message&&<Toast text={message}/>} {error&&<Toast text={error} type="error"/>}</div>
+  const selectedDomainIds=editing?.domain_ids?.length?editing.domain_ids:[editing?.domain_id||''].filter(Boolean)
+  const visibleItems=domainTab==='all'?items:items.filter(item=>(item.domain_ids?.length?item.domain_ids:[item.domain_id]).includes(domainTab))
+  const domainTabs=domains.filter(domain=>items.some(item=>(item.domain_ids?.length?item.domain_ids:[item.domain_id]).includes(domain.id)))
+  return <div className="config-split"><form className="panel config-form" onSubmit={editing?save:add}><div className="form-title-row"><div><h2>{editing?'编辑通用节点':'新建通用节点'}</h2><p>节点只描述交付动作与完成标准，不预设耗时。</p></div>{editing&&<button type="button" className="icon" onClick={()=>setEditing(undefined)}><X size={16}/></button>}</div><Field label="节点名称"><input name="name" required placeholder="例如：视觉验收" defaultValue={editing?.name||''} key={`def-name-${editing?.id||'new'}`}/></Field><Field label="所属领域" hint="可多选；第一个勾选的领域会作为画布主色"><div className="checkbox-list" key={`def-domain-${editing?.id||'new'}`}>{domains.filter(d=>d.active||selectedDomainIds.includes(d.id)).map(d=><label key={d.id}><input name="domain_ids" type="checkbox" value={d.id} defaultChecked={selectedDomainIds.includes(d.id)}/><i style={{background:d.color}}/>{d.name}</label>)}</div></Field><Field label="说明"><textarea name="description" defaultValue={editing?.description||''} key={`def-desc-${editing?.id||'new'}`}/></Field><Field label="完成标准"><textarea name="completion_criteria" placeholder="怎样算这个节点完成" defaultValue={editing?.completion_criteria||''} key={`def-criteria-${editing?.id||'new'}`}/></Field>{editing&&<label className="check"><input name="active" type="checkbox" defaultChecked={editing.active}/>使用中</label>}<button className="button primary">{editing?<><Save size={16}/>保存修改</>:<><Plus size={16}/>创建节点</>}</button></form><div className="panel config-list"><div className="section-head"><div><h2>节点库</h2><p>按领域管理通用交付环节</p></div></div><div className="domain-tabs"><button className={domainTab==='all'?'active':''} onClick={()=>setDomainTab('all')}>全部</button>{domainTabs.map(domain=><button className={domainTab===domain.id?'active':''} key={domain.id} onClick={()=>setDomainTab(domain.id)}><i style={{background:domain.color}}/>{domain.name}</button>)}</div>{visibleItems.map(n=><div className="definition-row editable" key={n.id}><i style={{background:n.domain.color}}/><div><span>{domainNames(n.domains,n.domain)}{n.active?'':' · 已停用'}</span><strong>{n.name}</strong><small>{n.completion_criteria||'未设置完成标准'}</small></div><div className="row-actions"><button className="icon" onClick={()=>setEditing(n)}><Edit3 size={15}/></button><button className="icon" onClick={()=>deactivate(n)} disabled={!n.active}><Trash2 size={15}/></button></div></div>)}</div>{message&&<Toast text={message}/>} {error&&<Toast text={error} type="error"/>}</div>
 }
 
 function Templates(){

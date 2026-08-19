@@ -10,7 +10,7 @@ def test_schema_contains_new_domain_graph_and_requirement_tables_only(tmp_path: 
     url = f"sqlite+pysqlite:///{tmp_path / 'schema.db'}"
     initialize_database(url)
     tables = set(inspect(create_database_engine(url)).get_table_names())
-    assert {"people", "delivery_domains", "node_definitions", "workflow_templates", "workflow_template_nodes", "workflow_template_edges", "requirements", "requirement_nodes", "requirement_edges", "webhook_settings", "ai_settings"} <= tables
+    assert {"people", "delivery_domains", "node_definitions", "node_definition_domains", "workflow_templates", "workflow_template_nodes", "workflow_template_edges", "requirements", "requirement_nodes", "requirement_edges", "webhook_settings", "ai_settings"} <= tables
     assert "projects" not in tables
     assert "blockers" not in tables
     requirement_columns = {column["name"] for column in inspect(create_database_engine(url)).get_columns("requirements")}
