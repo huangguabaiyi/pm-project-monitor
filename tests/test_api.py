@@ -181,3 +181,36 @@ def test_requirement_ids_increment_without_user_number(tmp_path: Path):
     second = client.post("/api/requirements", json={**payload, "name": "第二个需求"})
     assert first.status_code == second.status_code == 201
     assert [first.json()["sequence_id"], second.json()["sequence_id"]] == [1, 2]
+
+
+def test_admin_export_clear_and_import_roundtrip(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'backup.db'}"
+    client = TestClient(create_app(database_url))
+    person = client.post("/api/people", json={"display_name": "负责人"}).json()
+    domain = client.post("/api/domains", json={"name": "产品"}).json()
+    definition = client.post("/api/node-definitions", json={"name": "评审", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "备份流程"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition["id"]})
+    created = client.post("/api/requirements", json={"name": "备份测试", "owner_id": person["id"], "template_id": template["id"]})
+    assert created.status_code == 201
+    webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/backup-token"
+    client.patch("/api/webhook-settings", json={"enabled": True, "test_webhook_url": webhook})
+
+    exported = client.get("/api/admin/export")
+    assert exported.status_code == 200
+    assert "pm-project-monitor-backup" in exported.headers["content-disposition"]
+    backup = exported.json()
+    assert backup["format"] == "pm-project-monitor.backup"
+    assert backup["tables"]["requirements"][0]["name"] == "备份测试"
+    assert backup["tables"]["webhook_settings"][0]["test_webhook_url"] == webhook
+
+    cleared = client.post("/api/admin/clear", json={"preserve_settings": True})
+    assert cleared.status_code == 200
+    assert client.get("/api/requirements").json() == []
+    assert client.get("/api/webhook-settings").json()["test_configured"] is True
+
+    imported = client.post("/api/admin/import", json={"backup": backup, "preserve_settings": True})
+    assert imported.status_code == 200
+    restored = client.get("/api/requirements").json()
+    assert len(restored) == 1
+    assert restored[0]["name"] == "备份测试"

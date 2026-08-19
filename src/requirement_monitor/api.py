@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import AnyHttpUrl, BaseModel, Field
 
@@ -22,16 +23,19 @@ from .service import (
     create_person,
     create_requirement,
     create_template,
+    clear_data,
     dashboard_summary,
     deactivate_definition,
     deactivate_domain,
     deactivate_person,
     delete_template_edge,
     delete_template_node,
+    export_data,
     get_requirement,
     get_ai_settings,
     get_template,
     get_webhook_settings,
+    import_data,
     list_definitions,
     list_domains,
     list_jobs,
@@ -194,6 +198,15 @@ class AISettingsPatch(BaseModel):
 
 class DeploymentUpdateInput(BaseModel):
     skip_backup: bool = False
+
+
+class DataClearInput(BaseModel):
+    preserve_settings: bool = True
+
+
+class DataImportInput(BaseModel):
+    backup: Dict[str, object]
+    preserve_settings: bool = False
 
 
 def create_app(database_url: Optional[str] = None) -> FastAPI:
@@ -433,6 +446,26 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
             return deployment_updates.start_update(skip_backup=payload.skip_backup)
         except RuntimeError as error:
             raise HTTPException(400, str(error)) from error
+
+    @app.get("/api/admin/export")
+    def admin_export():
+        payload = export_data(db())
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        return JSONResponse(
+            payload,
+            headers={"Content-Disposition": f'attachment; filename="pm-project-monitor-backup-{stamp}.json"'},
+        )
+
+    @app.post("/api/admin/import")
+    def admin_import(payload: DataImportInput):
+        try:
+            return import_data(db(), payload.backup, preserve_settings=payload.preserve_settings)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+
+    @app.post("/api/admin/clear")
+    def admin_clear(payload: DataClearInput):
+        return clear_data(db(), preserve_settings=payload.preserve_settings)
 
     @app.get("/api/notifications")
     def notifications(limit: int = Query(default=100, ge=1, le=500)):

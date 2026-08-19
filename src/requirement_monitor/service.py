@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Mapping, Optional, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import Boolean, DateTime, func, insert, select
 from sqlalchemy.orm import selectinload
 
 from .ai_analysis import (
@@ -17,6 +17,7 @@ from .ai_analysis import (
 )
 from .database import (
     AISettingsRow,
+    Base,
     DeliveryDomainRow,
     JobRunRow,
     NodeDefinitionRow,
@@ -31,6 +32,7 @@ from .database import (
     WorkflowTemplateNodeRow,
     WorkflowTemplateRow,
     WebhookSettingsRow,
+    create_database_engine,
     _new_id,
     _utc_now,
     session_scope,
@@ -40,6 +42,28 @@ from .webhook_url import is_allowed_webhook_url
 
 
 NODE_STATUSES = {"not_started", "in_progress", "blocked", "completed", "skipped"}
+BACKUP_FORMAT_VERSION = 1
+SETTINGS_TABLES = {"webhook_settings", "ai_settings", "scheduled_jobs"}
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _database_tables():
+    return list(Base.metadata.sorted_tables)
+
+
+def _restore_value(value: object, column) -> object:
+    if value is None:
+        return None
+    if isinstance(column.type, DateTime) and isinstance(value, str):
+        return _datetime(value)
+    if isinstance(column.type, Boolean) and isinstance(value, bool):
+        return value
+    return value
 
 
 def _datetime(value) -> Optional[datetime]:
@@ -49,6 +73,79 @@ def _datetime(value) -> Optional[datetime]:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def export_data(database_url: str) -> Dict[str, object]:
+    engine = create_database_engine(database_url)
+    tables: Dict[str, List[Dict[str, object]]] = {}
+    with engine.connect() as connection:
+        for table in _database_tables():
+            rows = connection.execute(select(table)).mappings().all()
+            tables[table.name] = [
+                {key: _json_value(value) for key, value in row.items()}
+                for row in rows
+            ]
+    return {
+        "format": "pm-project-monitor.backup",
+        "version": BACKUP_FORMAT_VERSION,
+        "exported_at": _utc_now().isoformat(),
+        "tables": tables,
+    }
+
+
+def clear_data(database_url: str, *, preserve_settings: bool = True) -> Dict[str, object]:
+    engine = create_database_engine(database_url)
+    deleted: Dict[str, int] = {}
+    with engine.begin() as connection:
+        for table in reversed(_database_tables()):
+            if preserve_settings and table.name in SETTINGS_TABLES:
+                continue
+            result = connection.execute(table.delete())
+            deleted[table.name] = result.rowcount or 0
+    return {"ok": True, "preserve_settings": preserve_settings, "deleted": deleted}
+
+
+def import_data(database_url: str, backup: Mapping[str, object], *, preserve_settings: bool = False) -> Dict[str, object]:
+    if backup.get("format") != "pm-project-monitor.backup":
+        raise ValueError("invalid backup format")
+    if int(backup.get("version") or 0) != BACKUP_FORMAT_VERSION:
+        raise ValueError("unsupported backup version")
+    raw_tables = backup.get("tables")
+    if not isinstance(raw_tables, Mapping):
+        raise ValueError("backup tables are missing")
+    tables_by_name = {table.name: table for table in _database_tables()}
+    unknown = sorted(set(raw_tables) - set(tables_by_name))
+    if unknown:
+        raise ValueError("backup contains unknown tables: {}".format(", ".join(unknown)))
+
+    engine = create_database_engine(database_url)
+    imported: Dict[str, int] = {}
+    with engine.begin() as connection:
+        for table in reversed(_database_tables()):
+            if preserve_settings and table.name in SETTINGS_TABLES:
+                continue
+            connection.execute(table.delete())
+        for table in _database_tables():
+            if preserve_settings and table.name in SETTINGS_TABLES:
+                continue
+            rows = raw_tables.get(table.name, [])
+            if not isinstance(rows, list):
+                raise ValueError("backup table {} must be a list".format(table.name))
+            payload = []
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    raise ValueError("backup table {} contains invalid row".format(table.name))
+                payload.append(
+                    {
+                        column.name: _restore_value(row[column.name], column)
+                        for column in table.columns
+                        if column.name in row
+                    }
+                )
+            if payload:
+                connection.execute(insert(table), payload)
+            imported[table.name] = len(payload)
+    return {"ok": True, "preserve_settings": preserve_settings, "imported": imported}
 
 
 def _person(row: PersonRow) -> Dict[str, object]:
