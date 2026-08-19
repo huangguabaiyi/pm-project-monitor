@@ -143,6 +143,23 @@ def test_job_timer_can_be_updated(tmp_path: Path):
     assert payload["enabled"] is False
     assert payload["next_run_at"].startswith("2026-08-20T09:30:00")
 
+    cron = client.patch(
+        f"/api/jobs/{job_id}",
+        json={
+            "schedule_kind": "cron",
+            "cron_expression": "0 10 * * 1-5",
+            "timezone": "Asia/Shanghai",
+            "next_run_at": None,
+            "enabled": True,
+        },
+    )
+    assert cron.status_code == 200
+    payload = cron.json()
+    assert payload["schedule_kind"] == "cron"
+    assert payload["cron_expression"] == "0 10 * * 1-5"
+    assert payload["timezone"] == "Asia/Shanghai"
+    assert payload["next_run_at"] is not None
+
 
 def test_person_domain_open_id_and_masked_webhook_settings(tmp_path: Path):
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'settings.db'}"))

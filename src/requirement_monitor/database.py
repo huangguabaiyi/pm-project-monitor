@@ -211,6 +211,9 @@ class ScheduledJobRow(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
     name: Mapped[str] = mapped_column(String(255), unique=True)
     job_type: Mapped[str] = mapped_column(String(64))
+    schedule_kind: Mapped[str] = mapped_column(String(32), default="interval")
+    cron_expression: Mapped[Optional[str]] = mapped_column(String(255))
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
     interval_seconds: Mapped[int] = mapped_column(Integer, default=86400)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
@@ -335,6 +338,17 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
         with engine.begin() as connection:
             for column in sorted(missing_links):
                 connection.execute(text(f"ALTER TABLE requirements ADD COLUMN {column} TEXT"))
+    job_columns = {column["name"] for column in inspect(engine).get_columns("scheduled_jobs")}
+    job_migrations = {
+        "schedule_kind": "VARCHAR(32) DEFAULT 'interval'",
+        "cron_expression": "VARCHAR(255)",
+        "timezone": "VARCHAR(64) DEFAULT 'Asia/Shanghai'",
+    }
+    if set(job_migrations) - job_columns:
+        with engine.begin() as connection:
+            for column, sql_type in job_migrations.items():
+                if column not in job_columns:
+                    connection.execute(text(f"ALTER TABLE scheduled_jobs ADD COLUMN {column} {sql_type}"))
     requirement_columns = {column["name"] for column in inspect(engine).get_columns("requirements")}
     ai_columns = {
         "ai_analysis": "JSON",

@@ -173,6 +173,9 @@ class RequirementNodePatch(BaseModel):
 class JobInput(BaseModel):
     name: str
     job_type: str = "risk_scan"
+    schedule_kind: str = "interval"
+    cron_expression: Optional[str] = None
+    timezone: str = "Asia/Shanghai"
     interval_seconds: int = Field(default=86400, ge=10)
     enabled: bool = True
     next_run_at: Optional[str] = None
@@ -180,6 +183,9 @@ class JobInput(BaseModel):
 
 class JobPatch(BaseModel):
     name: Optional[str] = None
+    schedule_kind: Optional[str] = None
+    cron_expression: Optional[str] = None
+    timezone: Optional[str] = None
     interval_seconds: Optional[int] = Field(default=None, ge=10)
     enabled: Optional[bool] = None
     next_run_at: Optional[str] = None

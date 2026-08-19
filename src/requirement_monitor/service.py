@@ -38,11 +38,13 @@ from .database import (
     session_scope,
 )
 from .schedule_risk import RiskLevel, evaluate_schedule
+from .scheduler import next_cron_run, validate_cron
 from .webhook_url import is_allowed_webhook_url
 
 
 NODE_STATUSES = {"not_started", "in_progress", "blocked", "completed", "skipped"}
 JOB_TYPES = {"risk_scan", "outbox_delivery", "ai_analysis"}
+SCHEDULE_KINDS = {"interval", "cron"}
 BACKUP_FORMAT_VERSION = 1
 SETTINGS_TABLES = {"webhook_settings", "ai_settings", "scheduled_jobs"}
 
@@ -630,7 +632,7 @@ def dashboard_summary(database_url: str) -> Dict[str, object]:
 
 
 def _job(row: ScheduledJobRow) -> Dict[str, object]:
-    return {"id": row.id, "name": row.name, "job_type": row.job_type, "interval_seconds": row.interval_seconds, "enabled": row.enabled, "next_run_at": row.next_run_at, "last_run_at": row.last_run_at, "last_status": row.last_status}
+    return {"id": row.id, "name": row.name, "job_type": row.job_type, "schedule_kind": row.schedule_kind or "interval", "cron_expression": row.cron_expression, "timezone": row.timezone or "Asia/Shanghai", "interval_seconds": row.interval_seconds, "enabled": row.enabled, "next_run_at": row.next_run_at, "last_run_at": row.last_run_at, "last_status": row.last_status}
 
 
 def list_jobs(database_url: str) -> List[Dict[str, object]]:
@@ -649,9 +651,18 @@ def create_job(database_url: str, data: Mapping[str, object]) -> Dict[str, objec
             row = ScheduledJobRow(name=name, job_type=job_type)
             session.add(row)
         row.job_type = job_type
+        row.schedule_kind = str(data.get("schedule_kind") or row.schedule_kind or "interval")
+        if row.schedule_kind not in SCHEDULE_KINDS:
+            raise ValueError("invalid schedule kind")
+        row.timezone = str(data.get("timezone") or row.timezone or "Asia/Shanghai")
+        row.cron_expression = str(data.get("cron_expression") or row.cron_expression or "").strip() or None
+        if row.schedule_kind == "cron":
+            if not row.cron_expression:
+                raise ValueError("cron_expression is required")
+            validate_cron(row.cron_expression, row.timezone)
         row.interval_seconds = max(10, int(data.get("interval_seconds") or 86400))
         row.enabled = bool(data.get("enabled", True))
-        row.next_run_at = _datetime(data.get("next_run_at")) or _utc_now()
+        row.next_run_at = _datetime(data.get("next_run_at")) or (next_cron_run(row.cron_expression, row.timezone) if row.schedule_kind == "cron" and row.cron_expression else _utc_now())
         session.flush()
         return _job(row)
 
@@ -673,10 +684,25 @@ def update_job(database_url: str, job_id: str, data: Mapping[str, object]) -> Op
             row.job_type = job_type
         if "interval_seconds" in data and data["interval_seconds"] is not None:
             row.interval_seconds = max(10, int(data["interval_seconds"]))
+        if "schedule_kind" in data and data["schedule_kind"] is not None:
+            schedule_kind = str(data["schedule_kind"])
+            if schedule_kind not in SCHEDULE_KINDS:
+                raise ValueError("invalid schedule kind")
+            row.schedule_kind = schedule_kind
+        if "timezone" in data and data["timezone"] is not None:
+            row.timezone = str(data["timezone"] or "Asia/Shanghai")
+        if "cron_expression" in data:
+            row.cron_expression = str(data["cron_expression"] or "").strip() or None
+        if (row.schedule_kind or "interval") == "cron":
+            if not row.cron_expression:
+                raise ValueError("cron_expression is required")
+            validate_cron(row.cron_expression, row.timezone or "Asia/Shanghai")
         if "enabled" in data and data["enabled"] is not None:
             row.enabled = bool(data["enabled"])
         if "next_run_at" in data:
-            row.next_run_at = _datetime(data["next_run_at"]) or _utc_now()
+            row.next_run_at = _datetime(data["next_run_at"]) or (next_cron_run(row.cron_expression, row.timezone or "Asia/Shanghai") if (row.schedule_kind or "interval") == "cron" else _utc_now())
+        elif any(field in data for field in ("schedule_kind", "cron_expression", "timezone")) and (row.schedule_kind or "interval") == "cron":
+            row.next_run_at = next_cron_run(row.cron_expression, row.timezone or "Asia/Shanghai")
         session.flush()
         return _job(row)
 

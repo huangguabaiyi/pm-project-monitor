@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from .config import load_settings
 from .database import JobRunRow, NotificationDeliveryRow, NotificationOutboxRow, ScheduledJobRow, session_scope
+from .scheduler import next_cron_run
 from .service import analyze_all_requirements, create_job, enqueue_notification, evaluate_all_requirements, get_ai_settings, get_requirement, get_webhook_settings, list_jobs, list_requirements
 from .webhook import WebhookSender
 
@@ -128,7 +129,10 @@ def _claim_due_jobs(database_url: str) -> list[tuple[str, str]]:
             session.add(run)
             job.last_run_at = now
             job.last_status = "running"
-            job.next_run_at = now + timedelta(seconds=max(10, job.interval_seconds))
+            if (job.schedule_kind or "interval") == "cron" and job.cron_expression:
+                job.next_run_at = next_cron_run(job.cron_expression, job.timezone or "Asia/Shanghai", now)
+            else:
+                job.next_run_at = now + timedelta(seconds=max(10, job.interval_seconds))
             session.flush()
             claimed.append((run.id, job.job_type))
             logger.info("job.claimed job_id=%s job_type=%s run_id=%s", job.id, job.job_type, run.id)
