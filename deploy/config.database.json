@@ -1,18 +1,12 @@
 {
-  "data_source": "database",
   "database_url": "postgresql+psycopg://monitor:change-me@db:5432/requirement_monitor",
   "runtime_environment": "test",
   "webhooks": {
     "test": null,
     "prod": null
   },
-  "fixed_rules_path": "/app/固定业务规则",
+  "bot_keyword": "需求交付提醒",
   "timezone": "Asia/Shanghai",
-  "send_hour": 19,
-  "send_minute": 30,
   "state_dir": "/app/.state",
-  "log_dir": "/app/logs",
-  "llm": {
-    "enabled": false
-  }
+  "log_dir": "/app/logs"
 }

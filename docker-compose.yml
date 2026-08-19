@@ -25,6 +25,8 @@ services:
     command: ["requirement-monitor", "api", "--database-url", "postgresql+psycopg://monitor:${POSTGRES_PASSWORD:-change-me}@db:5432/requirement_monitor", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "${MONITOR_PORT:-8000}:8000"
+    volumes:
+      - monitor-codex:/root/.codex
 
   worker:
     build: .
@@ -40,17 +42,17 @@ services:
     volumes:
       - monitor-state:/app/.state
       - monitor-logs:/app/logs
+      - monitor-codex:/root/.codex
       - ./deploy/config.database.json:/app/config.database.json:ro
     command:
       - sh
       - -c
       - >-
         requirement-monitor db-init --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" &&
-        requirement-monitor create-job --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" --name "风险扫描" --job-type risk_scan --interval-seconds 86400 &&
-        requirement-monitor create-job --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" --name "通知投递" --job-type outbox_delivery --interval-seconds 30 &&
         exec requirement-monitor worker --config /app/config.database.json --database-url "$${REQUIREMENT_MONITOR_DATABASE_URL}" --poll-seconds 30
 
 volumes:
   monitor-db:
   monitor-state:
   monitor-logs:
+  monitor-codex:

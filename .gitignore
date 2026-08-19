@@ -8,3 +8,5 @@ __pycache__/
 config.local.json
 .state/
 logs/
+frontend/node_modules/
+*.tsbuildinfo

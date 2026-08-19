@@ -2,69 +2,33 @@
 
 ## Docker Compose
 
-在项目根目录创建 `.env`：
-
-```env
-POSTGRES_PASSWORD=替换为强密码
-MONITOR_PORT=8000
-REQUIREMENT_MONITOR_TEST_WEBHOOK_URL=测试机器人Webhook
-REQUIREMENT_MONITOR_BOT_KEYWORD=需求进展推送
-```
-
-启动：
+无需创建 `.env` 或配置运行环境，直接启动：
 
 ```bash
 docker compose up -d --build
+docker compose exec api requirement-monitor seed-demo
 docker compose ps
 docker compose logs -f worker
 ```
 
-管理页面：`http://Linux主机IP:8000/`
+管理页面：`http://Linux主机IP:8000/`。Worker 会自动创建风险扫描和通知投递任务。
 
-首次启动后，通过页面或 CLI 创建人员、项目、需求和节点。Compose Worker 会自动创建“风险扫描”和“通知投递”两个任务。
+Webhook、AI 开关、第三方 API 凭证和模型都在管理页面配置。ChatGPT Plus 首次启用需在“AI 分析”页面完成一次设备授权，登录凭证保存在 `monitor-codex` 命名卷中。容器升级不会清除该卷。
 
-停止：
+生产环境仍建议通过 `.env` 覆盖默认的 `POSTGRES_PASSWORD` 和 `MONITOR_PORT`，并在反向代理增加 HTTPS 与访问认证；这些不是首次启动的必填项。
 
-```bash
-docker compose down
-```
+## 备份与升级
 
-删除数据库卷前请先备份：
+升级前备份 PostgreSQL：
 
 ```bash
 docker compose exec db pg_dump -U monitor requirement_monitor > backup.sql
 ```
 
-## systemd
-
-适用于直接在 Linux 主机的 Python 虚拟环境运行：
+然后重新构建：
 
 ```bash
-sudo mkdir -p /opt/requirement-monitor
-sudo cp -a . /opt/requirement-monitor/
-cd /opt/requirement-monitor
-uv sync
+docker compose up -d --build
 ```
 
-创建 `/etc/requirement-monitor.env`：
-
-```env
-REQUIREMENT_MONITOR_DATABASE_URL=postgresql+psycopg://monitor:密码@127.0.0.1:5432/requirement_monitor
-REQUIREMENT_MONITOR_TEST_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/测试地址
-REQUIREMENT_MONITOR_BOT_KEYWORD=需求进展推送
-```
-
-把 `deploy/config.database.json` 复制为 `/opt/requirement-monitor/config.database.json`，并将其中路径改成 Linux 实际路径。
-
-安装服务：
-
-```bash
-sudo cp deploy/systemd/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now requirement-monitor-api.service
-sudo systemctl enable --now requirement-monitor-worker.service
-sudo systemctl status requirement-monitor-api.service
-sudo systemctl status requirement-monitor-worker.service
-```
-
-Worker 是常驻进程，每 30 秒扫描到期任务和待发送 Outbox；systemd 会在进程崩溃、主机重启后自动恢复。
+数据库初始化使用安全的 `create_all`，已有表和数据不会在启动时删除。当前版本尚未内置复杂迁移系统，大版本结构升级前必须保留备份。

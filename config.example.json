@@ -1,24 +1,12 @@
 {
-  "data_source": "bitable",
-  "bitable_url": "https://mi.feishu.cn/wiki/TA6nwzFi0i4fdOkIamzcxj34nRd?fromScene=spaceOverview&table=tblQlOtlW0xmcKBE&view=vewCeVIyDY",
-  "database_url": null,
+  "database_url": "sqlite+pysqlite:///./.state/pulse.db",
   "runtime_environment": "test",
   "webhooks": {
     "test": null,
     "prod": null
   },
-  "bot_keyword": "需求进展推送",
-  "fixed_rules_path": "固定业务规则",
+  "bot_keyword": "需求交付提醒",
   "timezone": "Asia/Shanghai",
-  "send_hour": 19,
-  "send_minute": 30,
   "state_dir": ".state",
-  "log_dir": "logs",
-  "llm": {
-    "enabled": false,
-    "base_url": null,
-    "api_key": null,
-    "model": null,
-    "timeout_seconds": 20
-  }
+  "log_dir": "logs"
 }
