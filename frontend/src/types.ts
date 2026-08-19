@@ -13,3 +13,4 @@ export type Job = { id:string; name:string; job_type:string; interval_seconds:nu
 export type WebhookSettings = { enabled:boolean; runtime_environment:'test'|'prod'; test_webhook_url?:string; prod_webhook_url?:string; test_configured:boolean; prod_configured:boolean; bot_keyword:string; updated_at?:string }
 export type AISettings = { enabled:boolean; provider:'chatgpt_plus'|'openai_compatible'; base_url:string; api_key?:string; api_key_configured:boolean; model:string; prompt:string; include_in_feishu:boolean; auto_analyze:boolean; updated_at?:string }
 export type PlusLoginStatus = { installed:boolean; authenticated:boolean; running:boolean; output:string; status_text?:string }
+export type DeploymentUpdateStatus = { enabled:boolean; running:boolean; repo_path:string; script_exists:boolean; branch?:string; last_started_at?:string; last_finished_at?:string; last_exit_code?:number; last_output:string }

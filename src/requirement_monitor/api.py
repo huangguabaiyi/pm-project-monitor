@@ -11,6 +11,7 @@ from pydantic import AnyHttpUrl, BaseModel, Field
 
 from .ai_analysis import plus_login_manager
 from .database import initialize_database
+from .deployment import deployment_updates
 from .service import (
     add_template_edge,
     add_template_node,
@@ -187,6 +188,10 @@ class AISettingsPatch(BaseModel):
     prompt: Optional[str] = None
     include_in_feishu: Optional[bool] = None
     auto_analyze: Optional[bool] = None
+
+
+class DeploymentUpdateInput(BaseModel):
+    skip_backup: bool = False
 
 
 def create_app(database_url: Optional[str] = None) -> FastAPI:
@@ -408,6 +413,24 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
         if result is None:
             raise HTTPException(404, "job not found")
         return result
+
+    @app.get("/api/deployment/update-status")
+    def deployment_update_status():
+        return deployment_updates.status()
+
+    @app.post("/api/deployment/check-updates")
+    def deployment_update_check():
+        try:
+            return deployment_updates.check_updates()
+        except RuntimeError as error:
+            raise HTTPException(400, str(error)) from error
+
+    @app.post("/api/deployment/apply-update")
+    def deployment_update_apply(payload: DeploymentUpdateInput):
+        try:
+            return deployment_updates.start_update(skip_backup=payload.skip_backup)
+        except RuntimeError as error:
+            raise HTTPException(400, str(error)) from error
 
     @app.get("/api/notifications")
     def notifications(limit: int = Query(default=100, ge=1, le=500)):

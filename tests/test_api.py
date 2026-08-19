@@ -50,6 +50,16 @@ def test_removed_project_and_blocker_routes_do_not_exist(tmp_path: Path):
     assert client.get("/api/nodes").status_code == 404
 
 
+def test_deployment_update_is_disabled_by_default(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("REQUIREMENT_MONITOR_DEPLOY_UPDATE_ENABLED", raising=False)
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'deploy.db'}"))
+    status = client.get("/api/deployment/update-status")
+    assert status.status_code == 200
+    assert status.json()["enabled"] is False
+    assert client.post("/api/deployment/check-updates", json={}).status_code == 400
+    assert client.post("/api/deployment/apply-update", json={}).status_code == 400
+
+
 def test_person_domain_open_id_and_masked_webhook_settings(tmp_path: Path):
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'settings.db'}"))
     domain = client.post("/api/domains", json={"name": "服务端", "color": "#248052"}).json()
