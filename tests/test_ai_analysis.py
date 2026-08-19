@@ -64,3 +64,5 @@ def test_requirement_ai_input_uses_explicit_shanghai_times():
     )
     assert payload["nodes"][0]["planned_start"] == "2026-08-22T09:00:00+08:00"
     assert payload["nodes"][0]["planned_end"] == "2026-08-22T18:00:00+08:00"
+    assert "actual_start" not in payload["nodes"][0]
+    assert "actual_end" not in payload["nodes"][0]

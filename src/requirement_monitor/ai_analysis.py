@@ -16,7 +16,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 
-DEFAULT_AI_PROMPT = """你是资深项目交付风险分析助手。请根据需求基本信息、交付节点、节点依赖、负责人、计划时间、实际状态、节点备注、受阻原因和规则风险进行综合判断。
+DEFAULT_AI_PROMPT = """你是资深项目交付风险分析助手。请根据需求基本信息、交付节点、节点依赖、负责人、计划时间、当前状态、节点备注、受阻原因和规则风险进行综合判断。
 
 分析原则：
 1. 已经逾期、依赖冲突等确定性规则风险不能被 AI 降级。
@@ -24,7 +24,8 @@ DEFAULT_AI_PROMPT = """你是资深项目交付风险分析助手。请根据需
 3. 后置节点已设置时间而前置节点缺失时间时，必须说明排期完整性风险。
 4. 不猜测未提供的事实；信息不足时写入 missing_information。
 5. 建议必须具体、可执行、按优先级排序。
-6. 只返回符合给定 JSON Schema 的对象，不输出 Markdown 或额外说明。"""
+6. 节点状态切换时间不代表真实开始或完成时间，不要据此推断实际执行时长。
+7. 只返回符合给定 JSON Schema 的对象，不输出 Markdown 或额外说明。"""
 
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -92,8 +93,6 @@ def requirement_ai_input(requirement: Mapping[str, object]) -> Dict[str, object]
                 "domain": node.get("domain_name"),
                 "planned_start": _ai_datetime(node.get("planned_start")),
                 "planned_end": _ai_datetime(node.get("planned_end")),
-                "actual_start": _ai_datetime(node.get("actual_start")),
-                "actual_end": _ai_datetime(node.get("actual_end")),
                 "status": node.get("status"),
                 "owners": [person.get("display_name") for person in node.get("owners") or [] if isinstance(person, Mapping)],
                 "notes": node.get("notes"),
