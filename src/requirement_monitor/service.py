@@ -45,6 +45,7 @@ from .webhook_url import is_allowed_webhook_url
 NODE_STATUSES = {"not_started", "in_progress", "blocked", "completed", "skipped"}
 JOB_TYPES = {"risk_scan", "outbox_delivery", "ai_analysis"}
 SCHEDULE_KINDS = {"interval", "cron"}
+NOTIFICATION_SCOPES = {"all", "risk_only"}
 BACKUP_FORMAT_VERSION = 1
 SETTINGS_TABLES = {"webhook_settings", "ai_settings", "scheduled_jobs"}
 
@@ -76,6 +77,13 @@ def _datetime(value) -> Optional[datetime]:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _api_datetime(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return normalized.astimezone(timezone.utc).isoformat()
 
 
 def export_data(database_url: str) -> Dict[str, object]:
@@ -358,13 +366,13 @@ def update_template(database_url: str, template_id: str, data: Mapping[str, obje
 
 
 def _template_node(row: WorkflowTemplateNodeRow) -> Dict[str, object]:
-    domains = [_domain(domain) for domain in (row.definition.domains or [row.definition.domain])]
-    return {"id": row.id, "definition_id": row.definition_id, "name": row.definition.name, "description": row.definition.description, "completion_criteria": row.definition.completion_criteria, "domain": _domain(row.definition.domain), "domains": domains, "position": {"x": row.position_x, "y": row.position_y}}
+    domain = row.domain or row.definition.domain
+    return {"id": row.id, "definition_id": row.definition_id, "domain_id": domain.id, "name": row.definition.name, "description": row.definition.description, "completion_criteria": row.definition.completion_criteria, "domain": _domain(domain), "domains": [_domain(domain)], "position": {"x": row.position_x, "y": row.position_y}}
 
 
 def get_template(database_url: str, template_id: str) -> Optional[Dict[str, object]]:
     with session_scope(database_url) as session:
-        row = session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.id == template_id).options(selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domain), selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domains), selectinload(WorkflowTemplateRow.edges)))
+        row = session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.id == template_id).options(selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domain), selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.domain), selectinload(WorkflowTemplateRow.edges)))
         if row is None:
             return None
         return {**_template_summary(row), "nodes": [_template_node(node) for node in row.nodes], "edges": [{"id": edge.id, "source": edge.source_node_id, "target": edge.target_node_id} for edge in row.edges]}
@@ -372,19 +380,25 @@ def get_template(database_url: str, template_id: str) -> Optional[Dict[str, obje
 
 def add_template_node(database_url: str, template_id: str, data: Mapping[str, object]) -> Dict[str, object]:
     definition_id = str(data.get("definition_id") or "")
+    requested_domain_id = str(data.get("domain_id") or "")
     with session_scope(database_url) as session:
         template = session.get(WorkflowTemplateRow, template_id)
-        definition = session.get(NodeDefinitionRow, definition_id)
+        definition = session.scalar(select(NodeDefinitionRow).where(NodeDefinitionRow.id == definition_id).options(selectinload(NodeDefinitionRow.domain), selectinload(NodeDefinitionRow.domains)))
         if template is None or definition is None:
             raise ValueError("template or node definition not found")
-        duplicate = session.scalar(select(WorkflowTemplateNodeRow).where(WorkflowTemplateNodeRow.template_id == template_id, WorkflowTemplateNodeRow.definition_id == definition_id))
+        domain_id = requested_domain_id or definition.domain_id
+        domain = session.get(DeliveryDomainRow, domain_id)
+        definition_domain_ids = {item.id for item in (definition.domains or [definition.domain])}
+        if domain is None or domain_id not in definition_domain_ids:
+            raise ValueError("domain is not assigned to this node definition")
+        duplicate = session.scalar(select(WorkflowTemplateNodeRow).where(WorkflowTemplateNodeRow.template_id == template_id, WorkflowTemplateNodeRow.definition_id == definition_id, WorkflowTemplateNodeRow.domain_id == domain_id))
         if duplicate is not None:
-            raise ValueError("node already exists in this template")
-        row = WorkflowTemplateNodeRow(template_id=template_id, definition_id=definition_id, position_x=float(data.get("position_x") or 0), position_y=float(data.get("position_y") or 0))
+            raise ValueError("node domain already exists in this template")
+        row = WorkflowTemplateNodeRow(template_id=template_id, definition_id=definition_id, domain_id=domain_id, position_x=float(data.get("position_x") or 0), position_y=float(data.get("position_y") or 0))
         session.add(row)
         template.version += 1
         session.flush()
-        session.refresh(row, ["definition"])
+        session.refresh(row, ["definition", "domain"])
         _ = row.definition.domain
         _ = row.definition.domains
         return _template_node(row)
@@ -398,7 +412,7 @@ def move_template_node(database_url: str, node_id: str, data: Mapping[str, objec
         row.position_x = float(data.get("position_x", row.position_x))
         row.position_y = float(data.get("position_y", row.position_y))
         session.flush()
-        session.refresh(row, ["definition"])
+        session.refresh(row, ["definition", "domain"])
         _ = row.definition.domain
         _ = row.definition.domains
         return _template_node(row)
@@ -488,8 +502,8 @@ def _evaluate_requirement(row: RequirementRow, *, persist: bool = False) -> Dict
             node_result = result.node_results[node.id]
             node.risk_level = int(node_result.level)
             node.risk_reasons = node_result.reasons
-    current_names = [node.name for node in row.nodes if node.id in result.current_node_ids]
-    return {"risk_level": int(result.level), "risk_reasons": result.reasons, "completed_nodes": result.completed_nodes, "total_nodes": result.total_nodes, "progress": round(result.completed_nodes / result.total_nodes * 100) if result.total_nodes else 0, "current_nodes": current_names, "planned_completion": result.planned_completion}
+    current = [node for node in row.nodes if node.id in result.current_node_ids]
+    return {"risk_level": int(result.level), "risk_reasons": result.reasons, "completed_nodes": result.completed_nodes, "total_nodes": result.total_nodes, "progress": round(result.completed_nodes / result.total_nodes * 100) if result.total_nodes else 0, "current_nodes": [node.name for node in current], "current_node_ids": [node.id for node in current], "planned_completion": result.planned_completion}
 
 
 def _requirement_dict(row: RequirementRow, *, with_graph: bool = False, persist: bool = False) -> Dict[str, object]:
@@ -511,13 +525,13 @@ def _requirement_dict(row: RequirementRow, *, with_graph: bool = False, persist:
 def list_requirements(database_url: str) -> List[Dict[str, object]]:
     with session_scope(database_url) as session:
         rows = session.scalars(select(RequirementRow).options(selectinload(RequirementRow.owner), selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges)).order_by(RequirementRow.archived, RequirementRow.updated_at.desc()))
-        return [_requirement_dict(row) for row in rows]
+        return [_requirement_dict(row, persist=True) for row in rows]
 
 
 def get_requirement(database_url: str, requirement_id: str) -> Optional[Dict[str, object]]:
     with session_scope(database_url) as session:
         row = session.scalar(select(RequirementRow).where(RequirementRow.id == requirement_id).options(selectinload(RequirementRow.owner), selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges)))
-        return _requirement_dict(row, with_graph=True) if row else None
+        return _requirement_dict(row, with_graph=True, persist=True) if row else None
 
 
 def create_requirement(database_url: str, data: Mapping[str, object]) -> Dict[str, object]:
@@ -528,7 +542,7 @@ def create_requirement(database_url: str, data: Mapping[str, object]) -> Dict[st
         raise ValueError("name, owner_id and template_id are required")
     with session_scope(database_url) as session:
         owner = session.get(PersonRow, owner_id)
-        template = session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.id == template_id).options(selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domain), selectinload(WorkflowTemplateRow.edges)))
+        template = session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.id == template_id).options(selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domain), selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.domain), selectinload(WorkflowTemplateRow.edges)))
         if owner is None or template is None or not template.active:
             raise ValueError("owner or active template not found")
         if not template.nodes:
@@ -547,7 +561,8 @@ def create_requirement(database_url: str, data: Mapping[str, object]) -> Dict[st
         node_map: Dict[str, RequirementNodeRow] = {}
         for template_node in template.nodes:
             definition = template_node.definition
-            node = RequirementNodeRow(requirement_id=row.id, template_node_id=template_node.id, definition_id=definition.id, name=definition.name, domain_name=definition.domain.name, domain_color=definition.domain.color, position_x=template_node.position_x, position_y=template_node.position_y, owners=[owner])
+            domain = template_node.domain or definition.domain
+            node = RequirementNodeRow(requirement_id=row.id, template_node_id=template_node.id, definition_id=definition.id, name=definition.name, domain_name=domain.name, domain_color=domain.color, position_x=template_node.position_x, position_y=template_node.position_y, owners=[owner])
             session.add(node)
             session.flush()
             node_map[template_node.id] = node
@@ -557,7 +572,7 @@ def create_requirement(database_url: str, data: Mapping[str, object]) -> Dict[st
         session.refresh(row, ["owner", "nodes", "edges"])
         for node in row.nodes:
             _ = node.owners
-        return _requirement_dict(row, with_graph=True)
+        return _requirement_dict(row, with_graph=True, persist=True)
 
 
 def update_requirement(database_url: str, requirement_id: str, data: Mapping[str, object]) -> Optional[Dict[str, object]]:
@@ -587,6 +602,10 @@ def update_requirement_node(database_url: str, node_id: str, data: Mapping[str, 
         row = session.scalar(select(RequirementNodeRow).where(RequirementNodeRow.id == node_id).options(selectinload(RequirementNodeRow.owners)))
         if row is None:
             return None
+        if "position_x" in data and data["position_x"] is not None:
+            row.position_x = float(data["position_x"])
+        if "position_y" in data and data["position_y"] is not None:
+            row.position_y = float(data["position_y"])
         for field in ("planned_start", "planned_end"):
             if field in data:
                 setattr(row, field, _datetime(data[field]))
@@ -613,7 +632,106 @@ def update_requirement_node(database_url: str, node_id: str, data: Mapping[str, 
                 row.blocked_reason = ""
             row.status = status
         session.flush()
+        requirement = session.get(RequirementRow, row.requirement_id)
+        if requirement is not None:
+            _evaluate_requirement(requirement, persist=True)
         return _node_dict(row)
+
+
+def add_requirement_node(database_url: str, requirement_id: str, data: Mapping[str, object]) -> Dict[str, object]:
+    definition_id = str(data.get("definition_id") or "")
+    requested_domain_id = str(data.get("domain_id") or "")
+    with session_scope(database_url) as session:
+        requirement = session.scalar(select(RequirementRow).where(RequirementRow.id == requirement_id).options(selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners)))
+        definition = session.scalar(select(NodeDefinitionRow).where(NodeDefinitionRow.id == definition_id).options(selectinload(NodeDefinitionRow.domain), selectinload(NodeDefinitionRow.domains)))
+        if requirement is None or definition is None:
+            raise ValueError("requirement or node definition not found")
+        domain_id = requested_domain_id or definition.domain_id
+        domain = session.get(DeliveryDomainRow, domain_id)
+        allowed_domains = {item.id for item in (definition.domains or [definition.domain])}
+        if domain is None or domain_id not in allowed_domains:
+            raise ValueError("domain is not assigned to this node definition")
+        if any(node.definition_id == definition_id and node.domain_name == domain.name for node in requirement.nodes):
+            raise ValueError("node domain already exists in this requirement")
+        node = RequirementNodeRow(requirement=requirement, template_node_id=str(data.get("template_node_id") or "") or None, definition_id=definition.id, name=definition.name, domain_name=domain.name, domain_color=domain.color, position_x=float(data.get("position_x") or 0), position_y=float(data.get("position_y") or 0), owners=[requirement.owner])
+        session.add(node)
+        session.flush()
+        session.refresh(node, ["owners"])
+        _evaluate_requirement(requirement, persist=True)
+        return _node_dict(node)
+
+
+def delete_requirement_node(database_url: str, node_id: str) -> bool:
+    with session_scope(database_url) as session:
+        row = session.get(RequirementNodeRow, node_id)
+        if row is None:
+            return False
+        requirement = session.get(RequirementRow, row.requirement_id)
+        session.delete(row)
+        session.flush()
+        if requirement is not None:
+            _evaluate_requirement(requirement, persist=True)
+        return True
+
+
+def _would_requirement_cycle(edges: Sequence[RequirementEdgeRow], source: str, target: str) -> bool:
+    graph: Dict[str, List[str]] = {}
+    for edge in edges:
+        graph.setdefault(edge.source_node_id, []).append(edge.target_node_id)
+    graph.setdefault(source, []).append(target)
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> bool:
+        if node in visiting:
+            return True
+        if node in visited:
+            return False
+        visiting.add(node)
+        for next_node in graph.get(node, []):
+            if visit(next_node):
+                return True
+        visiting.remove(node)
+        visited.add(node)
+        return False
+
+    return any(visit(node) for node in list(graph))
+
+
+def add_requirement_edge(database_url: str, requirement_id: str, data: Mapping[str, object]) -> Dict[str, object]:
+    source = str(data.get("source") or "")
+    target = str(data.get("target") or "")
+    if not source or not target or source == target:
+        raise ValueError("source and target must be different nodes")
+    with session_scope(database_url) as session:
+        requirement = session.scalar(select(RequirementRow).where(RequirementRow.id == requirement_id).options(selectinload(RequirementRow.edges)))
+        source_node = session.get(RequirementNodeRow, source)
+        target_node = session.get(RequirementNodeRow, target)
+        if requirement is None or source_node is None or target_node is None or source_node.requirement_id != requirement_id or target_node.requirement_id != requirement_id:
+            raise ValueError("requirement node not found")
+        if any(edge.source_node_id == source and edge.target_node_id == target for edge in requirement.edges):
+            raise ValueError("edge already exists")
+        if _would_requirement_cycle(requirement.edges, source, target):
+            raise ValueError("edge would create a cycle")
+        row = RequirementEdgeRow(requirement_id=requirement_id, source_node_id=source, target_node_id=target)
+        session.add(row)
+        session.flush()
+        requirement.edges.append(row)
+        _evaluate_requirement(requirement, persist=True)
+        return {"id": row.id, "source": source, "target": target}
+
+
+def delete_requirement_edge(database_url: str, edge_id: str) -> bool:
+    with session_scope(database_url) as session:
+        row = session.get(RequirementEdgeRow, edge_id)
+        if row is None:
+            return False
+        requirement = session.get(RequirementRow, row.requirement_id)
+        session.delete(row)
+        session.flush()
+        if requirement is not None:
+            _evaluate_requirement(requirement, persist=True)
+        return True
 
 
 def evaluate_all_requirements(database_url: str) -> Dict[str, int]:
@@ -632,7 +750,7 @@ def dashboard_summary(database_url: str) -> Dict[str, object]:
 
 
 def _job(row: ScheduledJobRow) -> Dict[str, object]:
-    return {"id": row.id, "name": row.name, "job_type": row.job_type, "schedule_kind": row.schedule_kind or "interval", "cron_expression": row.cron_expression, "timezone": row.timezone or "Asia/Shanghai", "interval_seconds": row.interval_seconds, "enabled": row.enabled, "next_run_at": row.next_run_at, "last_run_at": row.last_run_at, "last_status": row.last_status}
+    return {"id": row.id, "name": row.name, "job_type": row.job_type, "schedule_kind": row.schedule_kind or "interval", "cron_expression": row.cron_expression, "timezone": row.timezone or "Asia/Shanghai", "interval_seconds": row.interval_seconds, "notification_scope": row.notification_scope or "risk_only", "enabled": row.enabled, "next_run_at": _api_datetime(row.next_run_at), "last_run_at": _api_datetime(row.last_run_at), "last_status": row.last_status}
 
 
 def list_jobs(database_url: str) -> List[Dict[str, object]]:
@@ -661,8 +779,14 @@ def create_job(database_url: str, data: Mapping[str, object]) -> Dict[str, objec
                 raise ValueError("cron_expression is required")
             validate_cron(row.cron_expression, row.timezone)
         row.interval_seconds = max(10, int(data.get("interval_seconds") or 86400))
+        row.notification_scope = str(data.get("notification_scope") or row.notification_scope or "risk_only")
+        if row.notification_scope not in NOTIFICATION_SCOPES:
+            raise ValueError("invalid notification scope")
         row.enabled = bool(data.get("enabled", True))
-        row.next_run_at = _datetime(data.get("next_run_at")) or (next_cron_run(row.cron_expression, row.timezone) if row.schedule_kind == "cron" and row.cron_expression else _utc_now())
+        if row.schedule_kind == "cron" and row.cron_expression:
+            row.next_run_at = next_cron_run(row.cron_expression, row.timezone)
+        else:
+            row.next_run_at = _datetime(data.get("next_run_at")) or _utc_now()
         session.flush()
         return _job(row)
 
@@ -684,6 +808,11 @@ def update_job(database_url: str, job_id: str, data: Mapping[str, object]) -> Op
             row.job_type = job_type
         if "interval_seconds" in data and data["interval_seconds"] is not None:
             row.interval_seconds = max(10, int(data["interval_seconds"]))
+        if "notification_scope" in data and data["notification_scope"] is not None:
+            notification_scope = str(data["notification_scope"])
+            if notification_scope not in NOTIFICATION_SCOPES:
+                raise ValueError("invalid notification scope")
+            row.notification_scope = notification_scope
         if "schedule_kind" in data and data["schedule_kind"] is not None:
             schedule_kind = str(data["schedule_kind"])
             if schedule_kind not in SCHEDULE_KINDS:
@@ -699,10 +828,11 @@ def update_job(database_url: str, job_id: str, data: Mapping[str, object]) -> Op
             validate_cron(row.cron_expression, row.timezone or "Asia/Shanghai")
         if "enabled" in data and data["enabled"] is not None:
             row.enabled = bool(data["enabled"])
-        if "next_run_at" in data:
-            row.next_run_at = _datetime(data["next_run_at"]) or (next_cron_run(row.cron_expression, row.timezone or "Asia/Shanghai") if (row.schedule_kind or "interval") == "cron" else _utc_now())
-        elif any(field in data for field in ("schedule_kind", "cron_expression", "timezone")) and (row.schedule_kind or "interval") == "cron":
-            row.next_run_at = next_cron_run(row.cron_expression, row.timezone or "Asia/Shanghai")
+        if (row.schedule_kind or "interval") == "cron":
+            if any(field in data for field in ("schedule_kind", "cron_expression", "timezone", "next_run_at")):
+                row.next_run_at = next_cron_run(row.cron_expression, row.timezone or "Asia/Shanghai")
+        elif "next_run_at" in data:
+            row.next_run_at = _datetime(data["next_run_at"]) or _utc_now()
         session.flush()
         return _job(row)
 

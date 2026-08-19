@@ -100,11 +100,13 @@ class WorkflowTemplateNodeRow(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
     template_id: Mapped[str] = mapped_column(String(32), ForeignKey("workflow_templates.id", ondelete="CASCADE"), index=True)
     definition_id: Mapped[str] = mapped_column(String(32), ForeignKey("node_definitions.id", ondelete="RESTRICT"))
+    domain_id: Mapped[Optional[str]] = mapped_column(String(32), ForeignKey("delivery_domains.id", ondelete="RESTRICT"))
     position_x: Mapped[float] = mapped_column(Float, default=0)
     position_y: Mapped[float] = mapped_column(Float, default=0)
 
     template: Mapped[WorkflowTemplateRow] = relationship(back_populates="nodes")
     definition: Mapped[NodeDefinitionRow] = relationship()
+    domain: Mapped[Optional[DeliveryDomainRow]] = relationship()
 
 
 class WorkflowTemplateEdgeRow(Base):
@@ -215,6 +217,7 @@ class ScheduledJobRow(Base):
     cron_expression: Mapped[Optional[str]] = mapped_column(String(255))
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
     interval_seconds: Mapped[int] = mapped_column(Integer, default=86400)
+    notification_scope: Mapped[str] = mapped_column(String(16), default="risk_only")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -324,6 +327,11 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
     if "domain_id" not in columns:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE people ADD COLUMN domain_id VARCHAR(32)"))
+    template_node_columns = {column["name"] for column in inspect(engine).get_columns("workflow_template_nodes")}
+    if "domain_id" not in template_node_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE workflow_template_nodes ADD COLUMN domain_id VARCHAR(32)"))
+            connection.execute(text("UPDATE workflow_template_nodes SET domain_id = (SELECT domain_id FROM node_definitions WHERE node_definitions.id = workflow_template_nodes.definition_id) WHERE domain_id IS NULL"))
     requirement_columns = {column["name"] for column in inspect(engine).get_columns("requirements")}
     if "sequence_id" not in requirement_columns:
         with engine.begin() as connection:
@@ -343,6 +351,7 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
         "schedule_kind": "VARCHAR(32) DEFAULT 'interval'",
         "cron_expression": "VARCHAR(255)",
         "timezone": "VARCHAR(64) DEFAULT 'Asia/Shanghai'",
+        "notification_scope": "VARCHAR(16) DEFAULT 'risk_only'",
     }
     if set(job_migrations) - job_columns:
         with engine.begin() as connection:

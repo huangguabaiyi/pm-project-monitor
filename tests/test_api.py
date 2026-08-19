@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from requirement_monitor.api import create_app
 from requirement_monitor.database import NotificationOutboxRow, ScheduledJobRow, session_scope
+from requirement_monitor.models import SendResult
 
 
 def test_full_configuration_and_requirement_flow(tmp_path: Path):
@@ -52,6 +53,47 @@ def test_removed_project_and_blocker_routes_do_not_exist(tmp_path: Path):
     assert client.get("/api/nodes").status_code == 404
 
 
+def test_requirement_graph_can_add_move_connect_and_delete_nodes(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'requirement-graph.db'}"))
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    domain = client.post("/api/domains", json={"name": "研发", "color": "#24704b"}).json()
+    first = client.post("/api/node-definitions", json={"name": "开发", "domain_id": domain["id"]}).json()
+    second = client.post("/api/node-definitions", json={"name": "测试", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "可编辑流程"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": first["id"]})
+    requirement = client.post("/api/requirements", json={"name": "流程调整需求", "owner_id": owner["id"], "template_id": template["id"]}).json()
+    first_node = requirement["nodes"][0]
+
+    added = client.post(
+        f"/api/requirements/{requirement['id']}/nodes",
+        json={"definition_id": second["id"], "domain_id": domain["id"], "position_x": 320, "position_y": 80},
+    )
+    assert added.status_code == 201
+    second_node = added.json()
+    assert second_node["name"] == "测试"
+    assert second_node["domain_name"] == "研发"
+
+    moved = client.patch(f"/api/requirement-nodes/{second_node['id']}", json={"position_x": 480, "position_y": 160})
+    assert moved.status_code == 200
+    assert moved.json()["position"] == {"x": 480.0, "y": 160.0}
+
+    edge = client.post(f"/api/requirements/{requirement['id']}/edges", json={"source": first_node["id"], "target": second_node["id"]})
+    assert edge.status_code == 201
+    cycle = client.post(f"/api/requirements/{requirement['id']}/edges", json={"source": second_node["id"], "target": first_node["id"]})
+    assert cycle.status_code == 400
+    assert "cycle" in cycle.json()["detail"]
+
+    detail = client.get(f"/api/requirements/{requirement['id']}").json()
+    assert len(detail["nodes"]) == 2
+    assert len(detail["edges"]) == 1
+
+    assert client.delete(f"/api/requirement-edges/{edge.json()['id']}").status_code == 200
+    assert client.delete(f"/api/requirement-nodes/{second_node['id']}").status_code == 200
+    detail = client.get(f"/api/requirements/{requirement['id']}").json()
+    assert len(detail["nodes"]) == 1
+    assert detail["edges"] == []
+
+
 def test_node_definition_supports_multiple_domains(tmp_path: Path):
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'multi-domain.db'}"))
     product = client.post("/api/domains", json={"name": "产品", "color": "#7c5ce5"}).json()
@@ -65,6 +107,105 @@ def test_node_definition_supports_multiple_domains(tmp_path: Path):
     assert payload["domain_id"] == product["id"]
     assert payload["domain_ids"] == [product["id"], client_domain["id"]]
     assert [domain["name"] for domain in payload["domains"]] == ["产品", "客户端"]
+
+
+def test_multi_domain_definition_creates_one_template_and_requirement_node_per_domain(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'multi-domain-template.db'}"))
+    product = client.post("/api/domains", json={"name": "产品"}).json()
+    client_domain = client.post("/api/domains", json={"name": "客户端"}).json()
+    owner = client.post("/api/people", json={"display_name": "林夏", "role_name": "负责人"}).json()
+    definition = client.post(
+        "/api/node-definitions",
+        json={"name": "体验验收", "domain_ids": [product["id"], client_domain["id"]]},
+    ).json()
+    template = client.post("/api/templates", json={"name": "多领域流程"}).json()
+
+    product_node = client.post(
+        f"/api/templates/{template['id']}/nodes",
+        json={"definition_id": definition["id"], "domain_id": product["id"]},
+    )
+    client_node = client.post(
+        f"/api/templates/{template['id']}/nodes",
+        json={"definition_id": definition["id"], "domain_id": client_domain["id"]},
+    )
+
+    assert product_node.status_code == 201
+    assert client_node.status_code == 201
+    assert product_node.json()["domain_id"] == product["id"]
+    assert client_node.json()["domain_id"] == client_domain["id"]
+
+    template_detail = client.get(f"/api/templates/{template['id']}").json()
+    assert len(template_detail["nodes"]) == 2
+    assert {node["domain"]["name"] for node in template_detail["nodes"]} == {"产品", "客户端"}
+
+    requirement = client.post(
+        "/api/requirements",
+        json={"name": "多领域需求", "owner_id": owner["id"], "template_id": template["id"]},
+    )
+    assert requirement.status_code == 201
+    assert len(requirement.json()["nodes"]) == 2
+    assert {node["domain_name"] for node in requirement.json()["nodes"]} == {"产品", "客户端"}
+
+
+def test_requirement_can_be_edited_and_archived(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'requirement-edit.db'}"))
+    domain = client.post("/api/domains", json={"name": "产品"}).json()
+    owner = client.post("/api/people", json={"display_name": "林夏", "role_name": "负责人"}).json()
+    replacement_owner = client.post("/api/people", json={"display_name": "周屿", "role_name": "交付负责人"}).json()
+    definition = client.post("/api/node-definitions", json={"name": "评审", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "编辑模板"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition["id"]})
+    requirement = client.post("/api/requirements", json={"name": "原始需求", "owner_id": owner["id"], "template_id": template["id"]}).json()
+
+    updated = client.patch(
+        f"/api/requirements/{requirement['id']}",
+        json={"name": "更新后的需求", "owner_id": replacement_owner["id"], "target_version": "v2.0", "archived": True},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "更新后的需求"
+    assert updated.json()["owner_id"] == replacement_owner["id"]
+    assert updated.json()["target_version"] == "v2.0"
+    assert updated.json()["archived"] is True
+
+    restored = client.patch(f"/api/requirements/{requirement['id']}", json={"archived": False})
+    assert restored.status_code == 200
+    assert restored.json()["archived"] is False
+
+
+def test_manual_notification_run_refreshes_generates_and_delivers(monkeypatch, tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'manual-notification.db'}"
+    client = TestClient(create_app(database_url))
+    domain = client.post("/api/domains", json={"name": "产品"}).json()
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    definition = client.post("/api/node-definitions", json={"name": "评审", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "通知模板"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition["id"]})
+    client.post("/api/requirements", json={"name": "待投递需求", "owner_id": owner["id"], "template_id": template["id"]})
+    job = client.post("/api/jobs", json={"name": "通知投递", "job_type": "outbox_delivery", "notification_scope": "all", "interval_seconds": 30}).json()
+    settings = client.patch("/api/webhook-settings", json={"enabled": True, "test_webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-token"})
+    assert settings.status_code == 200
+
+    class FakeSender:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def send(self, _payload):
+            return SendResult(success=True, attempts=1, status_code=200, feishu_code=0)
+
+        def close(self):
+            pass
+
+    import requirement_monitor.worker as worker
+
+    monkeypatch.setattr(worker, "WebhookSender", FakeSender)
+    response = client.post(f"/api/jobs/{job['id']}/run", json={})
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["refreshed"] == 1
+    assert response.json()["summary"]["enqueued"] == 1
+    assert response.json()["summary"]["delivered"] == 1
+    assert client.get("/api/notifications").json()[0]["status"] == "sent"
 
 
 def test_deployment_update_is_enabled_by_default(tmp_path: Path, monkeypatch):
@@ -87,7 +228,9 @@ def test_trigger_outbox_delivery_makes_pending_notifications_due(tmp_path: Path)
         job_id = job.id
         notification_id = notification.id
 
-    assert client.post(f"/api/jobs/{job_id}/run", json={}).status_code == 200
+    from requirement_monitor.service import trigger_job
+
+    assert trigger_job(database_url, job_id) is not None
     with session_scope(database_url) as session:
         notification = session.get(NotificationOutboxRow, notification_id)
         assert notification is not None
@@ -106,7 +249,9 @@ def test_trigger_outbox_delivery_revives_dead_notifications(tmp_path: Path):
         job_id = job.id
         notification_id = notification.id
 
-    assert client.post(f"/api/jobs/{job_id}/run", json={}).status_code == 200
+    from requirement_monitor.service import trigger_job
+
+    assert trigger_job(database_url, job_id) is not None
     with session_scope(database_url) as session:
         notification = session.get(NotificationOutboxRow, notification_id)
         assert notification is not None
@@ -141,7 +286,7 @@ def test_job_timer_can_be_updated(tmp_path: Path):
     assert payload["job_type"] == "ai_analysis"
     assert payload["interval_seconds"] == 7200
     assert payload["enabled"] is False
-    assert payload["next_run_at"].startswith("2026-08-20T09:30:00")
+    assert payload["next_run_at"] == "2026-08-20T01:30:00+00:00"
 
     cron = client.patch(
         f"/api/jobs/{job_id}",
@@ -159,6 +304,14 @@ def test_job_timer_can_be_updated(tmp_path: Path):
     assert payload["cron_expression"] == "0 10 * * 1-5"
     assert payload["timezone"] == "Asia/Shanghai"
     assert payload["next_run_at"] is not None
+    assert payload["next_run_at"].endswith("+00:00")
+
+    overridden = client.patch(
+        f"/api/jobs/{job_id}",
+        json={"next_run_at": "2026-08-19T08:29:00+00:00"},
+    )
+    assert overridden.status_code == 200
+    assert overridden.json()["next_run_at"] != "2026-08-19T08:29:00+00:00"
 
 
 def test_person_domain_open_id_and_masked_webhook_settings(tmp_path: Path):

@@ -11,5 +11,5 @@ export function Empty({title,detail}:{title:string;detail:string}){return <div c
 export function Loading(){return <div className="loading"><LoaderCircle className="spin"/>正在加载…</div>}
 export function Field({label,children,hint}:{label:string;children:ReactNode;hint?:string}){return <label className="field"><span>{label}</span>{children}{hint&&<small>{hint}</small>}</label>}
 export function Toast({text,type='ok'}:{text:string;type?:'ok'|'error'}){return <div className={`toast ${type}`}>{text}</div>}
-export function fmtDate(value?:string,withTime=false){if(!value)return '未设置';const date=new Date(value);return new Intl.DateTimeFormat('zh-CN',withTime?{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}:{year:'numeric',month:'2-digit',day:'2-digit'}).format(date)}
+export function fmtDate(value?:string,withTime=false,timeZone?:string){if(!value)return '未设置';const date=new Date(value);return new Intl.DateTimeFormat('zh-CN',withTime?{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone}:{year:'numeric',month:'2-digit',day:'2-digit',timeZone}).format(date)}
 export function dateInput(value?:string){if(!value)return '';const d=new Date(value);return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,16)}

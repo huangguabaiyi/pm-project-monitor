@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,7 +14,7 @@ from sqlalchemy import select
 from .config import load_settings
 from .database import JobRunRow, NotificationDeliveryRow, NotificationOutboxRow, ScheduledJobRow, session_scope
 from .scheduler import next_cron_run
-from .service import analyze_all_requirements, create_job, enqueue_notification, evaluate_all_requirements, get_ai_settings, get_requirement, get_webhook_settings, list_jobs, list_requirements
+from .service import analyze_all_requirements, create_job, enqueue_notification, evaluate_all_requirements, get_ai_settings, get_requirement, get_webhook_settings, list_jobs, list_requirements, update_job
 from .webhook import WebhookSender
 
 
@@ -41,6 +42,27 @@ def _risk_owner_mentions(requirement: Dict[str, object]) -> list[str]:
     return mentions
 
 
+def _current_node_lines(requirement: Dict[str, object]) -> list[str]:
+    nodes = requirement.get("nodes") if isinstance(requirement.get("nodes"), list) else []
+    current_ids = {str(item) for item in requirement.get("current_node_ids") or []}
+    current_nodes = [node for node in nodes if isinstance(node, dict) and ((current_ids and str(node.get("id")) in current_ids) or (not current_ids and int(node.get("risk_level") or 0) > 0)) and str(node.get("name") or "").strip()]
+    lines: list[str] = []
+    for node in current_nodes:
+        owners = node.get("owners") if isinstance(node.get("owners"), list) else []
+        owner_mentions: list[str] = []
+        for owner in owners:
+            if not isinstance(owner, dict):
+                continue
+            name = str(owner.get("display_name") or "").strip()
+            open_id = str(owner.get("feishu_open_id") or "").strip()
+            if open_id:
+                owner_mentions.append(f"<at id={open_id}>{name or open_id}</at>")
+            elif name:
+                owner_mentions.append(f"@{name}")
+        lines.append("- 当前环节：{} · 域：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), " ".join(owner_mentions) or "未设置"))
+    return lines
+
+
 def _link_buttons(requirement: Dict[str, object]) -> list[Dict[str, object]]:
     labels = [
         ("Meego", requirement.get("meego_url")),
@@ -64,16 +86,18 @@ def _link_buttons(requirement: Dict[str, object]) -> list[Dict[str, object]]:
 
 def _risk_card(requirement: Dict[str, object], *, include_ai: bool = True) -> Dict[str, object]:
     labels = {1: "预警", 2: "严重"}
+    risk_label = labels.get(requirement["risk_level"], "正常")
     reasons = list(requirement.get("risk_reasons") or [])[:5]
     mentions = _risk_owner_mentions(requirement)
-    content = "**{} · {}**\n风险等级：{}\n当前节点：{}\n{}".format(
+    current_lines = _current_node_lines(requirement)
+    content = "**{} · {}**\n风险等级：{}\n当前节点：\n{}\n{}".format(
         f"#{requirement['sequence_id']}",
         requirement["name"],
         labels.get(requirement["risk_level"], "正常"),
-        "、".join(requirement.get("current_nodes") or []) or "暂无",
+        "\n".join(current_lines) or "当前环节：暂无",
         "\n".join(f"- {reason}" for reason in reasons),
     )
-    if mentions:
+    if mentions and not current_lines:
         content += "\n\n负责人：" + " ".join(mentions)
     analysis = requirement.get("ai_analysis")
     if include_ai and isinstance(analysis, dict):
@@ -86,25 +110,13 @@ def _risk_card(requirement: Dict[str, object], *, include_ai: bool = True) -> Di
     buttons = _link_buttons(requirement)
     if buttons:
         elements.append({"tag": "action", "actions": buttons})
-    return {"msg_type": "interactive", "card": {"header": {"template": "red" if requirement["risk_level"] == 2 else "orange", "title": {"tag": "plain_text", "content": "需求进展风险提醒"}}, "elements": elements}}
+    return {"msg_type": "interactive", "card": {"header": {"template": "red" if requirement["risk_level"] == 2 else "orange" if requirement["risk_level"] == 1 else "green", "title": {"tag": "plain_text", "content": f"{risk_label} · {requirement['name']}"}}, "elements": elements}}
 
 
 def run_risk_scan(database_url: str) -> Dict[str, int]:
     logger.info("risk_scan.start")
     counts = evaluate_all_requirements(database_url)
-    ai_settings = get_ai_settings(database_url)
-    enqueued = 0
-    for summary in list_requirements(database_url):
-        if summary["archived"] or summary["risk_level"] == 0:
-            continue
-        requirement = get_requirement(database_url, str(summary["id"])) or summary
-        payload = _risk_card(requirement, include_ai=bool(ai_settings["include_in_feishu"]))
-        fingerprint = hashlib.sha256(json.dumps([requirement["id"], payload], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        result = enqueue_notification(database_url, payload, deduplication_key=f"risk:{fingerprint}")
-        if not result.get("duplicate"):
-            enqueued += 1
-        logger.info("risk_scan.notification requirement_id=%s risk_level=%s status=%s duplicate=%s", requirement["id"], requirement["risk_level"], result["status"], result.get("duplicate"))
-    summary = {**counts, "enqueued": enqueued}
+    summary = {**counts, "refreshed": sum(counts.values())}
     logger.info("risk_scan.finish summary=%s", summary)
     return summary
 
@@ -116,9 +128,9 @@ def run_ai_analysis(database_url: str) -> Dict[str, int]:
     return summary
 
 
-def _claim_due_jobs(database_url: str) -> list[tuple[str, str]]:
+def _claim_due_jobs(database_url: str) -> list[tuple[str, str, str]]:
     now = datetime.now(timezone.utc)
-    claimed: list[tuple[str, str]] = []
+    claimed: list[tuple[str, str, str]] = []
     with session_scope(database_url) as session:
         jobs = list(session.scalars(select(ScheduledJobRow).where(ScheduledJobRow.enabled.is_(True), ScheduledJobRow.next_run_at <= now).with_for_update(skip_locked=True)))
         for job in jobs:
@@ -134,7 +146,7 @@ def _claim_due_jobs(database_url: str) -> list[tuple[str, str]]:
             else:
                 job.next_run_at = now + timedelta(seconds=max(10, job.interval_seconds))
             session.flush()
-            claimed.append((run.id, job.job_type))
+            claimed.append((run.id, job.job_type, job.notification_scope or "risk_only"))
             logger.info("job.claimed job_id=%s job_type=%s run_id=%s", job.id, job.job_type, run.id)
     return claimed
 
@@ -157,14 +169,35 @@ def _finish(database_url: str, run_id: str, status: str, *, summary=None, error:
         logger.info("job.finish run_id=%s status=%s summary=%s", run_id, status, summary or {})
 
 
-def deliver_outbox(database_url: str, config_path: Path, limit: int = 50) -> Dict[str, int]:
+def _enqueue_notifications(database_url: str, scope: str, *, force: bool = False) -> int:
+    if scope not in {"all", "risk_only"}:
+        raise ValueError("invalid notification scope")
+    ai_settings = get_ai_settings(database_url)
+    enqueued = 0
+    for summary in list_requirements(database_url):
+        if summary["archived"] or (scope == "risk_only" and summary["risk_level"] == 0):
+            continue
+        requirement = get_requirement(database_url, str(summary["id"])) or summary
+        payload = _risk_card(requirement, include_ai=bool(ai_settings["include_in_feishu"]))
+        if force:
+            deduplication_key = "manual:{}:{}".format(requirement["id"], datetime.now(timezone.utc).isoformat())
+        else:
+            fingerprint = hashlib.sha256(json.dumps([requirement["id"], payload], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            deduplication_key = f"risk:{fingerprint}"
+        result = enqueue_notification(database_url, payload, deduplication_key=deduplication_key)
+        if not result.get("duplicate"):
+            enqueued += 1
+    return enqueued
+
+
+def deliver_outbox(database_url: str, config_path: Path, limit: int = 50, *, notification_scope: str = "risk_only", force: bool = False) -> Dict[str, int]:
     logger.info("outbox_delivery.start")
     stored = get_webhook_settings(database_url, include_secrets=True)
     has_stored_config = bool(stored["test_configured"] or stored["prod_configured"])
     if has_stored_config:
         if not stored["enabled"]:
             logger.info("outbox_delivery.skip reason=webhook_disabled")
-            return {"delivered": 0, "failed": 0, "dead": 0}
+            return {"refreshed": 0, "enqueued": 0, "delivered": 0, "failed": 0, "dead": 0}
         environment = str(stored["runtime_environment"])
         webhook_url = stored[f"{environment}_webhook_url"]
         if not webhook_url:
@@ -178,6 +211,8 @@ def deliver_outbox(database_url: str, config_path: Path, limit: int = 50) -> Dic
         webhook_url = settings.webhook_url.get_secret_value()
         bot_keyword = settings.bot_keyword
         logger.info("outbox_delivery.config source=file bot_keyword=%s", "set" if bot_keyword else "empty")
+    refreshed = evaluate_all_requirements(database_url)
+    enqueued = _enqueue_notifications(database_url, notification_scope, force=force)
     sender = WebhookSender(str(webhook_url), bot_keyword=bot_keyword)
     delivered = failed = dead = 0
     try:
@@ -217,7 +252,7 @@ def deliver_outbox(database_url: str, config_path: Path, limit: int = 50) -> Dic
                     logger.warning("outbox_delivery.failed outbox_id=%s attempts=%s next_available_at=%s status_code=%s feishu_code=%s error=%s", outbox_id, row.attempt_count, row.available_at, result.status_code, result.feishu_code, result.error)
     finally:
         sender.close()
-    summary = {"delivered": delivered, "failed": failed, "dead": dead}
+    summary = {"refreshed": sum(refreshed.values()), "enqueued": enqueued, "delivered": delivered, "failed": failed, "dead": dead}
     logger.info("outbox_delivery.finish summary=%s", summary)
     return summary
 
@@ -226,14 +261,14 @@ def execute_due_jobs(database_url: str, config_path: Path) -> int:
     claimed = _claim_due_jobs(database_url)
     if claimed:
         logger.info("jobs.execute count=%s", len(claimed))
-    for run_id, job_type in claimed:
+    for run_id, job_type, notification_scope in claimed:
         try:
             if job_type == "risk_scan":
                 summary = run_risk_scan(database_url)
             elif job_type == "ai_analysis":
                 summary = run_ai_analysis(database_url)
             else:
-                summary = deliver_outbox(database_url, config_path)
+                summary = deliver_outbox(database_url, config_path, notification_scope=notification_scope)
             _finish(database_url, run_id, "succeeded", summary=summary)
         except Exception as error:
             _finish(database_url, run_id, "failed", error=str(error))
@@ -245,7 +280,11 @@ def worker_loop(database_url: str, config_path: Path, *, poll_seconds: int = 30,
     logger.info("worker.start poll_seconds=%s once=%s config=%s", poll_seconds, once, config_path)
     existing_types = {job["job_type"] for job in list_jobs(database_url)}
     if "risk_scan" not in existing_types:
-        create_job(database_url, {"name": "风险扫描", "job_type": "risk_scan", "interval_seconds": 3600})
+        create_job(database_url, {"name": "风险刷新", "job_type": "risk_scan", "interval_seconds": 30})
+    else:
+        risk_job = next((job for job in list_jobs(database_url) if job["job_type"] == "risk_scan"), None)
+        if risk_job and risk_job["interval_seconds"] != 30:
+            update_job(database_url, str(risk_job["id"]), {"interval_seconds": 30, "enabled": True})
     if "outbox_delivery" not in existing_types:
         create_job(database_url, {"name": "通知投递", "job_type": "outbox_delivery", "interval_seconds": 30})
     if "ai_analysis" not in existing_types:
@@ -255,3 +294,38 @@ def worker_loop(database_url: str, config_path: Path, *, poll_seconds: int = 30,
         if once:
             return
         time.sleep(max(5, poll_seconds))
+
+
+def run_job_now(database_url: str, job_id: str, *, config_path: Optional[Path] = None) -> Optional[Dict[str, object]]:
+    now = datetime.now(timezone.utc)
+    config_path = config_path or Path(os.getenv("REQUIREMENT_MONITOR_CONFIG", "config.local.json"))
+    with session_scope(database_url) as session:
+        job = session.get(ScheduledJobRow, job_id)
+        if job is None:
+            return None
+        job.enabled = True
+        job.last_run_at = now
+        job.last_status = "running"
+        job.next_run_at = now + timedelta(seconds=max(10, job.interval_seconds))
+        job_type = job.job_type
+        notification_scope = job.notification_scope or "risk_only"
+        session.flush()
+    try:
+        if job_type == "risk_scan":
+            summary = run_risk_scan(database_url)
+        elif job_type == "ai_analysis":
+            summary = run_ai_analysis(database_url)
+        else:
+            summary = deliver_outbox(database_url, config_path, notification_scope=notification_scope, force=True)
+    except Exception:
+        with session_scope(database_url) as session:
+            job = session.get(ScheduledJobRow, job_id)
+            if job:
+                job.last_status = "failed"
+        raise
+    with session_scope(database_url) as session:
+        job = session.get(ScheduledJobRow, job_id)
+        if job:
+            job.last_status = "succeeded"
+    job_payload = next((item for item in list_jobs(database_url) if item["id"] == job_id), None)
+    return {"job": job_payload, "summary": summary, "immediate": True}

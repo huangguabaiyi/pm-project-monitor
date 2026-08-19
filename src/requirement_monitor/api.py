@@ -16,6 +16,8 @@ from .deployment import deployment_updates
 from .service import (
     add_template_edge,
     add_template_node,
+    add_requirement_edge,
+    add_requirement_node,
     analyze_requirement,
     create_definition,
     create_domain,
@@ -30,6 +32,8 @@ from .service import (
     deactivate_person,
     delete_template_edge,
     delete_template_node,
+    delete_requirement_edge,
+    delete_requirement_node,
     export_data,
     get_requirement,
     get_ai_settings,
@@ -125,6 +129,7 @@ class TemplatePatch(BaseModel):
 
 class TemplateNodeInput(BaseModel):
     definition_id: str
+    domain_id: Optional[str] = None
     position_x: float = 0
     position_y: float = 0
 
@@ -162,12 +167,27 @@ class RequirementPatch(BaseModel):
 
 
 class RequirementNodePatch(BaseModel):
+    position_x: Optional[float] = None
+    position_y: Optional[float] = None
     planned_start: Optional[str] = None
     planned_end: Optional[str] = None
     status: Optional[str] = None
     blocked_reason: Optional[str] = None
     notes: Optional[str] = None
     owner_ids: Optional[List[str]] = None
+
+
+class RequirementNodeInput(BaseModel):
+    template_node_id: Optional[str] = None
+    definition_id: str
+    domain_id: Optional[str] = None
+    position_x: float = 0
+    position_y: float = 0
+
+
+class RequirementEdgeInput(BaseModel):
+    source: str
+    target: str
 
 
 class JobInput(BaseModel):
@@ -177,6 +197,7 @@ class JobInput(BaseModel):
     cron_expression: Optional[str] = None
     timezone: str = "Asia/Shanghai"
     interval_seconds: int = Field(default=86400, ge=10)
+    notification_scope: str = "risk_only"
     enabled: bool = True
     next_run_at: Optional[str] = None
 
@@ -187,6 +208,7 @@ class JobPatch(BaseModel):
     cron_expression: Optional[str] = None
     timezone: Optional[str] = None
     interval_seconds: Optional[int] = Field(default=None, ge=10)
+    notification_scope: Optional[str] = None
     enabled: Optional[bool] = None
     next_run_at: Optional[str] = None
 
@@ -419,6 +441,33 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
             raise HTTPException(404, "requirement node not found")
         return result
 
+    @app.post("/api/requirements/{requirement_id}/nodes", status_code=201)
+    def requirement_nodes_create(requirement_id: str, payload: RequirementNodeInput):
+        try:
+            result = add_requirement_node(db(), requirement_id, payload.model_dump())
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return result
+
+    @app.delete("/api/requirement-nodes/{node_id}")
+    def requirement_nodes_delete(node_id: str):
+        if not delete_requirement_node(db(), node_id):
+            raise HTTPException(404, "requirement node not found")
+        return {"ok": True}
+
+    @app.post("/api/requirements/{requirement_id}/edges", status_code=201)
+    def requirement_edges_create(requirement_id: str, payload: RequirementEdgeInput):
+        try:
+            return add_requirement_edge(db(), requirement_id, payload.model_dump())
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+
+    @app.delete("/api/requirement-edges/{edge_id}")
+    def requirement_edges_delete(edge_id: str):
+        if not delete_requirement_edge(db(), edge_id):
+            raise HTTPException(404, "requirement edge not found")
+        return {"ok": True}
+
     @app.post("/api/requirements/{requirement_id}/ai-analysis")
     def requirement_ai_analyze(requirement_id: str):
         try:
@@ -448,7 +497,12 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
 
     @app.post("/api/jobs/{job_id}/run")
     def jobs_run(job_id: str):
-        result = trigger_job(db(), job_id)
+        from .worker import run_job_now
+
+        try:
+            result = run_job_now(db(), job_id, config_path=Path(os.getenv("REQUIREMENT_MONITOR_CONFIG", "config.local.json")))
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
         if result is None:
             raise HTTPException(404, "job not found")
         return result
