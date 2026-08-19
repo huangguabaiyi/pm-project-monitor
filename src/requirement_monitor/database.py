@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
@@ -20,8 +21,18 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
 class Base(DeclarativeBase):
     pass
+
+
+class DatabaseMigrationRow(Base):
+    __tablename__ = "database_migrations"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
 
 
 class PersonRow(Base):
@@ -370,6 +381,23 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
             if column not in requirement_columns:
                 connection.execute(text(f"ALTER TABLE requirements ADD COLUMN {column} {sql_type}"))
         connection.execute(text("INSERT OR IGNORE INTO node_definition_domains (definition_id, domain_id) SELECT id, domain_id FROM node_definitions WHERE domain_id IS NOT NULL")) if engine.dialect.name == "sqlite" else connection.execute(text("INSERT INTO node_definition_domains (definition_id, domain_id) SELECT id, domain_id FROM node_definitions WHERE domain_id IS NOT NULL ON CONFLICT DO NOTHING"))
+
+        migration_key = "planned-datetimes-utc-v1"
+        applied = connection.execute(text("SELECT 1 FROM database_migrations WHERE key=:key"), {"key": migration_key}).first()
+        if applied is None:
+            rows = connection.execute(text("SELECT id, planned_start, planned_end FROM requirement_nodes")).fetchall()
+            for node_id, planned_start, planned_end in rows:
+                updates = {}
+                for field, value in (("planned_start", planned_start), ("planned_end", planned_end)):
+                    if value is None:
+                        continue
+                    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00").replace(" ", "T"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=LOCAL_TIMEZONE)
+                    updates[field] = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                if updates:
+                    connection.execute(text("UPDATE requirement_nodes SET planned_start=:planned_start, planned_end=:planned_end WHERE id=:id"), {"id": node_id, "planned_start": updates.get("planned_start", planned_start), "planned_end": updates.get("planned_end", planned_end)})
+            connection.execute(text("INSERT INTO database_migrations (key, applied_at) VALUES (:key, :applied_at)"), {"key": migration_key, "applied_at": _utc_now()})
 
 
 @contextmanager

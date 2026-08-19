@@ -25,6 +25,7 @@ def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
                     "name": "开发",
                     "domain_name": "服务端",
                     "risk_level": 2,
+                    "risk_reasons": ["开发节点已逾期"],
                     "owners": [
                         {"display_name": "沈言", "feishu_open_id": "ou_backend"}
                     ],
@@ -54,6 +55,7 @@ def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
     assert payload["card"]["header"]["title"]["content"] == "严重 · 支付链路改造"
     content = payload["card"]["elements"][0]["content"]
     assert "- 当前环节：开发 · 域：服务端 · 负责人：<at id=ou_backend>沈言</at>" in content
+    assert "风险原因：开发节点已逾期" in content
     assert "- 当前环节：测试 · 域：质量 · 负责人：@陈默" in content
     assert "<at id=ou_backend>沈言</at>" in content
     assert "@陈默" in content

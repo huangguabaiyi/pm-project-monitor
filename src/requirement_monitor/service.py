@@ -4,8 +4,9 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Mapping, Optional, Sequence
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import Boolean, DateTime, func, insert, select
+from sqlalchemy import Boolean, DateTime, func, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -50,11 +51,13 @@ NOTIFICATION_SCOPES = {"all", "risk_only"}
 BACKUP_FORMAT_VERSION = 1
 SETTINGS_TABLES = {"webhook_settings", "ai_settings", "scheduled_jobs"}
 PRESERVED_SETTINGS_DEPENDENCIES = {"job_runs"}
+LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _json_value(value: object) -> object:
     if isinstance(value, datetime):
-        return value.isoformat()
+        normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return normalized.astimezone(timezone.utc).isoformat()
     return value
 
 
@@ -62,10 +65,10 @@ def _database_tables():
     return list(Base.metadata.sorted_tables)
 
 
-def _restore_value(value: object, column) -> object:
+def _restore_value(value: object, column, *, table_name: str = "") -> object:
     if value is None:
         return None
-    if isinstance(column.type, DateTime) and isinstance(value, str):
+    if isinstance(column.type, DateTime) and isinstance(value, (str, datetime)):
         return _datetime(value)
     if isinstance(column.type, Boolean) and isinstance(value, bool):
         return value
@@ -76,9 +79,13 @@ def _datetime(value) -> Optional[datetime]:
     if value in (None, ""):
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=LOCAL_TIMEZONE)
+        return value.astimezone(timezone.utc)
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
 
 
 def _api_datetime(value: Optional[datetime]) -> Optional[str]:
@@ -154,7 +161,7 @@ def import_data(database_url: str, backup: Mapping[str, object], *, preserve_set
                     raise ValueError("backup table {} contains invalid row".format(table.name))
                 payload.append(
                     {
-                        column.name: _restore_value(row[column.name], column)
+                        column.name: _restore_value(row[column.name], column, table_name=table.name)
                         for column in table.columns
                         if column.name in row
                     }
@@ -165,6 +172,9 @@ def import_data(database_url: str, backup: Mapping[str, object], *, preserve_set
                 except IntegrityError as error:
                     raise ValueError(f"backup table {table.name} contains incompatible references") from error
             imported[table.name] = len(payload)
+        migration_key = "planned-datetimes-utc-v1"
+        if connection.execute(text("SELECT 1 FROM database_migrations WHERE key=:key"), {"key": migration_key}).first() is None:
+            connection.execute(text("INSERT INTO database_migrations (key, applied_at) VALUES (:key, :applied_at)"), {"key": migration_key, "applied_at": _utc_now()})
     return {"ok": True, "preserve_settings": preserve_settings, "imported": imported}
 
 
@@ -498,7 +508,7 @@ def delete_template_edge(database_url: str, edge_id: str) -> bool:
 
 
 def _node_dict(row: RequirementNodeRow) -> Dict[str, object]:
-    return {"id": row.id, "requirement_id": row.requirement_id, "definition_id": row.definition_id, "name": row.name, "domain_name": row.domain_name, "domain_color": row.domain_color, "position": {"x": row.position_x, "y": row.position_y}, "planned_start": row.planned_start, "planned_end": row.planned_end, "actual_start": row.actual_start, "actual_end": row.actual_end, "status": row.status, "blocked_reason": row.blocked_reason, "notes": row.notes, "owners": [_person(person) for person in row.owners], "risk_level": row.risk_level, "risk_reasons": list(row.risk_reasons or [])}
+    return {"id": row.id, "requirement_id": row.requirement_id, "definition_id": row.definition_id, "name": row.name, "domain_name": row.domain_name, "domain_color": row.domain_color, "position": {"x": row.position_x, "y": row.position_y}, "planned_start": _api_datetime(row.planned_start), "planned_end": _api_datetime(row.planned_end), "actual_start": _api_datetime(row.actual_start), "actual_end": _api_datetime(row.actual_end), "status": row.status, "blocked_reason": row.blocked_reason, "notes": row.notes, "owners": [_person(person) for person in row.owners], "risk_level": row.risk_level, "risk_reasons": list(row.risk_reasons or [])}
 
 
 def _evaluate_requirement(row: RequirementRow, *, persist: bool = False) -> Dict[str, object]:
@@ -512,7 +522,7 @@ def _evaluate_requirement(row: RequirementRow, *, persist: bool = False) -> Dict
             node.risk_level = int(node_result.level)
             node.risk_reasons = node_result.reasons
     current = [node for node in row.nodes if node.id in result.current_node_ids]
-    return {"risk_level": int(result.level), "risk_reasons": result.reasons, "completed_nodes": result.completed_nodes, "total_nodes": result.total_nodes, "progress": round(result.completed_nodes / result.total_nodes * 100) if result.total_nodes else 0, "current_nodes": [node.name for node in current], "current_node_ids": [node.id for node in current], "planned_completion": result.planned_completion}
+    return {"risk_level": int(result.level), "risk_reasons": result.reasons, "completed_nodes": result.completed_nodes, "total_nodes": result.total_nodes, "progress": round(result.completed_nodes / result.total_nodes * 100) if result.total_nodes else 0, "current_nodes": [node.name for node in current], "current_node_ids": [node.id for node in current], "planned_completion": _api_datetime(result.planned_completion)}
 
 
 def _requirement_dict(row: RequirementRow, *, with_graph: bool = False, persist: bool = False) -> Dict[str, object]:
@@ -520,7 +530,7 @@ def _requirement_dict(row: RequirementRow, *, with_graph: bool = False, persist:
     schedule_level = int(schedule["risk_level"])
     ai_analysis = dict(row.ai_analysis) if row.ai_analysis else None
     ai_level = {"normal": 0, "warning": 1, "severe": 2}.get(str((ai_analysis or {}).get("risk_level")), 0)
-    payload = {"id": row.id, "sequence_id": row.sequence_id, "name": row.name, "owner": _person(row.owner), "owner_id": row.owner_id, "template_id": row.template_id, "template_name": row.template_name, "template_version": row.template_version, "target_version": row.target_version, "meego_url": row.meego_url, "requirement_url": row.requirement_url, "figma_url": row.figma_url, "notes": row.notes, "archived": row.archived, "created_at": row.created_at, "updated_at": row.updated_at, **schedule, "schedule_risk_level": schedule_level, "risk_level": max(schedule_level, ai_level), "ai_risk_level": ai_level if ai_analysis else None, "ai_analysis": ai_analysis, "ai_analyzed_at": row.ai_analyzed_at, "ai_error": row.ai_error}
+    payload = {"id": row.id, "sequence_id": row.sequence_id, "name": row.name, "owner": _person(row.owner), "owner_id": row.owner_id, "template_id": row.template_id, "template_name": row.template_name, "template_version": row.template_version, "target_version": row.target_version, "meego_url": row.meego_url, "requirement_url": row.requirement_url, "figma_url": row.figma_url, "notes": row.notes, "archived": row.archived, "created_at": _api_datetime(row.created_at), "updated_at": _api_datetime(row.updated_at), **schedule, "schedule_risk_level": schedule_level, "risk_level": max(schedule_level, ai_level), "ai_risk_level": ai_level if ai_analysis else None, "ai_analysis": ai_analysis, "ai_analyzed_at": _api_datetime(row.ai_analyzed_at), "ai_error": row.ai_error}
     graph_nodes = [_node_dict(node) for node in row.nodes]
     graph_edges = [{"id": edge.id, "source": edge.source_node_id, "target": edge.target_node_id} for edge in row.edges]
     analysis_source = {**payload, "nodes": graph_nodes, "edges": graph_edges}

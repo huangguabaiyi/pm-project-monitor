@@ -95,8 +95,23 @@ def _current_node_lines(requirement: Dict[str, object]) -> list[str]:
     current_nodes = [node for node in nodes if isinstance(node, dict) and ((current_ids and str(node.get("id")) in current_ids) or (not current_ids and int(node.get("risk_level") or 0) > 0)) and str(node.get("name") or "").strip()]
     lines: list[str] = []
     for node in current_nodes[:3]:
-        lines.append("- 当前环节：{} · 域：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node)))
+        reasons = [str(reason) for reason in (node.get("risk_reasons") or []) if str(reason).strip()][:2]
+        reason_text = f" · 风险原因：{'；'.join(reasons)}" if reasons else ""
+        lines.append("- 当前环节：{} · 域：{} · 负责人：{}{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node), reason_text))
     return lines
+
+
+def _risk_node_lines(requirement: Dict[str, object]) -> list[str]:
+    current_ids = {str(item) for item in requirement.get("current_node_ids") or []}
+    lines: list[str] = []
+    for node in _ordered_nodes(requirement):
+        if str(node.get("id") or "") in current_ids or int(node.get("risk_level") or 0) == 0:
+            continue
+        reasons = [str(reason) for reason in (node.get("risk_reasons") or []) if str(reason).strip()][:2]
+        if not reasons:
+            continue
+        lines.append("- 风险节点：{} · 域：{} · 原因：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), "；".join(reasons), _owner_mentions(node)))
+    return lines[:3]
 
 
 def _missing_schedule_lines(requirement: Dict[str, object]) -> list[str]:
@@ -137,10 +152,13 @@ def _risk_card(requirement: Dict[str, object], *, include_ai: bool = True) -> Di
     reasons = list(requirement.get("risk_reasons") or [])[:2]
     mentions = _risk_owner_mentions(requirement)
     current_lines = _current_node_lines(requirement)
+    risk_node_lines = _risk_node_lines(requirement)
     missing_lines = _missing_schedule_lines(requirement)
     sections = [f"**#{requirement['sequence_id']} · {requirement['name']}**", f"风险等级：{risk_label}"]
     if current_lines:
         sections.append("当前节点：\n" + "\n".join(current_lines))
+    if risk_node_lines:
+        sections.append("风险节点：\n" + "\n".join(risk_node_lines))
     if missing_lines:
         sections.append("待补时间：\n" + "\n".join(missing_lines))
     if reasons:

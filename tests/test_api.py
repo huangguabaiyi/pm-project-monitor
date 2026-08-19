@@ -41,6 +41,8 @@ def test_full_configuration_and_requirement_flow(tmp_path: Path):
     target = next(n for n in requirement["nodes"] if n["name"] == "测试")
     updated = client.patch(f"/api/requirement-nodes/{target['id']}", json={"planned_start": "2026-08-22T09:00:00+08:00", "planned_end": "2026-08-22T18:00:00+08:00"})
     assert updated.status_code == 200
+    assert updated.json()["planned_start"] == "2026-08-22T01:00:00+00:00"
+    assert updated.json()["planned_end"] == "2026-08-22T10:00:00+00:00"
     detail = client.get(f"/api/requirements/{requirement['id']}").json()
     assert detail["risk_level"] == 1
     assert any("前置节点" in reason and "尚未设置计划结束时间" in reason for reason in detail["risk_reasons"])

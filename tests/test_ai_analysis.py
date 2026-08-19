@@ -42,3 +42,25 @@ def test_openai_compatible_analysis_falls_back_to_json_object():
         actual = analyze_with_compatible_api(base_url="https://ai.example.com/v1", api_key="secret", model="model-a", prompt="分析风险", payload={}, client=client)
     assert calls == ["json_schema", "json_object"]
     assert actual["risk_level"] == "normal"
+
+
+def test_requirement_ai_input_uses_explicit_shanghai_times():
+    from requirement_monitor.ai_analysis import requirement_ai_input
+
+    payload = requirement_ai_input(
+        {
+            "id": "req-1",
+            "name": "时区测试",
+            "nodes": [
+                {
+                    "id": "node-1",
+                    "name": "开发",
+                    "planned_start": "2026-08-22T01:00:00+00:00",
+                    "planned_end": "2026-08-22T10:00:00+00:00",
+                    "owners": [],
+                }
+            ],
+        }
+    )
+    assert payload["nodes"][0]["planned_start"] == "2026-08-22T09:00:00+08:00"
+    assert payload["nodes"][0]["planned_end"] == "2026-08-22T18:00:00+08:00"

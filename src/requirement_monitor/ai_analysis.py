@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Literal, Mapping, Optional
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,6 +25,20 @@ DEFAULT_AI_PROMPT = """你是资深项目交付风险分析助手。请根据需
 4. 不猜测未提供的事实；信息不足时写入 missing_information。
 5. 建议必须具体、可执行、按优先级排序。
 6. 只返回符合给定 JSON Schema 的对象，不输出 Markdown 或额外说明。"""
+
+LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _ai_datetime(value: object) -> object:
+    if value is None or not isinstance(value, (datetime, str)):
+        return value
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(LOCAL_TIMEZONE).isoformat()
 
 
 RiskName = Literal["normal", "warning", "severe"]
@@ -74,10 +90,10 @@ def requirement_ai_input(requirement: Mapping[str, object]) -> Dict[str, object]
                 "id": node.get("id"),
                 "name": node.get("name"),
                 "domain": node.get("domain_name"),
-                "planned_start": node.get("planned_start"),
-                "planned_end": node.get("planned_end"),
-                "actual_start": node.get("actual_start"),
-                "actual_end": node.get("actual_end"),
+                "planned_start": _ai_datetime(node.get("planned_start")),
+                "planned_end": _ai_datetime(node.get("planned_end")),
+                "actual_start": _ai_datetime(node.get("actual_start")),
+                "actual_end": _ai_datetime(node.get("actual_end")),
                 "status": node.get("status"),
                 "owners": [person.get("display_name") for person in node.get("owners") or [] if isinstance(person, Mapping)],
                 "notes": node.get("notes"),
