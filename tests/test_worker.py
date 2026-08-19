@@ -40,6 +40,7 @@ def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
                     "id": "node-design",
                     "name": "视觉",
                     "domain_name": "设计",
+                    "status": "completed",
                     "risk_level": 0,
                     "owners": [
                         {"display_name": "周屿", "feishu_open_id": "ou_client"}
@@ -70,6 +71,48 @@ def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
     ]
 
 
+def test_risk_card_is_compact_and_lists_missing_schedule_with_multiple_owners():
+    payload = _risk_card(
+        {
+            "sequence_id": 8,
+            "name": "会员中心改造",
+            "risk_level": 1,
+            "risk_reasons": ["缺少计划时间", "其他风险", "不要展示的长风险"],
+            "current_node_ids": ["node-a"],
+            "edges": [{"source": "node-a", "target": "node-b"}],
+            "nodes": [
+                {
+                    "id": "node-a",
+                    "name": "开发",
+                    "domain_name": "服务端",
+                    "status": "in_progress",
+                    "risk_level": 1,
+                    "planned_start": "2026-08-19T09:00:00+08:00",
+                    "planned_end": "2026-08-20T18:00:00+08:00",
+                    "owners": [
+                        {"display_name": "张三", "feishu_open_id": "ou_zhang"},
+                        {"display_name": "李四", "feishu_open_id": ""},
+                    ],
+                },
+                {
+                    "id": "node-b",
+                    "name": "测试",
+                    "domain_name": "质量",
+                    "status": "not_started",
+                    "risk_level": 1,
+                    "planned_start": None,
+                    "planned_end": None,
+                    "owners": [{"display_name": "王五", "feishu_open_id": "ou_wang"}],
+                },
+            ],
+        }
+    )
+    content = payload["card"]["elements"][0]["content"]
+    assert "当前环节：开发 · 域：服务端 · 负责人：<at id=ou_zhang>张三</at> @李四" in content
+    assert "待补时间：\n- 待补时间：测试 · 域：质量 · 负责人：<at id=ou_wang>王五</at>" in content
+    assert "不要展示的长风险" not in content
+
+
 def test_worker_creates_default_automation_jobs(tmp_path: Path):
     database_url = f"sqlite+pysqlite:///{tmp_path / 'worker-jobs.db'}"
     initialize_database(database_url)
@@ -80,7 +123,7 @@ def test_worker_creates_default_automation_jobs(tmp_path: Path):
     assert {"risk_scan", "outbox_delivery", "ai_analysis"} <= job_types
 
 
-def test_notification_scope_controls_generated_cards(tmp_path: Path):
+def test_notification_scope_controls_generated_cards_without_fingerprint_dedup(tmp_path: Path):
     database_url = f"sqlite+pysqlite:///{tmp_path / 'notification-scope.db'}"
     initialize_database(database_url)
     domain = create_domain(database_url, {"name": "产品"})
@@ -94,5 +137,6 @@ def test_notification_scope_controls_generated_cards(tmp_path: Path):
     update_requirement_node(database_url, node_id, {"planned_start": now + timedelta(days=1), "planned_end": now + timedelta(days=2)})
 
     assert _enqueue_notifications(database_url, "risk_only") == 0
-    assert _enqueue_notifications(database_url, "all", force=True) == 1
-    assert len(list_notifications(database_url)) == 1
+    assert _enqueue_notifications(database_url, "all") == 1
+    assert _enqueue_notifications(database_url, "all") == 1
+    assert len(list_notifications(database_url)) == 2

@@ -94,6 +94,42 @@ def test_requirement_graph_can_add_move_connect_and_delete_nodes(tmp_path: Path)
     assert detail["edges"] == []
 
 
+def test_requirement_nodes_support_batch_status_updates(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'batch-status.db'}"))
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    domain = client.post("/api/domains", json={"name": "研发"}).json()
+    definition_a = client.post("/api/node-definitions", json={"name": "开发", "domain_id": domain["id"]}).json()
+    definition_b = client.post("/api/node-definitions", json={"name": "测试", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "批量状态模板"}).json()
+    node_a = client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition_a["id"]}).json()
+    node_b = client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition_b["id"]}).json()
+    requirement = client.post("/api/requirements", json={"name": "批量状态需求", "owner_id": owner["id"], "template_id": template["id"]}).json()
+    node_ids = [node["id"] for node in requirement["nodes"]]
+    response = client.post("/api/requirement-nodes/batch-status", json={"node_ids": node_ids, "status": "skipped"})
+    assert response.status_code == 200
+    assert response.json()["count"] == 2
+    detail = client.get(f"/api/requirements/{requirement['id']}").json()
+    assert {node["status"] for node in detail["nodes"]} == {"skipped"}
+
+
+def test_requirement_nodes_support_batch_owner_updates(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'batch-owners.db'}"))
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    second_owner = client.post("/api/people", json={"display_name": "沈言"}).json()
+    domain = client.post("/api/domains", json={"name": "研发"}).json()
+    definition_a = client.post("/api/node-definitions", json={"name": "开发", "domain_id": domain["id"]}).json()
+    definition_b = client.post("/api/node-definitions", json={"name": "测试", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "批量负责人模板"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition_a["id"]})
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition_b["id"]})
+    requirement = client.post("/api/requirements", json={"name": "批量负责人需求", "owner_id": owner["id"], "template_id": template["id"]}).json()
+    node_ids = [node["id"] for node in requirement["nodes"]]
+    response = client.post("/api/requirement-nodes/batch-owners", json={"node_ids": node_ids, "owner_ids": [second_owner["id"]], "mode": "replace"})
+    assert response.status_code == 200
+    detail = client.get(f"/api/requirements/{requirement['id']}").json()
+    assert all([person["id"] for person in node["owners"]] == [second_owner["id"]] for node in detail["nodes"])
+
+
 def test_node_definition_supports_multiple_domains(tmp_path: Path):
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'multi-domain.db'}"))
     product = client.post("/api/domains", json={"name": "产品", "color": "#7c5ce5"}).json()
@@ -401,6 +437,16 @@ def test_admin_export_clear_and_import_roundtrip(tmp_path: Path):
     assert backup["format"] == "pm-project-monitor.backup"
     assert backup["tables"]["requirements"][0]["name"] == "备份测试"
     assert backup["tables"]["webhook_settings"][0]["test_webhook_url"] == webhook
+    backup["tables"]["job_runs"] = [{
+        "id": "orphaned-run",
+        "job_id": "job-from-another-backup",
+        "run_key": "job-from-another-backup:2026-08-19T09:00:00+00:00",
+        "status": "succeeded",
+        "started_at": "2026-08-19T09:00:00+00:00",
+        "finished_at": "2026-08-19T09:00:01+00:00",
+        "result_summary": {},
+        "error_message": None,
+    }]
 
     cleared = client.post("/api/admin/clear", json={"preserve_settings": True})
     assert cleared.status_code == 200
@@ -409,6 +455,7 @@ def test_admin_export_clear_and_import_roundtrip(tmp_path: Path):
 
     imported = client.post("/api/admin/import", json={"backup": backup, "preserve_settings": True})
     assert imported.status_code == 200
+    assert imported.json()["imported"]["job_runs"] == 0
     restored = client.get("/api/requirements").json()
     assert len(restored) == 1
     assert restored[0]["name"] == "备份测试"

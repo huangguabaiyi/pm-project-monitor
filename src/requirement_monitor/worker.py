@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -42,25 +41,73 @@ def _risk_owner_mentions(requirement: Dict[str, object]) -> list[str]:
     return mentions
 
 
+def _ordered_nodes(requirement: Dict[str, object]) -> list[Dict[str, object]]:
+    raw_nodes = requirement.get("nodes") if isinstance(requirement.get("nodes"), list) else []
+    nodes = [node for node in raw_nodes if isinstance(node, dict)]
+    by_id = {str(node.get("id")): node for node in nodes if node.get("id")}
+    order = {str(node.get("id")): index for index, node in enumerate(nodes) if node.get("id")}
+    successors: dict[str, list[str]] = {node_id: [] for node_id in by_id}
+    indegree = {node_id: 0 for node_id in by_id}
+    raw_edges = requirement.get("edges") if isinstance(requirement.get("edges"), list) else []
+    for edge in raw_edges:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if source in by_id and target in by_id and target not in successors[source]:
+            successors[source].append(target)
+            indegree[target] += 1
+    ready = sorted((node_id for node_id, degree in indegree.items() if degree == 0), key=order.get)
+    result: list[Dict[str, object]] = []
+    while ready:
+        node_id = ready.pop(0)
+        result.append(by_id[node_id])
+        for target in successors[node_id]:
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                ready.append(target)
+        ready.sort(key=order.get)
+    if len(result) != len(nodes):
+        result.extend(node for node in nodes if node not in result)
+    return result
+
+
+def _owner_mentions(node: Dict[str, object]) -> str:
+    owners = node.get("owners") if isinstance(node.get("owners"), list) else []
+    mentions: list[str] = []
+    seen: set[str] = set()
+    for owner in owners:
+        if not isinstance(owner, dict):
+            continue
+        name = str(owner.get("display_name") or "").strip()
+        open_id = str(owner.get("feishu_open_id") or "").strip()
+        key = open_id or name
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        mentions.append(f"<at id={open_id}>{name or open_id}</at>" if open_id else f"@{name}")
+    return " ".join(mentions) or "未设置"
+
+
 def _current_node_lines(requirement: Dict[str, object]) -> list[str]:
-    nodes = requirement.get("nodes") if isinstance(requirement.get("nodes"), list) else []
+    nodes = _ordered_nodes(requirement)
     current_ids = {str(item) for item in requirement.get("current_node_ids") or []}
     current_nodes = [node for node in nodes if isinstance(node, dict) and ((current_ids and str(node.get("id")) in current_ids) or (not current_ids and int(node.get("risk_level") or 0) > 0)) and str(node.get("name") or "").strip()]
     lines: list[str] = []
-    for node in current_nodes:
-        owners = node.get("owners") if isinstance(node.get("owners"), list) else []
-        owner_mentions: list[str] = []
-        for owner in owners:
-            if not isinstance(owner, dict):
-                continue
-            name = str(owner.get("display_name") or "").strip()
-            open_id = str(owner.get("feishu_open_id") or "").strip()
-            if open_id:
-                owner_mentions.append(f"<at id={open_id}>{name or open_id}</at>")
-            elif name:
-                owner_mentions.append(f"@{name}")
-        lines.append("- 当前环节：{} · 域：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), " ".join(owner_mentions) or "未设置"))
+    for node in current_nodes[:3]:
+        lines.append("- 当前环节：{} · 域：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node)))
     return lines
+
+
+def _missing_schedule_lines(requirement: Dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    for node in _ordered_nodes(requirement):
+        if str(node.get("status") or "") in {"completed", "skipped"}:
+            continue
+        if node.get("planned_start") and node.get("planned_end"):
+            continue
+        lines.append("- 待补时间：{} · 域：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node)))
+    return lines[:3]
 
 
 def _link_buttons(requirement: Dict[str, object]) -> list[Dict[str, object]]:
@@ -87,23 +134,28 @@ def _link_buttons(requirement: Dict[str, object]) -> list[Dict[str, object]]:
 def _risk_card(requirement: Dict[str, object], *, include_ai: bool = True) -> Dict[str, object]:
     labels = {1: "预警", 2: "严重"}
     risk_label = labels.get(requirement["risk_level"], "正常")
-    reasons = list(requirement.get("risk_reasons") or [])[:5]
+    reasons = list(requirement.get("risk_reasons") or [])[:2]
     mentions = _risk_owner_mentions(requirement)
     current_lines = _current_node_lines(requirement)
-    content = "**{} · {}**\n风险等级：{}\n当前节点：\n{}\n{}".format(
-        f"#{requirement['sequence_id']}",
-        requirement["name"],
-        labels.get(requirement["risk_level"], "正常"),
-        "\n".join(current_lines) or "当前环节：暂无",
-        "\n".join(f"- {reason}" for reason in reasons),
-    )
+    missing_lines = _missing_schedule_lines(requirement)
+    sections = [f"**#{requirement['sequence_id']} · {requirement['name']}**", f"风险等级：{risk_label}"]
+    if current_lines:
+        sections.append("当前节点：\n" + "\n".join(current_lines))
+    if missing_lines:
+        sections.append("待补时间：\n" + "\n".join(missing_lines))
+    if reasons:
+        sections.append("风险：" + "；".join(str(reason) for reason in reasons))
+    content = "\n\n".join(sections)
     if mentions and not current_lines:
         content += "\n\n负责人：" + " ".join(mentions)
     analysis = requirement.get("ai_analysis")
     if include_ai and isinstance(analysis, dict):
-        actions = list(analysis.get("actions") or [])[:3]
+        summary = str(analysis.get("summary") or "暂无结论").strip()
+        if len(summary) > 120:
+            summary = summary[:117] + "…"
+        actions = list(analysis.get("actions") or [])[:2]
         action_lines = [f"- {item.get('action')}" for item in actions if isinstance(item, dict) and item.get("action")]
-        content += "\n\n**AI 综合分析**\n{}".format(analysis.get("summary") or "暂无结论")
+        content += "\n\n**AI：**{}".format(summary)
         if action_lines:
             content += "\n**建议动作**\n" + "\n".join(action_lines)
     elements: list[Dict[str, object]] = [{"tag": "markdown", "content": content}]
@@ -179,11 +231,7 @@ def _enqueue_notifications(database_url: str, scope: str, *, force: bool = False
             continue
         requirement = get_requirement(database_url, str(summary["id"])) or summary
         payload = _risk_card(requirement, include_ai=bool(ai_settings["include_in_feishu"]))
-        if force:
-            deduplication_key = "manual:{}:{}".format(requirement["id"], datetime.now(timezone.utc).isoformat())
-        else:
-            fingerprint = hashlib.sha256(json.dumps([requirement["id"], payload], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-            deduplication_key = f"risk:{fingerprint}"
+        deduplication_key = "notification:{}:{}:{}".format(requirement["id"], datetime.now(timezone.utc).isoformat(), uuid.uuid4().hex)
         result = enqueue_notification(database_url, payload, deduplication_key=deduplication_key)
         if not result.get("duplicate"):
             enqueued += 1

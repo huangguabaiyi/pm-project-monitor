@@ -56,6 +56,8 @@ from .service import (
     update_person,
     update_requirement,
     update_requirement_node,
+    batch_update_requirement_nodes,
+    batch_update_requirement_node_owners,
     update_template,
     update_webhook_settings,
 )
@@ -175,6 +177,17 @@ class RequirementNodePatch(BaseModel):
     blocked_reason: Optional[str] = None
     notes: Optional[str] = None
     owner_ids: Optional[List[str]] = None
+
+
+class RequirementNodesBatchStatus(BaseModel):
+    node_ids: List[str] = Field(min_length=1)
+    status: str
+
+
+class RequirementNodesBatchOwners(BaseModel):
+    node_ids: List[str] = Field(min_length=1)
+    owner_ids: List[str] = []
+    mode: str = "replace"
 
 
 class RequirementNodeInput(BaseModel):
@@ -430,6 +443,22 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
         if result is None:
             raise HTTPException(404, "requirement not found")
         return {"ok": True}
+
+    @app.post("/api/requirement-nodes/batch-status")
+    def requirement_nodes_batch_status(payload: RequirementNodesBatchStatus):
+        try:
+            updated = batch_update_requirement_nodes(db(), payload.node_ids, payload.status)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return {"updated": updated, "count": len(updated)}
+
+    @app.post("/api/requirement-nodes/batch-owners")
+    def requirement_nodes_batch_owners(payload: RequirementNodesBatchOwners):
+        try:
+            updated = batch_update_requirement_node_owners(db(), payload.node_ids, payload.owner_ids, payload.mode)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return {"updated": updated, "count": len(updated)}
 
     @app.patch("/api/requirement-nodes/{node_id}")
     def requirement_nodes_update(node_id: str, payload: RequirementNodePatch):

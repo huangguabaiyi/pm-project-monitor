@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import Boolean, DateTime, func, insert, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from .ai_analysis import (
@@ -48,6 +49,7 @@ SCHEDULE_KINDS = {"interval", "cron"}
 NOTIFICATION_SCOPES = {"all", "risk_only"}
 BACKUP_FORMAT_VERSION = 1
 SETTINGS_TABLES = {"webhook_settings", "ai_settings", "scheduled_jobs"}
+PRESERVED_SETTINGS_DEPENDENCIES = {"job_runs"}
 
 
 def _json_value(value: object) -> object:
@@ -131,13 +133,17 @@ def import_data(database_url: str, backup: Mapping[str, object], *, preserve_set
 
     engine = create_database_engine(database_url)
     imported: Dict[str, int] = {}
+    skipped_tables = set(SETTINGS_TABLES) if preserve_settings else set()
+    if preserve_settings:
+        skipped_tables.update(PRESERVED_SETTINGS_DEPENDENCIES)
     with engine.begin() as connection:
         for table in reversed(_database_tables()):
-            if preserve_settings and table.name in SETTINGS_TABLES:
+            if table.name in skipped_tables:
                 continue
             connection.execute(table.delete())
         for table in _database_tables():
-            if preserve_settings and table.name in SETTINGS_TABLES:
+            if table.name in skipped_tables:
+                imported[table.name] = 0
                 continue
             rows = raw_tables.get(table.name, [])
             if not isinstance(rows, list):
@@ -154,7 +160,10 @@ def import_data(database_url: str, backup: Mapping[str, object], *, preserve_set
                     }
                 )
             if payload:
-                connection.execute(insert(table), payload)
+                try:
+                    connection.execute(insert(table), payload)
+                except IntegrityError as error:
+                    raise ValueError(f"backup table {table.name} contains incompatible references") from error
             imported[table.name] = len(payload)
     return {"ok": True, "preserve_settings": preserve_settings, "imported": imported}
 
@@ -636,6 +645,71 @@ def update_requirement_node(database_url: str, node_id: str, data: Mapping[str, 
         if requirement is not None:
             _evaluate_requirement(requirement, persist=True)
         return _node_dict(row)
+
+
+def batch_update_requirement_nodes(database_url: str, node_ids: Sequence[str], status: str) -> List[Dict[str, object]]:
+    if status not in NODE_STATUSES:
+        raise ValueError("invalid node status")
+    normalized_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids if str(node_id).strip()))
+    if not normalized_ids:
+        raise ValueError("node_ids are required")
+    with session_scope(database_url) as session:
+        rows = list(session.scalars(select(RequirementNodeRow).where(RequirementNodeRow.id.in_(normalized_ids)).options(selectinload(RequirementNodeRow.owners))))
+        if len(rows) != len(normalized_ids):
+            raise ValueError("requirement node not found")
+        requirement_ids = {row.requirement_id for row in rows}
+        requirements = {
+            requirement.id: requirement
+            for requirement in session.scalars(
+                select(RequirementRow)
+                .where(RequirementRow.id.in_(requirement_ids))
+                .options(
+                    selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners),
+                    selectinload(RequirementRow.edges),
+                    selectinload(RequirementRow.owner),
+                )
+            )
+        }
+        now = _utc_now()
+        for row in rows:
+            if status == "in_progress" and row.actual_start is None:
+                row.actual_start = now
+            if status == "completed" and row.actual_end is None:
+                row.actual_end = now
+                row.actual_start = row.actual_start or row.actual_end
+                row.blocked_reason = ""
+            if status != "blocked" and row.status == "blocked":
+                row.blocked_reason = ""
+            row.status = status
+        session.flush()
+        for requirement in requirements.values():
+            _evaluate_requirement(requirement, persist=True)
+        return [_node_dict(row) for row in rows]
+
+
+def batch_update_requirement_node_owners(database_url: str, node_ids: Sequence[str], owner_ids: Sequence[str], mode: str = "replace") -> List[Dict[str, object]]:
+    if mode not in {"replace", "append"}:
+        raise ValueError("invalid owner update mode")
+    normalized_node_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids if str(node_id).strip()))
+    normalized_owner_ids = list(dict.fromkeys(str(owner_id) for owner_id in owner_ids if str(owner_id).strip()))
+    if not normalized_node_ids:
+        raise ValueError("node_ids are required")
+    with session_scope(database_url) as session:
+        rows = list(session.scalars(select(RequirementNodeRow).where(RequirementNodeRow.id.in_(normalized_node_ids)).options(selectinload(RequirementNodeRow.owners))))
+        if len(rows) != len(normalized_node_ids):
+            raise ValueError("requirement node not found")
+        owners = [session.get(PersonRow, owner_id) for owner_id in normalized_owner_ids]
+        if any(owner is None for owner in owners):
+            raise ValueError("node owner not found")
+        for row in rows:
+            if mode == "replace":
+                row.owners = [owner for owner in owners if owner]
+            else:
+                existing = {owner.id: owner for owner in row.owners}
+                existing.update({owner.id: owner for owner in owners if owner})
+                row.owners = list(existing.values())
+        session.flush()
+        return [_node_dict(row) for row in rows]
 
 
 def add_requirement_node(database_url: str, requirement_id: str, data: Mapping[str, object]) -> Dict[str, object]:
