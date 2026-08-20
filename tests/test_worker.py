@@ -3,7 +3,7 @@ from pathlib import Path
 from requirement_monitor.database import initialize_database
 from datetime import datetime, timedelta, timezone
 
-from requirement_monitor.service import create_domain, create_person, create_definition, create_template, add_template_node, create_requirement, get_requirement, list_jobs, list_notifications, update_requirement_node
+from requirement_monitor.service import create_domain, create_person, create_definition, create_template, add_template_node, create_requirement, get_requirement, list_jobs, list_notifications, update_requirement, update_requirement_node
 from requirement_monitor.worker import _enqueue_notifications, _risk_card, worker_loop
 
 
@@ -54,9 +54,9 @@ def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
     assert payload["msg_type"] == "interactive"
     assert payload["card"]["header"]["title"]["content"] == "严重 · 支付链路改造"
     content = payload["card"]["elements"][0]["content"]
-    assert "- 当前环节：开发 · 域：服务端 · 负责人：<at id=ou_backend>沈言</at>" in content
-    assert "风险原因：开发节点已逾期" in content
-    assert "- 当前环节：测试 · 域：质量 · 负责人：@陈默" in content
+    assert "- **开发 · 服务端** · 负责人：<at id=ou_backend>沈言</at>" in content
+    assert "风险：已逾期" in content
+    assert "- **测试 · 质量** · 负责人：@陈默" in content
     assert "<at id=ou_backend>沈言</at>" in content
     assert "@陈默" in content
     assert "周屿" not in content
@@ -110,9 +110,49 @@ def test_risk_card_is_compact_and_lists_missing_schedule_with_multiple_owners():
         }
     )
     content = payload["card"]["elements"][0]["content"]
-    assert "当前环节：开发 · 域：服务端 · 负责人：<at id=ou_zhang>张三</at> @李四" in content
-    assert "待补时间：\n- 待补时间：测试 · 域：质量 · 负责人：<at id=ou_wang>王五</at>" in content
+    assert "**开发 · 服务端** · 负责人：<at id=ou_zhang>张三</at> @李四" in content
+    assert "**待补计划**\n- 测试 · 质量 · <at id=ou_wang>王五</at>" in content
     assert "不要展示的长风险" not in content
+
+
+def test_risk_card_compacts_node_reasons_and_separates_ai_section():
+    payload = _risk_card(
+        {
+            "sequence_id": 9,
+            "name": "快捷跳转",
+            "risk_level": 1,
+            "risk_reasons": [],
+            "current_node_ids": [],
+            "nodes": [
+                {
+                    "id": "pv",
+                    "name": "PV测试",
+                    "domain_name": "客户端",
+                    "status": "not_started",
+                    "risk_level": 1,
+                    "risk_reasons": [
+                        "“PV测试”尚未设置计划开始和结束时间",
+                        "后续节点“合版”已有开始时间，但前置节点“PV测试”尚未设置计划结束时间",
+                        "重复且不应展示",
+                    ],
+                    "owners": [],
+                }
+            ],
+            "ai_analysis": {
+                "summary": "当前主要风险是前置计划缺失。",
+                "actions": [{"action": "补齐 PV 测试排期"}],
+            },
+        }
+    )
+
+    elements = payload["card"]["elements"]
+    assert "**PV测试 · 客户端**：未设置计划时间；影响「合版」启动" in elements[0]["content"]
+    assert "尚未设置计划开始和结束时间" not in elements[0]["content"]
+    assert elements[1] == {"tag": "hr"}
+    assert "**AI 风险总结**" in elements[2]["content"]
+    assert "###" not in elements[2]["content"]
+    assert "**结论**" in elements[2]["content"]
+    assert "**建议动作**" in elements[2]["content"]
 
 
 def test_worker_creates_default_automation_jobs(tmp_path: Path):
@@ -142,3 +182,23 @@ def test_notification_scope_controls_generated_cards_without_fingerprint_dedup(t
     assert _enqueue_notifications(database_url, "all") == 1
     assert _enqueue_notifications(database_url, "all") == 1
     assert len(list_notifications(database_url)) == 2
+
+
+def test_planned_and_archived_requirements_are_excluded_from_notifications(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'notification-lifecycle.db'}"
+    initialize_database(database_url)
+    domain = create_domain(database_url, {"name": "产品"})
+    owner = create_person(database_url, {"display_name": "林夏"})
+    definition = create_definition(database_url, {"name": "评审", "domain_id": domain["id"]})
+    template = create_template(database_url, {"name": "状态通知模板"})
+    add_template_node(database_url, template["id"], {"definition_id": definition["id"]})
+    active = create_requirement(database_url, {"name": "进行中需求", "owner_id": owner["id"], "template_id": template["id"]})
+    create_requirement(database_url, {"name": "计划需求", "owner_id": owner["id"], "template_id": template["id"], "lifecycle_status": "planned"})
+    create_requirement(database_url, {"name": "归档需求", "owner_id": owner["id"], "template_id": template["id"], "lifecycle_status": "archived"})
+
+    assert _enqueue_notifications(database_url, "all") == 1
+    pending = list_notifications(database_url)
+    assert len(pending) == 1
+    update_requirement(database_url, active["id"], {"lifecycle_status": "planned"})
+    assert list_notifications(database_url)[0]["status"] == "canceled"
+    assert _enqueue_notifications(database_url, "all") == 0

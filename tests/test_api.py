@@ -96,6 +96,52 @@ def test_requirement_graph_can_add_move_connect_and_delete_nodes(tmp_path: Path)
     assert detail["edges"] == []
 
 
+def test_template_can_be_copied_with_nodes_edges_domains_and_positions(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'template-copy.db'}"))
+    domain = client.post("/api/domains", json={"name": "客户端", "color": "#24704b"}).json()
+    first = client.post("/api/node-definitions", json={"name": "开发", "domain_id": domain["id"]}).json()
+    second = client.post("/api/node-definitions", json={"name": "测试", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "客户端流程", "description": "原模板说明"}).json()
+    node_a = client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": first["id"], "domain_id": domain["id"], "position_x": 80, "position_y": 120}).json()
+    node_b = client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": second["id"], "domain_id": domain["id"], "position_x": 360, "position_y": 120}).json()
+    client.post(f"/api/templates/{template['id']}/edges", json={"source": node_a["id"], "target": node_b["id"]})
+
+    copied = client.post(f"/api/templates/{template['id']}/copy", json={})
+
+    assert copied.status_code == 201
+    payload = copied.json()
+    assert payload["name"] == "客户端流程（副本）"
+    assert payload["description"] == "原模板说明"
+    assert len(payload["nodes"]) == 2
+    assert len(payload["edges"]) == 1
+    assert {node["definition_id"] for node in payload["nodes"]} == {first["id"], second["id"]}
+    assert {node["domain_id"] for node in payload["nodes"]} == {domain["id"]}
+    assert {tuple(node["position"].values()) for node in payload["nodes"]} == {(80.0, 120.0), (360.0, 120.0)}
+    assert {node["id"] for node in payload["nodes"]}.isdisjoint({node_a["id"], node_b["id"]})
+    copied_node_ids = {node["id"] for node in payload["nodes"]}
+    assert payload["edges"][0]["source"] in copied_node_ids
+    assert payload["edges"][0]["target"] in copied_node_ids
+
+
+def test_template_can_be_deleted_without_removing_existing_requirements(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'template-delete.db'}"))
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    domain = client.post("/api/domains", json={"name": "产品", "color": "#24704b"}).json()
+    definition = client.post("/api/node-definitions", json={"name": "评审", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "待删除模板"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition["id"]})
+    requirement = client.post("/api/requirements", json={"name": "已创建需求", "owner_id": owner["id"], "template_id": template["id"]}).json()
+
+    deleted = client.delete(f"/api/templates/{template['id']}")
+
+    assert deleted.status_code == 200
+    assert client.get(f"/api/templates/{template['id']}").status_code == 404
+    requirement_detail = client.get(f"/api/requirements/{requirement['id']}")
+    assert requirement_detail.status_code == 200
+    assert requirement_detail.json()["name"] == "已创建需求"
+    assert len(requirement_detail.json()["nodes"]) == 1
+
+
 def test_requirement_graph_supports_batch_move_and_delete(tmp_path: Path):
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'requirement-graph-batch.db'}"))
     owner = client.post("/api/people", json={"display_name": "林夏"}).json()
@@ -300,10 +346,44 @@ def test_requirement_can_be_edited_and_archived(tmp_path: Path):
     assert updated.json()["owner_id"] == replacement_owner["id"]
     assert updated.json()["target_version"] == "v2.0"
     assert updated.json()["archived"] is True
+    assert updated.json()["lifecycle_status"] == "archived"
 
     restored = client.patch(f"/api/requirements/{requirement['id']}", json={"archived": False})
     assert restored.status_code == 200
     assert restored.json()["archived"] is False
+    assert restored.json()["lifecycle_status"] == "active"
+
+
+def test_requirement_supports_planned_lifecycle_without_risk_or_ai(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'planned-requirement.db'}"))
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    domain = client.post("/api/domains", json={"name": "研发"}).json()
+    definition = client.post("/api/node-definitions", json={"name": "开发", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "计划需求模板"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition["id"]})
+
+    planned = client.post("/api/requirements", json={"name": "下季度需求", "owner_id": owner["id"], "template_id": template["id"], "lifecycle_status": "planned"})
+    assert planned.status_code == 201
+    assert planned.json()["lifecycle_status"] == "planned"
+    assert planned.json()["archived"] is False
+    assert planned.json()["risk_level"] == 0
+    assert planned.json()["risk_reasons"] == []
+
+    client.patch("/api/ai-settings", json={"enabled": True})
+    analysis = client.post(f"/api/requirements/{planned.json()['id']}/ai-analysis")
+    assert analysis.status_code == 400
+    assert "不参与 AI 总结" in analysis.json()["detail"]
+
+    active = client.patch(f"/api/requirements/{planned.json()['id']}", json={"lifecycle_status": "active"})
+    assert active.status_code == 200
+    assert active.json()["lifecycle_status"] == "active"
+    assert active.json()["risk_level"] == 1
+
+    archived = client.patch(f"/api/requirements/{planned.json()['id']}", json={"lifecycle_status": "archived"})
+    assert archived.status_code == 200
+    assert archived.json()["archived"] is True
+    assert archived.json()["risk_level"] == 0
+    assert client.post(f"/api/requirements/{planned.json()['id']}/ai-analysis").status_code == 400
 
 
 def test_manual_notification_run_refreshes_generates_and_delivers(monkeypatch, tmp_path: Path):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -11,7 +12,7 @@ from typing import Dict, Optional
 from sqlalchemy import select
 
 from .config import load_settings
-from .database import JobRunRow, NotificationDeliveryRow, NotificationOutboxRow, ScheduledJobRow, session_scope
+from .database import JobRunRow, NotificationDeliveryRow, NotificationOutboxRow, RequirementRow, ScheduledJobRow, session_scope
 from .scheduler import next_cron_run
 from .service import analyze_all_requirements, create_job, enqueue_notification, evaluate_all_requirements, get_ai_settings, get_requirement, get_webhook_settings, list_jobs, list_requirements, update_job
 from .webhook import WebhookSender
@@ -89,15 +90,50 @@ def _owner_mentions(node: Dict[str, object]) -> str:
     return " ".join(mentions) or "未设置"
 
 
+def _compact_risk_reason(reason: object, node_name: str = "") -> str:
+    text = str(reason or "").strip().rstrip("；。· ")
+    if not text:
+        return ""
+    later_node = re.fullmatch(r"后续节点[“\"](.+?)[”\"]已有开始时间，但前置节点[“\"](.+?)[”\"]尚未设置计划结束时间", text)
+    if later_node:
+        return f"影响「{later_node.group(1)}」启动"
+    if node_name:
+        for prefix in (f"“{node_name}”", f'"{node_name}"', node_name):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip("节点：: ")
+                break
+    replacements = {
+        "尚未设置计划开始和结束时间": "未设置计划时间",
+        "尚未设置计划开始时间": "未设置开始时间",
+        "尚未设置计划结束时间": "未设置结束时间",
+        "节点已逾期": "已逾期",
+        "已超过计划结束时间": "已逾期",
+        "节点前置未完成": "前置未完成",
+    }
+    return replacements.get(text, text)
+
+
+def _compact_node_reasons(node: Dict[str, object]) -> list[str]:
+    node_name = str(node.get("name") or "").strip()
+    compact: list[str] = []
+    for reason in node.get("risk_reasons") or []:
+        text = _compact_risk_reason(reason, node_name)
+        if text and text not in compact:
+            compact.append(text)
+        if len(compact) == 2:
+            break
+    return compact
+
+
 def _current_node_lines(requirement: Dict[str, object]) -> list[str]:
     nodes = _ordered_nodes(requirement)
     current_ids = {str(item) for item in requirement.get("current_node_ids") or []}
     current_nodes = [node for node in nodes if isinstance(node, dict) and ((current_ids and str(node.get("id")) in current_ids) or (not current_ids and int(node.get("risk_level") or 0) > 0)) and str(node.get("name") or "").strip()]
     lines: list[str] = []
     for node in current_nodes[:3]:
-        reasons = [str(reason) for reason in (node.get("risk_reasons") or []) if str(reason).strip()][:2]
-        reason_text = f" · 风险原因：{'；'.join(reasons)}" if reasons else ""
-        lines.append("- 当前环节：{} · 域：{} · 负责人：{}{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node), reason_text))
+        reasons = _compact_node_reasons(node)
+        reason_text = f" · 风险：{'；'.join(reasons)}" if reasons else ""
+        lines.append("- **{} · {}** · 负责人：{}{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node), reason_text))
     return lines
 
 
@@ -107,10 +143,10 @@ def _risk_node_lines(requirement: Dict[str, object]) -> list[str]:
     for node in _ordered_nodes(requirement):
         if str(node.get("id") or "") in current_ids or int(node.get("risk_level") or 0) == 0:
             continue
-        reasons = [str(reason) for reason in (node.get("risk_reasons") or []) if str(reason).strip()][:2]
+        reasons = _compact_node_reasons(node)
         if not reasons:
             continue
-        lines.append("- 风险节点：{} · 域：{} · 原因：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), "；".join(reasons), _owner_mentions(node)))
+        lines.append("- **{} · {}**：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), "；".join(reasons), _owner_mentions(node)))
     return lines[:3]
 
 
@@ -121,7 +157,7 @@ def _missing_schedule_lines(requirement: Dict[str, object]) -> list[str]:
             continue
         if node.get("planned_start") and node.get("planned_end"):
             continue
-        lines.append("- 待补时间：{} · 域：{} · 负责人：{}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node)))
+        lines.append("- {} · {} · {}".format(str(node.get("name") or ""), str(node.get("domain_name") or "未分配域"), _owner_mentions(node)))
     return lines[:3]
 
 
@@ -149,23 +185,30 @@ def _link_buttons(requirement: Dict[str, object]) -> list[Dict[str, object]]:
 def _risk_card(requirement: Dict[str, object], *, include_ai: bool = True) -> Dict[str, object]:
     labels = {1: "预警", 2: "严重"}
     risk_label = labels.get(requirement["risk_level"], "正常")
-    reasons = list(requirement.get("risk_reasons") or [])[:2]
+    reasons = []
+    for reason in requirement.get("risk_reasons") or []:
+        compact_reason = _compact_risk_reason(reason)
+        if compact_reason and compact_reason not in reasons:
+            reasons.append(compact_reason)
+        if len(reasons) == 2:
+            break
     mentions = _risk_owner_mentions(requirement)
     current_lines = _current_node_lines(requirement)
     risk_node_lines = _risk_node_lines(requirement)
     missing_lines = _missing_schedule_lines(requirement)
-    sections = [f"**#{requirement['sequence_id']} · {requirement['name']}**", f"风险等级：{risk_label}"]
+    sections = [f"**#{requirement['sequence_id']} · {requirement['name']}**", f"**风险等级**  {risk_label}"]
     if current_lines:
-        sections.append("当前节点：\n" + "\n".join(current_lines))
+        sections.append("**当前环节**\n" + "\n".join(current_lines))
     if risk_node_lines:
-        sections.append("风险节点：\n" + "\n".join(risk_node_lines))
+        sections.append("**风险节点**\n" + "\n".join(risk_node_lines))
     if missing_lines:
-        sections.append("待补时间：\n" + "\n".join(missing_lines))
-    if reasons:
-        sections.append("风险：" + "；".join(str(reason) for reason in reasons))
+        sections.append("**待补计划**\n" + "\n".join(missing_lines))
+    if reasons and not current_lines and not risk_node_lines:
+        sections.append("**风险原因**  " + "；".join(reasons))
     content = "\n\n".join(sections)
     if mentions and not current_lines:
         content += "\n\n负责人：" + " ".join(mentions)
+    elements: list[Dict[str, object]] = [{"tag": "markdown", "content": content}]
     analysis = requirement.get("ai_analysis")
     if include_ai and isinstance(analysis, dict):
         summary = str(analysis.get("summary") or "暂无结论").strip()
@@ -173,10 +216,11 @@ def _risk_card(requirement: Dict[str, object], *, include_ai: bool = True) -> Di
             summary = summary[:117] + "…"
         actions = list(analysis.get("actions") or [])[:2]
         action_lines = [f"- {item.get('action')}" for item in actions if isinstance(item, dict) and item.get("action")]
-        content += "\n\n**AI：**{}".format(summary)
+        ai_sections = ["**AI 风险总结**", f"**结论**\n{summary}"]
         if action_lines:
-            content += "\n**建议动作**\n" + "\n".join(action_lines)
-    elements: list[Dict[str, object]] = [{"tag": "markdown", "content": content}]
+            ai_sections.append("**建议动作**\n" + "\n".join(action_lines))
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "\n\n".join(ai_sections)})
     buttons = _link_buttons(requirement)
     if buttons:
         elements.append({"tag": "action", "actions": buttons})
@@ -245,12 +289,12 @@ def _enqueue_notifications(database_url: str, scope: str, *, force: bool = False
     ai_settings = get_ai_settings(database_url)
     enqueued = 0
     for summary in list_requirements(database_url):
-        if summary["archived"] or (scope == "risk_only" and summary["risk_level"] == 0):
+        if summary.get("lifecycle_status") != "active" or (scope == "risk_only" and summary["risk_level"] == 0):
             continue
         requirement = get_requirement(database_url, str(summary["id"])) or summary
         payload = _risk_card(requirement, include_ai=bool(ai_settings["include_in_feishu"]))
         deduplication_key = "notification:{}:{}:{}".format(requirement["id"], datetime.now(timezone.utc).isoformat(), uuid.uuid4().hex)
-        result = enqueue_notification(database_url, payload, deduplication_key=deduplication_key)
+        result = enqueue_notification(database_url, payload, deduplication_key=deduplication_key, requirement_id=str(requirement["id"]))
         if not result.get("duplicate"):
             enqueued += 1
     return enqueued
@@ -289,6 +333,12 @@ def deliver_outbox(database_url: str, config_path: Path, limit: int = 50, *, not
         for outbox_id in ids:
             with session_scope(database_url) as session:
                 row = session.get(NotificationOutboxRow, outbox_id)
+                if row and row.requirement_id:
+                    requirement = session.get(RequirementRow, row.requirement_id)
+                    if requirement is None or requirement.lifecycle_status != "active":
+                        row.status = "canceled"
+                        row.last_error = "requirement is not active"
+                        row = None
                 payload = dict(row.payload) if row and row.status == "pending" else None
             if payload is None:
                 continue

@@ -45,6 +45,7 @@ from .webhook_url import is_allowed_webhook_url
 
 
 NODE_STATUSES = {"not_started", "in_progress", "blocked", "completed", "skipped"}
+REQUIREMENT_LIFECYCLE_STATUSES = {"active", "planned", "archived"}
 JOB_TYPES = {"risk_scan", "outbox_delivery", "ai_analysis"}
 SCHEDULE_KINDS = {"interval", "cron"}
 NOTIFICATION_SCOPES = {"all", "risk_only"}
@@ -159,13 +160,14 @@ def import_data(database_url: str, backup: Mapping[str, object], *, preserve_set
             for row in rows:
                 if not isinstance(row, Mapping):
                     raise ValueError("backup table {} contains invalid row".format(table.name))
-                payload.append(
-                    {
-                        column.name: _restore_value(row[column.name], column, table_name=table.name)
-                        for column in table.columns
-                        if column.name in row
-                    }
-                )
+                restored = {
+                    column.name: _restore_value(row[column.name], column, table_name=table.name)
+                    for column in table.columns
+                    if column.name in row
+                }
+                if table.name == "requirements" and "lifecycle_status" not in restored:
+                    restored["lifecycle_status"] = "archived" if bool(restored.get("archived")) else "active"
+                payload.append(restored)
             if payload:
                 try:
                     connection.execute(insert(table), payload)
@@ -370,6 +372,62 @@ def create_template(database_url: str, data: Mapping[str, object]) -> Dict[str, 
         return _template_summary(row)
 
 
+def copy_template(database_url: str, template_id: str, data: Mapping[str, object]) -> Dict[str, object]:
+    requested_name = str(data.get("name") or "").strip()
+    copied_template_id = ""
+    with session_scope(database_url) as session:
+        source = session.scalar(
+            select(WorkflowTemplateRow)
+            .where(WorkflowTemplateRow.id == template_id)
+            .options(selectinload(WorkflowTemplateRow.nodes), selectinload(WorkflowTemplateRow.edges))
+        )
+        if source is None:
+            raise ValueError("template not found")
+
+        if requested_name:
+            if session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.name == requested_name)):
+                raise ValueError("template name already exists")
+            copied_name = requested_name
+        else:
+            base_name = f"{source.name}（副本）"
+            copied_name = base_name
+            suffix = 2
+            while session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.name == copied_name)):
+                copied_name = f"{base_name}{suffix}"
+                suffix += 1
+
+        copied = WorkflowTemplateRow(name=copied_name, description=source.description, active=source.active)
+        session.add(copied)
+        session.flush()
+        node_ids: Dict[str, str] = {}
+        for source_node in source.nodes:
+            copied_node = WorkflowTemplateNodeRow(
+                template_id=copied.id,
+                definition_id=source_node.definition_id,
+                domain_id=source_node.domain_id,
+                position_x=source_node.position_x,
+                position_y=source_node.position_y,
+            )
+            session.add(copied_node)
+            session.flush()
+            node_ids[source_node.id] = copied_node.id
+        for source_edge in source.edges:
+            session.add(
+                WorkflowTemplateEdgeRow(
+                    template_id=copied.id,
+                    source_node_id=node_ids[source_edge.source_node_id],
+                    target_node_id=node_ids[source_edge.target_node_id],
+                )
+            )
+        session.flush()
+        copied_template_id = copied.id
+
+    result = get_template(database_url, copied_template_id)
+    if result is None:
+        raise ValueError("copied template not found")
+    return result
+
+
 def update_template(database_url: str, template_id: str, data: Mapping[str, object]) -> Optional[Dict[str, object]]:
     with session_scope(database_url) as session:
         row = session.get(WorkflowTemplateRow, template_id)
@@ -382,6 +440,15 @@ def update_template(database_url: str, template_id: str, data: Mapping[str, obje
             row.active = bool(data["active"])
         session.flush()
         return _template_summary(row)
+
+
+def delete_template(database_url: str, template_id: str) -> bool:
+    with session_scope(database_url) as session:
+        row = session.get(WorkflowTemplateRow, template_id)
+        if row is None:
+            return False
+        session.delete(row)
+        return True
 
 
 def _template_node(row: WorkflowTemplateNodeRow) -> Dict[str, object]:
@@ -513,28 +580,29 @@ def _node_dict(row: RequirementNodeRow) -> Dict[str, object]:
 
 def _evaluate_requirement(row: RequirementRow, *, persist: bool = False) -> Dict[str, object]:
     result = evaluate_schedule(row.nodes, row.edges)
+    participates = row.lifecycle_status == "active"
     if persist:
-        row.risk_level = int(result.level)
-        row.risk_reasons = result.reasons
-        row.last_evaluated_at = _utc_now()
+        row.risk_level = int(result.level) if participates else 0
+        row.risk_reasons = result.reasons if participates else []
+        row.last_evaluated_at = _utc_now() if participates else None
         for node in row.nodes:
             node_result = result.node_results[node.id]
-            node.risk_level = int(node_result.level)
-            node.risk_reasons = node_result.reasons
+            node.risk_level = int(node_result.level) if participates else 0
+            node.risk_reasons = node_result.reasons if participates else []
     current = [node for node in row.nodes if node.id in result.current_node_ids]
-    return {"risk_level": int(result.level), "risk_reasons": result.reasons, "completed_nodes": result.completed_nodes, "total_nodes": result.total_nodes, "progress": round(result.completed_nodes / result.total_nodes * 100) if result.total_nodes else 0, "current_nodes": [node.name for node in current], "current_node_ids": [node.id for node in current], "planned_completion": _api_datetime(result.planned_completion)}
+    return {"risk_level": int(result.level) if participates else 0, "risk_reasons": result.reasons if participates else [], "completed_nodes": result.completed_nodes, "total_nodes": result.total_nodes, "progress": round(result.completed_nodes / result.total_nodes * 100) if result.total_nodes else 0, "current_nodes": [node.name for node in current], "current_node_ids": [node.id for node in current], "planned_completion": _api_datetime(result.planned_completion)}
 
 
 def _requirement_dict(row: RequirementRow, *, with_graph: bool = False, persist: bool = False) -> Dict[str, object]:
     schedule = _evaluate_requirement(row, persist=persist)
     schedule_level = int(schedule["risk_level"])
-    ai_analysis = dict(row.ai_analysis) if row.ai_analysis else None
+    ai_analysis = dict(row.ai_analysis) if row.lifecycle_status == "active" and row.ai_analysis else None
     ai_level = {"normal": 0, "warning": 1, "severe": 2}.get(str((ai_analysis or {}).get("risk_level")), 0)
-    payload = {"id": row.id, "sequence_id": row.sequence_id, "name": row.name, "owner": _person(row.owner), "owner_id": row.owner_id, "template_id": row.template_id, "template_name": row.template_name, "template_version": row.template_version, "target_version": row.target_version, "meego_url": row.meego_url, "requirement_url": row.requirement_url, "figma_url": row.figma_url, "notes": row.notes, "archived": row.archived, "created_at": _api_datetime(row.created_at), "updated_at": _api_datetime(row.updated_at), **schedule, "schedule_risk_level": schedule_level, "risk_level": max(schedule_level, ai_level), "ai_enabled": row.ai_enabled, "ai_risk_level": ai_level if ai_analysis else None, "ai_analysis": ai_analysis, "ai_analyzed_at": _api_datetime(row.ai_analyzed_at), "ai_error": row.ai_error}
+    payload = {"id": row.id, "sequence_id": row.sequence_id, "name": row.name, "owner": _person(row.owner), "owner_id": row.owner_id, "template_id": row.template_id, "template_name": row.template_name, "template_version": row.template_version, "target_version": row.target_version, "meego_url": row.meego_url, "requirement_url": row.requirement_url, "figma_url": row.figma_url, "notes": row.notes, "lifecycle_status": row.lifecycle_status, "archived": row.lifecycle_status == "archived", "created_at": _api_datetime(row.created_at), "updated_at": _api_datetime(row.updated_at), **schedule, "schedule_risk_level": schedule_level, "risk_level": max(schedule_level, ai_level), "ai_enabled": row.ai_enabled, "ai_risk_level": ai_level if ai_analysis else None, "ai_analysis": ai_analysis, "ai_analyzed_at": _api_datetime(row.ai_analyzed_at), "ai_error": row.ai_error}
     graph_nodes = [_node_dict(node) for node in row.nodes]
     graph_edges = [{"id": edge.id, "source": edge.source_node_id, "target": edge.target_node_id} for edge in row.edges]
     analysis_source = {**payload, "nodes": graph_nodes, "edges": graph_edges}
-    payload["ai_stale"] = bool(row.ai_input_hash and row.ai_input_hash != input_fingerprint(requirement_ai_input(analysis_source)))
+    payload["ai_stale"] = row.lifecycle_status == "active" and bool(row.ai_input_hash and row.ai_input_hash != input_fingerprint(requirement_ai_input(analysis_source)))
     if with_graph:
         payload["nodes"] = graph_nodes
         payload["edges"] = graph_edges
@@ -543,7 +611,7 @@ def _requirement_dict(row: RequirementRow, *, with_graph: bool = False, persist:
 
 def list_requirements(database_url: str) -> List[Dict[str, object]]:
     with session_scope(database_url) as session:
-        rows = session.scalars(select(RequirementRow).options(selectinload(RequirementRow.owner), selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges)).order_by(RequirementRow.archived, RequirementRow.updated_at.desc()))
+        rows = session.scalars(select(RequirementRow).options(selectinload(RequirementRow.owner), selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges)).order_by(RequirementRow.updated_at.desc()))
         return [_requirement_dict(row, persist=True) for row in rows]
 
 
@@ -559,6 +627,9 @@ def create_requirement(database_url: str, data: Mapping[str, object]) -> Dict[st
     template_id = str(data.get("template_id") or "")
     if not name or not owner_id or not template_id:
         raise ValueError("name, owner_id and template_id are required")
+    lifecycle_status = str(data.get("lifecycle_status") or "active")
+    if lifecycle_status not in REQUIREMENT_LIFECYCLE_STATUSES:
+        raise ValueError("invalid requirement lifecycle status")
     with session_scope(database_url) as session:
         owner = session.get(PersonRow, owner_id)
         template = session.scalar(select(WorkflowTemplateRow).where(WorkflowTemplateRow.id == template_id).options(selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.definition).selectinload(NodeDefinitionRow.domain), selectinload(WorkflowTemplateRow.nodes).selectinload(WorkflowTemplateNodeRow.domain), selectinload(WorkflowTemplateRow.edges)))
@@ -574,7 +645,7 @@ def create_requirement(database_url: str, data: Mapping[str, object]) -> Dict[st
         else:
             next_value = counter.next_value
             counter.next_value += 1
-        row = RequirementRow(sequence_id=next_value, requirement_key=f"internal-{next_value}-{_new_id()}", name=name, owner_id=owner_id, template_id=template.id, template_name=template.name, template_version=template.version, target_version=str(data.get("target_version") or ""), meego_url=str(data.get("meego_url") or "") or None, requirement_url=str(data.get("requirement_url") or "") or None, figma_url=str(data.get("figma_url") or "") or None, notes=str(data.get("notes") or ""))
+        row = RequirementRow(sequence_id=next_value, requirement_key=f"internal-{next_value}-{_new_id()}", name=name, owner_id=owner_id, template_id=template.id, template_name=template.name, template_version=template.version, target_version=str(data.get("target_version") or ""), meego_url=str(data.get("meego_url") or "") or None, requirement_url=str(data.get("requirement_url") or "") or None, figma_url=str(data.get("figma_url") or "") or None, notes=str(data.get("notes") or ""), lifecycle_status=lifecycle_status, archived=lifecycle_status == "archived")
         session.add(row)
         session.flush()
         node_map: Dict[str, RequirementNodeRow] = {}
@@ -610,8 +681,26 @@ def update_requirement(database_url: str, requirement_id: str, data: Mapping[str
             if owner is None:
                 raise ValueError("owner not found")
             row.owner_id = owner.id
-        if "archived" in data:
-            row.archived = bool(data["archived"])
+        lifecycle_status = None
+        if "lifecycle_status" in data:
+            lifecycle_status = str(data["lifecycle_status"] or "")
+        elif "archived" in data:
+            lifecycle_status = "archived" if bool(data["archived"]) else "active"
+        if lifecycle_status is not None:
+            if lifecycle_status not in REQUIREMENT_LIFECYCLE_STATUSES:
+                raise ValueError("invalid requirement lifecycle status")
+            row.lifecycle_status = lifecycle_status
+            row.archived = lifecycle_status == "archived"
+            if lifecycle_status != "active":
+                row.ai_analysis = None
+                row.ai_analyzed_at = None
+                row.ai_input_hash = None
+                row.ai_error = None
+                pending_notifications = session.scalars(select(NotificationOutboxRow).where(NotificationOutboxRow.requirement_id == row.id, NotificationOutboxRow.status.in_(["pending", "dead"])))
+                for notification in pending_notifications:
+                    notification.status = "canceled"
+                    notification.last_error = "requirement is not active"
+            _evaluate_requirement(row, persist=True)
         if "ai_enabled" in data:
             row.ai_enabled = bool(data["ai_enabled"])
             if not row.ai_enabled:
@@ -887,7 +976,7 @@ def delete_requirement_edge(database_url: str, edge_id: str) -> bool:
 
 def evaluate_all_requirements(database_url: str) -> Dict[str, int]:
     with session_scope(database_url) as session:
-        rows = list(session.scalars(select(RequirementRow).where(RequirementRow.archived.is_(False)).options(selectinload(RequirementRow.owner), selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges))))
+        rows = list(session.scalars(select(RequirementRow).where(RequirementRow.lifecycle_status == "active").options(selectinload(RequirementRow.owner), selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges))))
         counts = {"normal": 0, "warning": 0, "severe": 0}
         for row in rows:
             summary = _evaluate_requirement(row, persist=True)
@@ -896,7 +985,7 @@ def evaluate_all_requirements(database_url: str) -> Dict[str, int]:
 
 
 def dashboard_summary(database_url: str) -> Dict[str, object]:
-    requirements = [row for row in list_requirements(database_url) if not row["archived"]]
+    requirements = [row for row in list_requirements(database_url) if row["lifecycle_status"] == "active"]
     return {"counts": {"requirements": len(requirements), "normal": sum(row["risk_level"] == 0 for row in requirements), "warning": sum(row["risk_level"] == 1 for row in requirements), "severe": sum(row["risk_level"] == 2 for row in requirements), "active_nodes": sum(bool(row["current_nodes"]) for row in requirements)}, "requirements": requirements[:12], "jobs": list_jobs(database_url), "notifications": list_notifications(database_url, 10)}
 
 
@@ -1008,13 +1097,13 @@ def trigger_job(database_url: str, job_id: str) -> Optional[Dict[str, object]]:
         return _job(row)
 
 
-def enqueue_notification(database_url: str, payload: Mapping[str, object], *, deduplication_key: Optional[str] = None) -> Dict[str, object]:
+def enqueue_notification(database_url: str, payload: Mapping[str, object], *, deduplication_key: Optional[str] = None, requirement_id: Optional[str] = None) -> Dict[str, object]:
     dedup = deduplication_key or hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
     with session_scope(database_url) as session:
         existing = session.scalar(select(NotificationOutboxRow).where(NotificationOutboxRow.deduplication_key == dedup))
         if existing:
             return {"id": existing.id, "status": existing.status, "duplicate": True}
-        row = NotificationOutboxRow(deduplication_key=dedup, payload=dict(payload))
+        row = NotificationOutboxRow(requirement_id=requirement_id, deduplication_key=dedup, payload=dict(payload))
         session.add(row)
         session.flush()
         return {"id": row.id, "status": row.status, "duplicate": False}
@@ -1147,6 +1236,8 @@ def analyze_requirement(database_url: str, requirement_id: str, *, force: bool =
     requirement = get_requirement(database_url, requirement_id)
     if requirement is None:
         raise LookupError("requirement not found")
+    if requirement.get("lifecycle_status") != "active":
+        raise ValueError("计划中或已归档需求不参与 AI 总结")
     if not requirement.get("ai_enabled", True):
         raise ValueError("该需求已关闭 AI 总结")
     payload = requirement_ai_input(requirement)
@@ -1186,7 +1277,7 @@ def analyze_all_requirements(database_url: str) -> Dict[str, int]:
     if not settings["enabled"] or not settings["auto_analyze"]:
         return counts
     for requirement in list_requirements(database_url):
-        if requirement["archived"] or not requirement.get("ai_enabled", True):
+        if requirement.get("lifecycle_status") != "active" or not requirement.get("ai_enabled", True):
             continue
         try:
             before = requirement.get("ai_analyzed_at")

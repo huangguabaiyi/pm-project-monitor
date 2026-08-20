@@ -149,6 +149,7 @@ class RequirementRow(Base):
     figma_url: Mapped[Optional[str]] = mapped_column(Text)
     notes: Mapped[str] = mapped_column(Text, default="")
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    lifecycle_status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     risk_level: Mapped[int] = mapped_column(Integer, default=0)
     risk_reasons: Mapped[List[str]] = mapped_column(JSON, default=list)
     last_evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -254,6 +255,7 @@ class NotificationOutboxRow(Base):
     __tablename__ = "notification_outbox"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_id)
+    requirement_id: Mapped[Optional[str]] = mapped_column(String(32), ForeignKey("requirements.id", ondelete="SET NULL"), index=True)
     deduplication_key: Mapped[str] = mapped_column(String(500), unique=True)
     payload: Mapped[Dict[str, object]] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(32), default="pending")
@@ -345,6 +347,12 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
             connection.execute(text("ALTER TABLE workflow_template_nodes ADD COLUMN domain_id VARCHAR(32)"))
             connection.execute(text("UPDATE workflow_template_nodes SET domain_id = (SELECT domain_id FROM node_definitions WHERE node_definitions.id = workflow_template_nodes.definition_id) WHERE domain_id IS NULL"))
     requirement_columns = {column["name"] for column in inspect(engine).get_columns("requirements")}
+    if "lifecycle_status" not in requirement_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE requirements ADD COLUMN lifecycle_status VARCHAR(32) NOT NULL DEFAULT 'active'"))
+            connection.execute(text("UPDATE requirements SET lifecycle_status = CASE WHEN archived THEN 'archived' ELSE 'active' END"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_requirements_lifecycle_status ON requirements (lifecycle_status)"))
+        requirement_columns.add("lifecycle_status")
     if "sequence_id" not in requirement_columns:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE requirements ADD COLUMN sequence_id INTEGER"))
@@ -370,6 +378,17 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
             for column, sql_type in job_migrations.items():
                 if column not in job_columns:
                     connection.execute(text(f"ALTER TABLE scheduled_jobs ADD COLUMN {column} {sql_type}"))
+    outbox_columns = {column["name"] for column in inspect(engine).get_columns("notification_outbox")}
+    if "requirement_id" not in outbox_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE notification_outbox ADD COLUMN requirement_id VARCHAR(32)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_notification_outbox_requirement_id ON notification_outbox (requirement_id)"))
+    with engine.begin() as connection:
+        rows = connection.execute(text("SELECT id, deduplication_key FROM notification_outbox WHERE requirement_id IS NULL")).fetchall()
+        for outbox_id, deduplication_key in rows:
+            parts = str(deduplication_key or "").split(":", 2)
+            if len(parts) >= 2 and parts[0] == "notification" and parts[1]:
+                connection.execute(text("UPDATE notification_outbox SET requirement_id=:requirement_id WHERE id=:id"), {"requirement_id": parts[1], "id": outbox_id})
     requirement_columns = {column["name"] for column in inspect(engine).get_columns("requirements")}
     ai_columns = {
         "ai_analysis": "JSON",

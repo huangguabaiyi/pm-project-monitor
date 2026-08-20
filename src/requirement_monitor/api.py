@@ -25,6 +25,7 @@ from .service import (
     create_person,
     create_requirement,
     create_template,
+    copy_template,
     clear_data,
     dashboard_summary,
     deactivate_definition,
@@ -32,6 +33,7 @@ from .service import (
     deactivate_person,
     delete_template_edge,
     delete_template_node,
+    delete_template,
     delete_requirement_edge,
     delete_requirement_node,
     clear_requirement_ai_analysis,
@@ -132,6 +134,10 @@ class TemplatePatch(BaseModel):
     active: Optional[bool] = None
 
 
+class TemplateCopyInput(BaseModel):
+    name: Optional[str] = None
+
+
 class TemplateNodeInput(BaseModel):
     definition_id: str
     domain_id: Optional[str] = None
@@ -158,6 +164,7 @@ class RequirementInput(BaseModel):
     requirement_url: Optional[AnyHttpUrl] = None
     figma_url: Optional[AnyHttpUrl] = None
     notes: str = ""
+    lifecycle_status: str = "active"
 
 
 class RequirementPatch(BaseModel):
@@ -169,6 +176,7 @@ class RequirementPatch(BaseModel):
     figma_url: Optional[AnyHttpUrl] = None
     notes: Optional[str] = None
     archived: Optional[bool] = None
+    lifecycle_status: Optional[str] = None
     ai_enabled: Optional[bool] = None
 
 
@@ -393,6 +401,21 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
         if result is None:
             raise HTTPException(404, "template not found")
         return result
+
+    @app.delete("/api/templates/{template_id}")
+    def templates_delete(template_id: str):
+        if not delete_template(db(), template_id):
+            raise HTTPException(404, "template not found")
+        return {"ok": True}
+
+    @app.post("/api/templates/{template_id}/copy", status_code=201)
+    def templates_copy(template_id: str, payload: TemplateCopyInput):
+        try:
+            return copy_template(db(), template_id, payload.model_dump())
+        except ValueError as error:
+            if str(error) == "template not found":
+                raise HTTPException(404, str(error)) from error
+            raise HTTPException(400, str(error)) from error
 
     @app.post("/api/templates/{template_id}/nodes", status_code=201)
     def template_nodes_create(template_id: str, payload: TemplateNodeInput):
@@ -660,13 +683,13 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
 
         @app.get("/", response_class=FileResponse)
         def index():
-            return FileResponse(web_dir / "index.html")
+            return FileResponse(web_dir / "index.html", headers={"Cache-Control": "no-store"})
 
         @app.get("/{full_path:path}", response_class=FileResponse)
         def spa_fallback(full_path: str):
             if full_path == "api" or full_path.startswith("api/"):
                 raise HTTPException(404, "not found")
-            return FileResponse(web_dir / "index.html")
+            return FileResponse(web_dir / "index.html", headers={"Cache-Control": "no-store"})
     return app
 
 

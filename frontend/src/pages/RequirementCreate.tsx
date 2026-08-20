@@ -3,7 +3,7 @@ import { FormEvent, useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { Field, PageHead, Toast } from '../components'
-import type { Person, Requirement, Template } from '../types'
+import type { Person, Requirement, RequirementLifecycleStatus, Template } from '../types'
 
 export default function RequirementCreate(){
   const nav=useNavigate()
@@ -11,6 +11,7 @@ export default function RequirementCreate(){
   const [templates,setTemplates]=useState<Template[]>([])
   const [error,setError]=useState('')
   const [saving,setSaving]=useState(false)
+  const [lifecycleStatus,setLifecycleStatus]=useState<RequirementLifecycleStatus>('active')
   useEffect(()=>{Promise.all([api.get<Person[]>('/people'),api.get<Template[]>('/templates')]).then(([p,t])=>{setPeople(p.filter(x=>x.active));setTemplates(t.filter(x=>x.active&&x.node_count>0))})},[])
   async function submit(e:FormEvent<HTMLFormElement>){
     e.preventDefault();setSaving(true);setError('')
@@ -25,6 +26,7 @@ export default function RequirementCreate(){
       <div className="form-section"><div className="section-icon"><GitBranch/></div><div><h2>基本信息</h2><p>创建后会复制模板节点，后续模板修改不会影响已经开始的需求。</p></div></div>
       <div className="form-grid">
         <Field label="需求名称"><input name="name" required placeholder="一句话描述需求"/></Field>
+        <Field label="需求状态"><div className="requirement-state-picker"><button type="button" className={lifecycleStatus==='active'?'active':''} onClick={()=>setLifecycleStatus('active')}><strong>进行中</strong><small>参与风险、通知与 AI 总结</small></button><button type="button" className={lifecycleStatus==='planned'?'active':''} onClick={()=>setLifecycleStatus('planned')}><strong>计划中</strong><small>仅维护节点计划，不参与自动处理</small></button></div><input type="hidden" name="lifecycle_status" value={lifecycleStatus}/></Field>
         <Field label="需求负责人"><select name="owner_id" required defaultValue=""><option value="" disabled>选择已配置人员</option>{people.map(p=><option value={p.id} key={p.id}>{p.display_name} · {p.role_name}</option>)}</select></Field>
         <Field label="交付模板"><select name="template_id" required defaultValue=""><option value="" disabled>选择节点模板</option>{templates.map(t=><option value={t.id} key={t.id}>{t.name} · {t.node_count} 个节点</option>)}</select></Field>
         <Field label="目标版本"><input name="target_version" placeholder="可选，例如 v4.9.0"/></Field>
