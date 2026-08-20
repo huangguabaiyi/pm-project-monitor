@@ -156,6 +156,7 @@ class RequirementRow(Base):
     ai_analyzed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ai_input_hash: Mapped[Optional[str]] = mapped_column(String(64))
     ai_error: Mapped[Optional[str]] = mapped_column(Text)
+    ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, onupdate=_utc_now)
 
@@ -375,6 +376,7 @@ def initialize_database(database_url: str, *, echo: bool = False) -> None:
         "ai_analyzed_at": "TIMESTAMP",
         "ai_input_hash": "VARCHAR(64)",
         "ai_error": "TEXT",
+        "ai_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
     }
     with engine.begin() as connection:
         for column, sql_type in ai_columns.items():

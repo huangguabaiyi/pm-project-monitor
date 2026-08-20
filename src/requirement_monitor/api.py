@@ -34,6 +34,7 @@ from .service import (
     delete_template_node,
     delete_requirement_edge,
     delete_requirement_node,
+    clear_requirement_ai_analysis,
     export_data,
     get_requirement,
     get_ai_settings,
@@ -58,6 +59,8 @@ from .service import (
     update_requirement_node,
     batch_update_requirement_nodes,
     batch_update_requirement_node_owners,
+    batch_update_requirement_node_positions,
+    batch_delete_requirement_nodes,
     update_template,
     update_webhook_settings,
 )
@@ -166,6 +169,7 @@ class RequirementPatch(BaseModel):
     figma_url: Optional[AnyHttpUrl] = None
     notes: Optional[str] = None
     archived: Optional[bool] = None
+    ai_enabled: Optional[bool] = None
 
 
 class RequirementNodePatch(BaseModel):
@@ -188,6 +192,20 @@ class RequirementNodesBatchOwners(BaseModel):
     node_ids: List[str] = Field(min_length=1)
     owner_ids: List[str] = []
     mode: str = "replace"
+
+
+class RequirementNodePosition(BaseModel):
+    id: str = Field(min_length=1)
+    position_x: float
+    position_y: float
+
+
+class RequirementNodesBatchPositions(BaseModel):
+    nodes: List[RequirementNodePosition] = Field(min_length=1)
+
+
+class RequirementNodesBatchDelete(BaseModel):
+    node_ids: List[str] = Field(min_length=1)
 
 
 class RequirementNodeInput(BaseModel):
@@ -460,6 +478,22 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
             raise HTTPException(400, str(error)) from error
         return {"updated": updated, "count": len(updated)}
 
+    @app.post("/api/requirement-nodes/batch-positions")
+    def requirement_nodes_batch_positions(payload: RequirementNodesBatchPositions):
+        try:
+            updated = batch_update_requirement_node_positions(db(), [node.model_dump() for node in payload.nodes])
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return {"updated": updated, "count": len(updated)}
+
+    @app.post("/api/requirement-nodes/batch-delete")
+    def requirement_nodes_batch_delete(payload: RequirementNodesBatchDelete):
+        try:
+            deleted = batch_delete_requirement_nodes(db(), payload.node_ids)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        return {"deleted": deleted, "count": len(deleted)}
+
     @app.patch("/api/requirement-nodes/{node_id}")
     def requirement_nodes_update(node_id: str, payload: RequirementNodePatch):
         try:
@@ -505,6 +539,13 @@ def create_app(database_url: Optional[str] = None) -> FastAPI:
             raise HTTPException(404, str(error)) from error
         except (ValueError, RuntimeError) as error:
             raise HTTPException(400, str(error)) from error
+
+    @app.delete("/api/requirements/{requirement_id}/ai-analysis")
+    def requirement_ai_clear(requirement_id: str):
+        result = clear_requirement_ai_analysis(db(), requirement_id)
+        if result is None:
+            raise HTTPException(404, "requirement not found")
+        return result
 
     @app.get("/api/jobs")
     def jobs():

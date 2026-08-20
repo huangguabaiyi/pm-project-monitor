@@ -530,7 +530,7 @@ def _requirement_dict(row: RequirementRow, *, with_graph: bool = False, persist:
     schedule_level = int(schedule["risk_level"])
     ai_analysis = dict(row.ai_analysis) if row.ai_analysis else None
     ai_level = {"normal": 0, "warning": 1, "severe": 2}.get(str((ai_analysis or {}).get("risk_level")), 0)
-    payload = {"id": row.id, "sequence_id": row.sequence_id, "name": row.name, "owner": _person(row.owner), "owner_id": row.owner_id, "template_id": row.template_id, "template_name": row.template_name, "template_version": row.template_version, "target_version": row.target_version, "meego_url": row.meego_url, "requirement_url": row.requirement_url, "figma_url": row.figma_url, "notes": row.notes, "archived": row.archived, "created_at": _api_datetime(row.created_at), "updated_at": _api_datetime(row.updated_at), **schedule, "schedule_risk_level": schedule_level, "risk_level": max(schedule_level, ai_level), "ai_risk_level": ai_level if ai_analysis else None, "ai_analysis": ai_analysis, "ai_analyzed_at": _api_datetime(row.ai_analyzed_at), "ai_error": row.ai_error}
+    payload = {"id": row.id, "sequence_id": row.sequence_id, "name": row.name, "owner": _person(row.owner), "owner_id": row.owner_id, "template_id": row.template_id, "template_name": row.template_name, "template_version": row.template_version, "target_version": row.target_version, "meego_url": row.meego_url, "requirement_url": row.requirement_url, "figma_url": row.figma_url, "notes": row.notes, "archived": row.archived, "created_at": _api_datetime(row.created_at), "updated_at": _api_datetime(row.updated_at), **schedule, "schedule_risk_level": schedule_level, "risk_level": max(schedule_level, ai_level), "ai_enabled": row.ai_enabled, "ai_risk_level": ai_level if ai_analysis else None, "ai_analysis": ai_analysis, "ai_analyzed_at": _api_datetime(row.ai_analyzed_at), "ai_error": row.ai_error}
     graph_nodes = [_node_dict(node) for node in row.nodes]
     graph_edges = [{"id": edge.id, "source": edge.source_node_id, "target": edge.target_node_id} for edge in row.edges]
     analysis_source = {**payload, "nodes": graph_nodes, "edges": graph_edges}
@@ -612,6 +612,26 @@ def update_requirement(database_url: str, requirement_id: str, data: Mapping[str
             row.owner_id = owner.id
         if "archived" in data:
             row.archived = bool(data["archived"])
+        if "ai_enabled" in data:
+            row.ai_enabled = bool(data["ai_enabled"])
+            if not row.ai_enabled:
+                row.ai_analysis = None
+                row.ai_analyzed_at = None
+                row.ai_input_hash = None
+                row.ai_error = None
+        session.flush()
+        return _requirement_dict(row, with_graph=True)
+
+
+def clear_requirement_ai_analysis(database_url: str, requirement_id: str) -> Optional[Dict[str, object]]:
+    with session_scope(database_url) as session:
+        row = session.scalar(select(RequirementRow).where(RequirementRow.id == requirement_id).options(selectinload(RequirementRow.owner), selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges)))
+        if row is None:
+            return None
+        row.ai_analysis = None
+        row.ai_analyzed_at = None
+        row.ai_input_hash = None
+        row.ai_error = None
         session.flush()
         return _requirement_dict(row, with_graph=True)
 
@@ -655,6 +675,53 @@ def update_requirement_node(database_url: str, node_id: str, data: Mapping[str, 
         if requirement is not None:
             _evaluate_requirement(requirement, persist=True)
         return _node_dict(row)
+
+
+def batch_update_requirement_node_positions(database_url: str, positions: Sequence[Mapping[str, object]]) -> List[Dict[str, object]]:
+    normalized_positions: Dict[str, Mapping[str, object]] = {}
+    for position in positions:
+        node_id = str(position.get("id") or "").strip()
+        if node_id:
+            normalized_positions[node_id] = position
+    normalized_ids = list(normalized_positions)
+    if not normalized_ids:
+        raise ValueError("nodes are required")
+    with session_scope(database_url) as session:
+        rows = list(session.scalars(select(RequirementNodeRow).where(RequirementNodeRow.id.in_(normalized_ids)).options(selectinload(RequirementNodeRow.owners))))
+        if len(rows) != len(normalized_ids):
+            raise ValueError("requirement node not found")
+        requirement_ids = {row.requirement_id for row in rows}
+        if len(requirement_ids) != 1:
+            raise ValueError("nodes must belong to the same requirement")
+        rows_by_id = {row.id: row for row in rows}
+        for node_id, position in normalized_positions.items():
+            row = rows_by_id[node_id]
+            row.position_x = float(position.get("position_x") or 0)
+            row.position_y = float(position.get("position_y") or 0)
+        session.flush()
+        return [_node_dict(rows_by_id[node_id]) for node_id in normalized_ids]
+
+
+def batch_delete_requirement_nodes(database_url: str, node_ids: Sequence[str]) -> List[str]:
+    normalized_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids if str(node_id).strip()))
+    if not normalized_ids:
+        raise ValueError("node_ids are required")
+    with session_scope(database_url) as session:
+        rows = list(session.scalars(select(RequirementNodeRow).where(RequirementNodeRow.id.in_(normalized_ids))))
+        if len(rows) != len(normalized_ids):
+            raise ValueError("requirement node not found")
+        requirement_ids = {row.requirement_id for row in rows}
+        if len(requirement_ids) != 1:
+            raise ValueError("nodes must belong to the same requirement")
+        requirement_id = rows[0].requirement_id
+        for row in rows:
+            session.delete(row)
+        session.flush()
+        session.expire_all()
+        requirement = session.scalar(select(RequirementRow).where(RequirementRow.id == requirement_id).options(selectinload(RequirementRow.nodes).selectinload(RequirementNodeRow.owners), selectinload(RequirementRow.edges), selectinload(RequirementRow.owner)))
+        if requirement is not None:
+            _evaluate_requirement(requirement, persist=True)
+        return normalized_ids
 
 
 def batch_update_requirement_nodes(database_url: str, node_ids: Sequence[str], status: str) -> List[Dict[str, object]]:
@@ -1080,6 +1147,8 @@ def analyze_requirement(database_url: str, requirement_id: str, *, force: bool =
     requirement = get_requirement(database_url, requirement_id)
     if requirement is None:
         raise LookupError("requirement not found")
+    if not requirement.get("ai_enabled", True):
+        raise ValueError("该需求已关闭 AI 总结")
     payload = requirement_ai_input(requirement)
     fingerprint = input_fingerprint(payload)
     if not force and requirement.get("ai_analysis") and not requirement.get("ai_stale"):
@@ -1117,7 +1186,7 @@ def analyze_all_requirements(database_url: str) -> Dict[str, int]:
     if not settings["enabled"] or not settings["auto_analyze"]:
         return counts
     for requirement in list_requirements(database_url):
-        if requirement["archived"]:
+        if requirement["archived"] or not requirement.get("ai_enabled", True):
             continue
         try:
             before = requirement.get("ai_analyzed_at")

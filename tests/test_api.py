@@ -96,6 +96,101 @@ def test_requirement_graph_can_add_move_connect_and_delete_nodes(tmp_path: Path)
     assert detail["edges"] == []
 
 
+def test_requirement_graph_supports_batch_move_and_delete(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'requirement-graph-batch.db'}"))
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    domain = client.post("/api/domains", json={"name": "研发", "color": "#24704b"}).json()
+    definitions = [
+        client.post("/api/node-definitions", json={"name": name, "domain_id": domain["id"]}).json()
+        for name in ("开发", "联调", "测试")
+    ]
+    template = client.post("/api/templates", json={"name": "批量编辑流程"}).json()
+    template_nodes = [
+        client.post(
+            f"/api/templates/{template['id']}/nodes",
+            json={"definition_id": definition["id"], "position_x": index * 220, "position_y": 40},
+        ).json()
+        for index, definition in enumerate(definitions)
+    ]
+    client.post(f"/api/templates/{template['id']}/edges", json={"source": template_nodes[0]["id"], "target": template_nodes[1]["id"]})
+    client.post(f"/api/templates/{template['id']}/edges", json={"source": template_nodes[1]["id"], "target": template_nodes[2]["id"]})
+    requirement = client.post("/api/requirements", json={"name": "批量画板需求", "owner_id": owner["id"], "template_id": template["id"]}).json()
+    node_ids = [node["id"] for node in requirement["nodes"]]
+    original_positions = {node["id"]: node["position"] for node in requirement["nodes"]}
+
+    rejected_move = client.post(
+        "/api/requirement-nodes/batch-positions",
+        json={"nodes": [{"id": node_ids[0], "position_x": 999, "position_y": 999}, {"id": "missing", "position_x": 1, "position_y": 1}]},
+    )
+    assert rejected_move.status_code == 400
+    detail = client.get(f"/api/requirements/{requirement['id']}").json()
+    assert {node["id"]: node["position"] for node in detail["nodes"]} == original_positions
+
+    moved = client.post(
+        "/api/requirement-nodes/batch-positions",
+        json={"nodes": [{"id": node_ids[0], "position_x": 120, "position_y": 160}, {"id": node_ids[1], "position_x": 360, "position_y": 160}]},
+    )
+    assert moved.status_code == 200
+    assert moved.json()["count"] == 2
+    detail = client.get(f"/api/requirements/{requirement['id']}").json()
+    positions = {node["id"]: node["position"] for node in detail["nodes"]}
+    assert positions[node_ids[0]] == {"x": 120.0, "y": 160.0}
+    assert positions[node_ids[1]] == {"x": 360.0, "y": 160.0}
+
+    rejected_delete = client.post("/api/requirement-nodes/batch-delete", json={"node_ids": [node_ids[0], "missing"]})
+    assert rejected_delete.status_code == 400
+    assert len(client.get(f"/api/requirements/{requirement['id']}").json()["nodes"]) == 3
+
+    deleted = client.post("/api/requirement-nodes/batch-delete", json={"node_ids": node_ids[:2]})
+    assert deleted.status_code == 200
+    assert deleted.json()["count"] == 2
+    detail = client.get(f"/api/requirements/{requirement['id']}").json()
+    assert [node["id"] for node in detail["nodes"]] == [node_ids[2]]
+    assert detail["edges"] == []
+    assert detail["total_nodes"] == 1
+
+
+def test_requirement_ai_summary_can_be_cleared_or_disabled(tmp_path: Path):
+    client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'requirement-ai-toggle.db'}"))
+    owner = client.post("/api/people", json={"display_name": "林夏"}).json()
+    domain = client.post("/api/domains", json={"name": "研发"}).json()
+    definition = client.post("/api/node-definitions", json={"name": "开发", "domain_id": domain["id"]}).json()
+    template = client.post("/api/templates", json={"name": "AI 开关模板"}).json()
+    client.post(f"/api/templates/{template['id']}/nodes", json={"definition_id": definition["id"]})
+    requirement = client.post("/api/requirements", json={"name": "AI 开关需求", "owner_id": owner["id"], "template_id": template["id"]}).json()
+
+    from requirement_monitor.database import RequirementRow, session_scope
+
+    with session_scope(f"sqlite+pysqlite:///{tmp_path / 'requirement-ai-toggle.db'}") as session:
+        row = session.get(RequirementRow, requirement["id"])
+        row.ai_analysis = {"risk_level": "warning", "summary": "待处理", "confidence": 0.8}
+        row.ai_analyzed_at = datetime.now(timezone.utc)
+        row.ai_input_hash = "fingerprint"
+        row.ai_error = "old error"
+
+    cleared = client.delete(f"/api/requirements/{requirement['id']}/ai-analysis")
+    assert cleared.status_code == 200
+    assert cleared.json()["ai_analysis"] is None
+    assert cleared.json()["ai_enabled"] is True
+
+    with session_scope(f"sqlite+pysqlite:///{tmp_path / 'requirement-ai-toggle.db'}") as session:
+        row = session.get(RequirementRow, requirement["id"])
+        row.ai_analysis = {"risk_level": "warning", "summary": "待关闭", "confidence": 0.8}
+        row.ai_input_hash = "fingerprint"
+        row.ai_error = "old error"
+
+    disabled = client.patch(f"/api/requirements/{requirement['id']}", json={"ai_enabled": False})
+    assert disabled.status_code == 200
+    assert disabled.json()["ai_enabled"] is False
+    assert disabled.json()["ai_analysis"] is None
+    assert disabled.json()["ai_error"] is None
+    assert client.post(f"/api/requirements/{requirement['id']}/ai-analysis").status_code == 400
+
+    enabled = client.patch(f"/api/requirements/{requirement['id']}", json={"ai_enabled": True})
+    assert enabled.status_code == 200
+    assert enabled.json()["ai_enabled"] is True
+
+
 def test_requirement_nodes_support_batch_status_updates(tmp_path: Path):
     client = TestClient(create_app(f"sqlite+pysqlite:///{tmp_path / 'batch-status.db'}"))
     owner = client.post("/api/people", json={"display_name": "林夏"}).json()

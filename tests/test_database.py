@@ -14,7 +14,7 @@ def test_schema_contains_new_domain_graph_and_requirement_tables_only(tmp_path: 
     assert "projects" not in tables
     assert "blockers" not in tables
     requirement_columns = {column["name"] for column in inspect(create_database_engine(url)).get_columns("requirements")}
-    assert {"sequence_id", "meego_url", "requirement_url", "figma_url", "ai_analysis", "ai_analyzed_at", "ai_input_hash", "ai_error"} <= requirement_columns
+    assert {"sequence_id", "meego_url", "requirement_url", "figma_url", "ai_analysis", "ai_analyzed_at", "ai_input_hash", "ai_error", "ai_enabled"} <= requirement_columns
 
 
 def test_demo_seed_creates_parallel_workflow_and_snapshot(tmp_path: Path):
