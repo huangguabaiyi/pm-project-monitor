@@ -237,7 +237,8 @@ def run_risk_scan(database_url: str) -> Dict[str, int]:
 
 def run_ai_analysis(database_url: str) -> Dict[str, int]:
     logger.info("ai_analysis.start")
-    summary = analyze_all_requirements(database_url)
+    refreshed = evaluate_all_requirements(database_url)
+    summary = {**analyze_all_requirements(database_url, force=True), "refreshed": sum(refreshed.values())}
     logger.info("ai_analysis.finish summary=%s", summary)
     return summary
 

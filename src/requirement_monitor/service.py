@@ -1244,11 +1244,18 @@ def analyze_requirement(database_url: str, requirement_id: str, *, force: bool =
     fingerprint = input_fingerprint(payload)
     if not force and requirement.get("ai_analysis") and not requirement.get("ai_stale"):
         return requirement
+    analysis_payload = {
+        **payload,
+        "analysis_context": {
+            "current_time": _utc_now().astimezone(LOCAL_TIMEZONE).isoformat(),
+            "timezone": str(LOCAL_TIMEZONE),
+        },
+    }
     try:
         if settings["provider"] == "chatgpt_plus":
-            analysis = analyze_with_chatgpt_plus(model=str(settings["model"]), prompt=str(settings["prompt"]), payload=payload)
+            analysis = analyze_with_chatgpt_plus(model=str(settings["model"]), prompt=str(settings["prompt"]), payload=analysis_payload)
         else:
-            analysis = analyze_with_compatible_api(base_url=str(settings["base_url"]), api_key=str(settings["api_key"] or ""), model=str(settings["model"]), prompt=str(settings["prompt"]), payload=payload)
+            analysis = analyze_with_compatible_api(base_url=str(settings["base_url"]), api_key=str(settings["api_key"] or ""), model=str(settings["model"]), prompt=str(settings["prompt"]), payload=analysis_payload)
         schedule_level = int(requirement.get("schedule_risk_level") or 0)
         names = ["normal", "warning", "severe"]
         analysis["risk_level"] = names[max(schedule_level, names.index(str(analysis["risk_level"])))]
@@ -1271,7 +1278,7 @@ def analyze_requirement(database_url: str, requirement_id: str, *, force: bool =
     return result
 
 
-def analyze_all_requirements(database_url: str) -> Dict[str, int]:
+def analyze_all_requirements(database_url: str, *, force: bool = False) -> Dict[str, int]:
     settings = get_ai_settings(database_url)
     counts = {"analyzed": 0, "skipped": 0, "failed": 0}
     if not settings["enabled"] or not settings["auto_analyze"]:
@@ -1281,8 +1288,8 @@ def analyze_all_requirements(database_url: str) -> Dict[str, int]:
             continue
         try:
             before = requirement.get("ai_analyzed_at")
-            result = analyze_requirement(database_url, str(requirement["id"]))
-            counts["analyzed" if result.get("ai_analyzed_at") != before else "skipped"] += 1
+            result = analyze_requirement(database_url, str(requirement["id"]), force=force)
+            counts["analyzed" if force or result.get("ai_analyzed_at") != before else "skipped"] += 1
         except Exception:
             counts["failed"] += 1
     return counts

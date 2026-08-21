@@ -1,10 +1,11 @@
 from pathlib import Path
 
+import requirement_monitor.service as service
 from requirement_monitor.database import initialize_database
 from datetime import datetime, timedelta, timezone
 
-from requirement_monitor.service import create_domain, create_person, create_definition, create_template, add_template_node, create_requirement, get_requirement, list_jobs, list_notifications, update_requirement, update_requirement_node
-from requirement_monitor.worker import _enqueue_notifications, _risk_card, worker_loop
+from requirement_monitor.service import create_domain, create_person, create_definition, create_template, add_template_node, create_requirement, get_requirement, list_jobs, list_notifications, update_ai_settings, update_requirement, update_requirement_node
+from requirement_monitor.worker import _enqueue_notifications, _risk_card, run_ai_analysis, worker_loop
 
 
 def test_risk_card_mentions_risky_node_owners_and_adds_link_buttons():
@@ -163,6 +164,44 @@ def test_worker_creates_default_automation_jobs(tmp_path: Path):
 
     job_types = {job["job_type"] for job in list_jobs(database_url)}
     assert {"risk_scan", "outbox_delivery", "ai_analysis"} <= job_types
+
+
+def test_ai_automation_reanalyzes_unchanged_requirements_with_current_time(monkeypatch, tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'ai-cron-force.db'}"
+    initialize_database(database_url)
+    domain = create_domain(database_url, {"name": "产品"})
+    owner = create_person(database_url, {"display_name": "林夏"})
+    definition = create_definition(database_url, {"name": "评审", "domain_id": domain["id"]})
+    template = create_template(database_url, {"name": "AI 定时模板"})
+    add_template_node(database_url, template["id"], {"definition_id": definition["id"]})
+    requirement = create_requirement(database_url, {"name": "每天重新分析", "owner_id": owner["id"], "template_id": template["id"]})
+    update_ai_settings(database_url, {"enabled": True, "auto_analyze": True, "provider": "openai_compatible", "api_key": "test-key"})
+    payloads = []
+
+    def fake_analysis(**kwargs):
+        payloads.append(kwargs["payload"])
+        return {
+            "risk_level": "normal",
+            "summary": f"第 {len(payloads)} 次分析",
+            "confidence": 0.9,
+            "delivery_forecast": {"status": "on_track", "reason": "计划正常"},
+            "signals": [],
+            "actions": [],
+            "missing_information": [],
+        }
+
+    monkeypatch.setattr(service, "analyze_with_compatible_api", fake_analysis)
+
+    first = run_ai_analysis(database_url)
+    second = run_ai_analysis(database_url)
+
+    assert first["analyzed"] == 1
+    assert second["analyzed"] == 1
+    assert second["skipped"] == 0
+    assert len(payloads) == 2
+    assert all(payload["analysis_context"]["timezone"] == "Asia/Shanghai" for payload in payloads)
+    assert all(payload["analysis_context"]["current_time"].endswith("+08:00") for payload in payloads)
+    assert get_requirement(database_url, requirement["id"])["ai_analysis"]["summary"] == "第 2 次分析"
 
 
 def test_notification_scope_controls_generated_cards_without_fingerprint_dedup(tmp_path: Path):
